@@ -46,6 +46,36 @@ container exec buildkit /bin/sh -lc 'printf "nameserver 1.1.1.1\n" > /etc/resolv
 
 Then rerun the build command.
 
+If a VPN is connected and the build still cannot resolve Debian hosts, the
+problem may be broader than DNS: Apple `container`/`buildkit` may be unable to
+reach public internet addresses directly. In that case, start a temporary
+host-side HTTP/HTTPS proxy on the Apple container bridge and pass it as build
+args:
+
+```bash
+npm install
+
+node - <<'NODE' &
+const ProxyChain = require('proxy-chain');
+const server = new ProxyChain.Server({ host: '192.168.64.1', port: 8891 });
+server.listen().then(() => console.log('proxy listening on 192.168.64.1:8891'));
+process.on('SIGTERM', async () => { await server.close(true); process.exit(0); });
+NODE
+PID=$!
+
+container build --dns 192.168.64.1 \
+  --build-arg HTTP_PROXY=http://192.168.64.1:8891 \
+  --build-arg HTTPS_PROXY=http://192.168.64.1:8891 \
+  --build-arg http_proxy=http://192.168.64.1:8891 \
+  --build-arg https_proxy=http://192.168.64.1:8891 \
+  -t pi-coding-node:24 .
+
+kill $PID
+```
+
+This is helpful when DNS changes such as `--dns 1.1.1.1` or a local router DNS
+still fail because the VPN blocks direct public egress from the builder VM.
+
 ## Install the Commands
 
 Add `pic` and `pic-admin` to your shell config, for example `~/.zshrc`:
