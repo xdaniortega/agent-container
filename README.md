@@ -141,6 +141,27 @@ pic-proxy
 `HTTPS_PROXY`, and `ALL_PROXY` set. This avoids changing host `~/.pi` model
 configuration.
 
+### Mounting multiple directories with `--volume`
+
+You can pass one or more `--volume` arguments to mount additional host
+directories alongside your current project. Each directory is mounted at
+`/workspace/<dirname>` using its basename, so you can `cd ../<other-dir>` to
+move between them:
+
+```bash
+# From ~/projects/project-core/
+pic-proxy --volume "../project-web:/workspace/project-web"
+```
+
+Inside the container you land in `/workspace/project-core` and can switch
+to the other project with `cd ../project-web`.
+
+**No host paths leak into the container.** By using relative paths like
+`"../project-web:/workspace/project-web"`, the host side of the bind mount
+stays relative; the container only sees the clean `/workspace/*` layout. The
+same applies to the primary mount — your current directory is mounted as
+`/workspace/<basename>`, not as `/workspace` with the full host path.
+
 When you need to modify Pi configuration:
 
 ```bash
