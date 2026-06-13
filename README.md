@@ -1,7 +1,7 @@
 # pi-container
 
 Run the Pi coding agent inside an Apple container while editing the current host
-project directory. The container mounts the current directory as `/workspace`,
+project directory. The container mounts the current directory as `/workspace/<basename>`,
 uses your host `~/.pi` configuration, and leaves the normal non-containerized
 `pi` command untouched.
 
@@ -82,23 +82,49 @@ Add `pic` and `pic-admin` to your shell config, for example `~/.zshrc`:
 
 ```zsh
 pic() {
+  local dir="${PWD##*/}"
   mkdir -p "$PWD/sessions"
   container run -it --memory 4g \
-    --volume "$PWD:/workspace" \
+    --volume "$PWD:/workspace/$dir" \
     --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
     --dns 1.1.1.1 \
-    -w /workspace \
-    pi-coding-node:24 --session-dir /workspace/sessions
+    -w "/workspace/$dir" \
+    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
 }
 
 pic-admin() {
+  local dir="${PWD##*/}"
   mkdir -p "$PWD/sessions"
   container run -it --memory 4g \
-    --volume "$PWD:/workspace" \
+    --volume "$PWD:/workspace/$dir" \
     --mount type=bind,source="$HOME/.pi",target=/root/.pi \
     --dns 1.1.1.1 \
-    -w /workspace \
-    pi-coding-node:24 --session-dir /workspace/sessions
+    -w "/workspace/$dir" \
+    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
+}
+```
+
+To mount additional directories alongside your current project, set the
+`PIC_EXTRA_VOLUMES` environment variable with one or more `--volume` specs
+separated by spaces before running `pic` or `pic-admin`:
+
+```zsh
+PIC_EXTRA_VOLUMES="--volume ../project-web:/workspace/project-web" pic
+```
+
+Or in your shell config, extend the function:
+
+```zsh
+pic() {
+  local dir="${PWD##*/}"
+  mkdir -p "$PWD/sessions"
+  container run -it --memory 4g \
+    --volume "$PWD:/workspace/$dir" \
+    ${PIC_EXTRA_VOLUMES:---volume ../project-web:/workspace/project-web --volume ../project-api:/workspace/project-api} \
+    --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
+    --dns 1.1.1.1 \
+    -w "/workspace/$dir" \
+    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
 }
 ```
 
@@ -126,8 +152,9 @@ From any project directory:
 pic
 ```
 
-This creates `./sessions`, mounts the current directory as `/workspace`, mounts
-host `~/.pi` read-only at `/host-pi`, and copies safe config into container-local
+This creates `./sessions`, mounts the current directory as
+`/workspace/<basename>` (e.g., `/workspace/project-core`), mounts host `~/.pi`
+read-only at `/host-pi`, and copies safe config into container-local
 `/root/.pi`.
 
 When a VPN is connected, you may need to use:
@@ -177,22 +204,22 @@ Equivalent direct command for `pic`:
 
 ```bash
 container run -it --memory 4g \
-  --volume "$PWD:/workspace" \
+  --volume "$PWD:/workspace/$(basename $PWD)" \
   --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
   --dns 1.1.1.1 \
-  -w /workspace \
-  pi-coding-node:24 --session-dir /workspace/sessions
+  -w "/workspace/$(basename $PWD)" \
+  pi-coding-node:24 --session-dir "/workspace/$(basename $PWD)/sessions"
 ```
 
 Start a shell instead of Pi:
 
 ```bash
 container run -it --memory 4g \
-  --volume "$PWD:/workspace" \
+  --volume "$PWD:/workspace/$(basename $PWD)" \
   --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
   --dns 1.1.1.1 \
   --entrypoint /bin/bash \
-  -w /workspace \
+  -w "/workspace/$(basename $PWD)" \
   pi-coding-node:24
 ```
 
