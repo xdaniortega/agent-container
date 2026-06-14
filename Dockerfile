@@ -31,7 +31,7 @@ RUN apt-get update \
     && rga --version \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @earendil-works/pi-coding-agent pnpm \
+RUN npm install -g @earendil-works/pi-coding-agent pnpm@11.5.2 \
     && npm cache clean --force
 
 RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh -o /tmp/rtk-install.sh \

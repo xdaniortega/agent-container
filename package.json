@@ -2,6 +2,7 @@
   "name": "pi-container",
   "private": true,
   "type": "commonjs",
+  "packageManager": "pnpm@11.5.2",
   "scripts": {
     "proxy": "node ./pic-proxy-runner.cjs"
   },

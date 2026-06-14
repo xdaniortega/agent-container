@@ -84,8 +84,11 @@ Add `pic` and `pic-admin` to your shell config, for example `~/.zshrc`:
 pic() {
   local dir="${PWD##*/}"
   mkdir -p "$PWD/sessions"
+  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
+  container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
     --volume "$PWD:/workspace/$dir" \
+    --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
     --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
     --dns 1.1.1.1 \
     -w "/workspace/$dir" \
@@ -95,14 +98,24 @@ pic() {
 pic-admin() {
   local dir="${PWD##*/}"
   mkdir -p "$PWD/sessions"
+  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
+  container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
     --volume "$PWD:/workspace/$dir" \
+    --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
     --mount type=bind,source="$HOME/.pi",target=/root/.pi \
     --dns 1.1.1.1 \
     -w "/workspace/$dir" \
     pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
 }
 ```
+
+The `node_modules` mount intentionally overlays the project mount with a
+container-local named volume. This keeps Linux-native dependencies inside the
+container instead of reusing macOS-installed modules from the host.
+At startup, the container entrypoint runs `pnpm install --prefer-offline` when
+the mounted project has `pnpm-lock.yaml` or `packageManager` set to `pnpm@...`.
+Set `PIC_PNPM_INSTALL=0` to skip this.
 
 To mount additional directories alongside your current project, set the
 `PIC_EXTRA_VOLUMES` environment variable with one or more `--volume` specs
@@ -118,8 +131,11 @@ Or in your shell config, extend the function:
 pic() {
   local dir="${PWD##*/}"
   mkdir -p "$PWD/sessions"
+  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
+  container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
     --volume "$PWD:/workspace/$dir" \
+    --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
     ${PIC_EXTRA_VOLUMES:---volume ../project-web:/workspace/project-web --volume ../project-api:/workspace/project-api} \
     --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
     --dns 1.1.1.1 \
@@ -203,8 +219,10 @@ configuration-changing operations.
 Equivalent direct command for `pic`:
 
 ```bash
+container volume create "pic-node-modules-$(pwd | shasum | cut -c1-12)" >/dev/null 2>&1 || true
 container run -it --memory 4g \
   --volume "$PWD:/workspace/$(basename $PWD)" \
+  --mount type=volume,source="pic-node-modules-$(pwd | shasum | cut -c1-12)",target="/workspace/$(basename $PWD)/node_modules" \
   --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
   --dns 1.1.1.1 \
   -w "/workspace/$(basename $PWD)" \
@@ -214,8 +232,10 @@ container run -it --memory 4g \
 Start a shell instead of Pi:
 
 ```bash
+container volume create "pic-node-modules-$(pwd | shasum | cut -c1-12)" >/dev/null 2>&1 || true
 container run -it --memory 4g \
   --volume "$PWD:/workspace/$(basename $PWD)" \
+  --mount type=volume,source="pic-node-modules-$(pwd | shasum | cut -c1-12)",target="/workspace/$(basename $PWD)/node_modules" \
   --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
   --dns 1.1.1.1 \
   --entrypoint /bin/bash \

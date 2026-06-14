@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const ProxyChain = require('proxy-chain');
 
 const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
@@ -29,6 +30,9 @@ for (let i = 0; i < cliArgs.length; i++) {
 // Use the basename of the current directory so multiple mounts can coexist under /workspace
 const dirBasename = path.basename(workdir);
 const workspaceTarget = `/workspace/${dirBasename}`;
+const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').slice(0, 12);
+const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
+const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 
 function log(message) {
   console.log(`[pic-proxy] ${message}`);
@@ -58,6 +62,8 @@ async function main() {
 
   fs.mkdirSync(path.join(workdir, 'sessions'), { recursive: true });
 
+  spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
+
   const proxy = await startProxy();
   let cleanedUp = false;
 
@@ -73,6 +79,7 @@ async function main() {
   const args = [
     'run', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
     '--volume', `${workdir}:${workspaceTarget}`,
+    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
     ...extraVolumes.flatMap(v => ['--volume', v]),
     '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
     '--dns', '1.1.1.1',
