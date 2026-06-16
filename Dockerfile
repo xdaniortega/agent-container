@@ -11,6 +11,7 @@ RUN apt-get update \
         curl \
         fd-find \
         ffmpeg \
+        git \
         pandoc \
         poppler-utils \
         ripgrep \
