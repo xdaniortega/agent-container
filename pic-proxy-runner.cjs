@@ -34,6 +34,10 @@ const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').sli
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
 const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 
+// Unique session tag per container invocation — isolates session files
+// so multiple containers mounting the same host directory don't conflict.
+const sessionTag = `pic-${crypto.randomBytes(4).toString('hex')}`;
+
 function log(message) {
   console.log(`[pic-proxy] ${message}`);
 }
@@ -60,7 +64,7 @@ async function startProxy() {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
-  fs.mkdirSync(path.join(workdir, 'sessions'), { recursive: true });
+  fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
 
   spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
 
@@ -91,7 +95,7 @@ async function main() {
     '-e', `all_proxy=${proxyUrl}`,
     '-w', workspaceTarget,
     'pi-coding-node:24',
-    '--session-dir', `${workspaceTarget}/sessions`,
+    '--session-dir', `${workspaceTarget}/.pi/agent/sessions/${sessionTag}`,
     ...extraPiArgs,
   ];
 

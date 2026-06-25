@@ -83,7 +83,8 @@ Add `pic` and `pic-admin` to your shell config, for example `~/.zshrc`:
 ```zsh
 pic() {
   local dir="${PWD##*/}"
-  mkdir -p "$PWD/sessions"
+  local session_tag="pic-$(openssl rand -hex 4)"
+  mkdir -p "$PWD/.pi/agent/sessions"
   local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
   container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
@@ -92,12 +93,13 @@ pic() {
     --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
     --dns 1.1.1.1 \
     -w "/workspace/$dir" \
-    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
+    pi-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
 }
 
 pic-admin() {
   local dir="${PWD##*/}"
-  mkdir -p "$PWD/sessions"
+  local session_tag="pic-$(openssl rand -hex 4)"
+  mkdir -p "$PWD/.pi/agent/sessions"
   local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
   container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
@@ -106,7 +108,7 @@ pic-admin() {
     --mount type=bind,source="$HOME/.pi",target=/root/.pi \
     --dns 1.1.1.1 \
     -w "/workspace/$dir" \
-    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
+    pi-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
 }
 ```
 
@@ -116,6 +118,31 @@ container instead of reusing macOS-installed modules from the host.
 At startup, the container entrypoint runs `pnpm install --prefer-offline` when
 the mounted project has `pnpm-lock.yaml` or `packageManager` set to `pnpm@...`.
 Set `PIC_PNPM_INSTALL=0` to skip this.
+
+### Session Isolation
+
+Each `pic`, `pic-admin`, or `pic-proxy` invocation generates a **unique session tag**
+(`pic-<8-hex-chars>`) and uses it as a subdirectory inside `./.pi/agent/sessions/`,
+mirroring pi's standard `~/.pi/agent/sessions/` layout:
+
+```text
+./.pi/agent/sessions/
+├── pic-a1b2c3d4/    ← Container A's sessions
+│   └── 2026-...jsonl
+└── pic-e5f6g7h8/    ← Container B's sessions
+    └── 2026-...jsonl
+```
+
+This ensures multiple containers mounting the same host directory do not
+conflict — each container sees only its own sessions in `/resume` and writes
+only to its own subdirectory. Old tag directories accumulate over time; clean
+up with:
+
+```bash
+rm -rf .pi/agent/sessions/pic-*
+```
+
+Or add `.pi/agent/sessions/pic-*` to your project's `.gitignore`.
 
 To mount additional directories alongside your current project, set the
 `PIC_EXTRA_VOLUMES` environment variable with one or more `--volume` specs
@@ -130,7 +157,8 @@ Or in your shell config, extend the function:
 ```zsh
 pic() {
   local dir="${PWD##*/}"
-  mkdir -p "$PWD/sessions"
+  local session_tag="pic-$(openssl rand -hex 4)"
+  mkdir -p "$PWD/.pi/agent/sessions"
   local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
   container volume create "$nm_volume" >/dev/null 2>&1 || true
   container run -it --memory 4g \
@@ -140,7 +168,7 @@ pic() {
     --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
     --dns 1.1.1.1 \
     -w "/workspace/$dir" \
-    pi-coding-node:24 --session-dir "/workspace/$dir/sessions"
+    pi-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
 }
 ```
 
@@ -168,7 +196,7 @@ From any project directory:
 pic
 ```
 
-This creates `./sessions`, mounts the current directory as
+This creates `./.pi/agent/sessions`, mounts the current directory as
 `/workspace/<basename>` (e.g., `/workspace/project-core`), mounts host `~/.pi`
 read-only at `/host-pi`, and copies safe config into container-local
 `/root/.pi`.
@@ -219,14 +247,13 @@ configuration-changing operations.
 Equivalent direct command for `pic`:
 
 ```bash
-container volume create "pic-node-modules-$(pwd | shasum | cut -c1-12)" >/dev/null 2>&1 || true
 container run -it --memory 4g \
   --volume "$PWD:/workspace/$(basename $PWD)" \
   --mount type=volume,source="pic-node-modules-$(pwd | shasum | cut -c1-12)",target="/workspace/$(basename $PWD)/node_modules" \
   --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
   --dns 1.1.1.1 \
   -w "/workspace/$(basename $PWD)" \
-  pi-coding-node:24 --session-dir "/workspace/$(basename $PWD)/sessions"
+  pi-coding-node:24 --session-dir "/workspace/$(basename $PWD)/.pi/agent/sessions/$(openssl rand -hex 4)"
 ```
 
 Start a shell instead of Pi:
