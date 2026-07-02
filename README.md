@@ -212,6 +212,23 @@ pic-proxy
 `HTTPS_PROXY`, and `ALL_PROXY` set. This avoids changing host `~/.pi` model
 configuration.
 
+You can publish container ports to the host by passing `-p` or `--publish`
+arguments to `pic-proxy`:
+
+```bash
+pic-proxy -p 5173:5173 -p 3000:3000
+```
+
+This maps container port 5173 to host port 5173 and container port 3000 to host
+port 3000. The format follows Apple Container's `-p` syntax:
+`[host-ip:]host-port:container-port[/protocol]`.
+
+Both `--volume` and `--publish` arguments can be combined freely:
+
+```bash
+pic-proxy -p 8080:8080 --volume "../web:/workspace/web"
+```
+
 ### Mounting multiple directories with `--volume`
 
 You can pass one or more `--volume` arguments to mount additional host
@@ -280,6 +297,131 @@ fd --version
 rg --version
 rtk --version
 pi --help
+
+
+## Second container for the same directory
+
+Apple Container cannot mount the same host directory into two running VMs
+simultaneously. If you run `pic` or `pic-proxy` and then try a second one in
+the same project directory, it fails with:
+
+```
+Error Domain=VZErrorDomain Code=2 "The storage device attachment is invalid."
+```
+
+Both `pic-proxy` and the shell functions (`pic`/`pic-admin`) now detect an
+existing running container with the same directory bind-mounted and
+**automatically use `container exec`** to start a second `pi` session inside
+the already-running VM instead. This avoids the VZ limitation entirely.
+
+### How it works
+
+1. `pic-proxy` runs `container list --format json` to find running containers
+2. For each, it runs `container inspect <id>` and checks
+   `configuration.mounts` for a virtiofs bind mount whose `source` matches
+   your current project directory
+3. If found, it runs `container exec -it -w /workspace/<basename> -e HTTP_PROXY=... <id> pi --session-dir ...`
+   instead of `container run`
+4. If no existing container is found, it falls back to `container run` as before
+
+Extra `--volume` and `--publish` arguments passed to `pic-proxy` are ignored
+when reusing a container via exec (the existing container already has its own
+volumes and port mappings).
+
+### Using `pic` / `pic-admin` with exec fallback
+
+The shell functions can also use exec instead of run. Update your `~/.zshrc`:
+
+```zsh
+pic() {
+  local dir="${PWD##*/}"
+  local session_tag="pic-$(openssl rand -hex 4)"
+  mkdir -p "$PWD/.pi/agent/sessions"
+  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
+  container volume create "$nm_volume" >/dev/null 2>&1 || true
+
+  # Check if a container already has this directory mounted
+  local existing_id=$(container list --format json 2>/dev/null | \
+    python3 -c "
+import json, sys
+containers = json.loads(sys.stdin.read())
+if not isinstance(containers, list):
+  containers = [containers]
+for c in containers:
+  cid = c.get('configuration', {}).get('id', '')
+  if not cid: continue
+  import subprocess, os
+  r = subprocess.run(['container', 'inspect', cid], capture_output=True, text=True)
+  if r.returncode != 0: continue
+  data = json.loads(r.stdout)
+  items = data if isinstance(data, list) else [data]
+  for item in items:
+    for m in item.get('configuration', {}).get('mounts', []):
+      if m.get('type') == 'virtiofs' and os.path.realpath(m.get('source','')) == os.path.realpath('$PWD'):
+        print(cid); sys.exit(0)
+print('', end='')
+"" 2>/dev/null || true"
+
+  if [ -n "$existing_id" ]; then
+    container exec -it \
+      -w "/workspace/$dir" \
+      "$existing_id" \
+      pi --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
+  else
+    container run -it --memory 4g \
+      --volume "$PWD:/workspace/$dir" \
+      --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
+      --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
+      --dns 1.1.1.1 \
+      -w "/workspace/$dir" \
+      pi-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
+  fi
+}
+
+pic-admin() {
+  local dir="${PWD##*/}"
+  local session_tag="pic-$(openssl rand -hex 4)"
+  mkdir -p "$PWD/.pi/agent/sessions"
+  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
+  container volume create "$nm_volume" >/dev/null 2>&1 || true
+
+  # Same detection logic
+  local existing_id=$(container list --format json 2>/dev/null | \
+    python3 -c "
+import json, sys
+containers = json.loads(sys.stdin.read())
+if not isinstance(containers, list):
+  containers = [containers]
+for c in containers:
+  cid = c.get('configuration', {}).get('id', '')
+  if not cid: continue
+  import subprocess, os
+  r = subprocess.run(['container', 'inspect', cid], capture_output=True, text=True)
+  if r.returncode != 0: continue
+  data = json.loads(r.stdout)
+  items = data if isinstance(data, list) else [data]
+  for item in items:
+    for m in item.get('configuration', {}).get('mounts', []):
+      if m.get('type') == 'virtiofs' and os.path.realpath(m.get('source','')) == os.path.realpath('$PWD'):
+        print(cid); sys.exit(0)
+print('', end='')
+"" 2>/dev/null || true"
+
+  if [ -n "$existing_id" ]; then
+    container exec -it \
+      -w "/workspace/$dir" \
+      "$existing_id" \
+      pi --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
+  else
+    container run -it --memory 4g \
+      --volume "$PWD:/workspace/$dir" \
+      --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
+      --mount type=bind,source="$HOME/.pi",target=/root/.pi \
+      --dns 1.1.1.1 \
+      -w "/workspace/$dir" \
+      pi-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
+  fi
+}
 ```
 
 ## Upgrade Pi

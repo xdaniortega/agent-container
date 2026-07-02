@@ -13,17 +13,27 @@ const workdir = process.env.PIC_WORKDIR || process.cwd();
 const home = process.env.HOME;
 const cliArgs = process.argv.slice(2);
 
-// Extract --volume arguments from CLI args, the rest pass through to pi
+// Extract --volume, --publish/-p arguments from CLI args, the rest pass through to pi
 const extraVolumes = [];
+const extraPublish = [];
 const extraPiArgs = [];
 for (let i = 0; i < cliArgs.length; i++) {
-  if (cliArgs[i] === '--volume' && i + 1 < cliArgs.length) {
+  const arg = cliArgs[i];
+  if ((arg === '--volume' || arg === '-v') && i + 1 < cliArgs.length) {
     extraVolumes.push(cliArgs[i + 1]);
     i++; // skip the value
-  } else if (cliArgs[i].startsWith('--volume=')) {
-    extraVolumes.push(cliArgs[i].slice(9));
+  } else if (arg.startsWith('--volume=')) {
+    extraVolumes.push(arg.slice(9));
+  } else if ((arg === '--publish' || arg === '-p') && i + 1 < cliArgs.length) {
+    extraPublish.push(cliArgs[i + 1]);
+    i++; // skip the value
+  } else if (arg.startsWith('--publish=')) {
+    extraPublish.push(arg.slice(10));
+  } else if (arg.startsWith('-p') && arg.length > 2) {
+    // -p5173:5173 (no space variant)
+    extraPublish.push(arg.slice(2));
   } else {
-    extraPiArgs.push(cliArgs[i]);
+    extraPiArgs.push(arg);
   }
 }
 
@@ -34,9 +44,9 @@ const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').sli
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
 const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 
-// Unique session tag per container invocation — isolates session files
-// so multiple containers mounting the same host directory don't conflict.
-const sessionTag = `pic-${crypto.randomBytes(4).toString('hex')}`;
+// Session directory — pi writes UUID-named session files, no hash needed for isolation
+// Two pi processes in the same container won't collide because session IDs are UUIDs.
+const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
 
 function log(message) {
   console.log(`[pic-proxy] ${message}`);
@@ -61,12 +71,89 @@ async function startProxy() {
   }
 }
 
+// Check if a running container already has workdir mounted as a virtiofs share
+function findContainerWithMount(workdirPath) {
+  // Normalize the workdir path for comparison
+  const normalizedWorkdir = path.resolve(workdirPath);
+
+  log(`checking for running container with mount source "${normalizedWorkdir}"`);
+
+  // List running containers as JSON
+  const listResult = spawnSync('container', ['list', '--format', 'json'], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    encoding: 'utf-8',
+  });
+
+  if (listResult.status !== 0) {
+    log(`container list failed (exit ${listResult.status}), will start a new container`);
+    return null;
+  }
+
+  let containers;
+  try {
+    containers = JSON.parse(listResult.stdout);
+    if (!Array.isArray(containers)) {
+      // Single object when only one container
+      containers = [containers];
+    }
+  } catch {
+    log('failed to parse container list output, will start a new container');
+    return null;
+  }
+
+  for (const container of containers) {
+    const containerId = container.configuration?.id;
+    if (!containerId) continue;
+
+    // Inspect this container to get full mount details
+    const inspectResult = spawnSync('container', ['inspect', containerId], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      encoding: 'utf-8',
+    });
+
+    if (inspectResult.status !== 0) continue;
+
+    let detail;
+    try {
+      detail = JSON.parse(inspectResult.stdout);
+      // inspect returns an array (one element per container)
+      const items = Array.isArray(detail) ? detail : [detail];
+      for (const item of items) {
+        if (!item.configuration) continue;
+        for (const mount of item.configuration.mounts || []) {
+          // Mount type "virtiofs" means a host directory bind mount
+          if (mount.type === 'virtiofs' || mount.type?.virtiofs !== undefined) {
+            // Resolve the mount source relative to the host
+            const mountSource = path.resolve(mount.source);
+            if (mountSource === normalizedWorkdir) {
+              log(`found running container "${containerId}" with ${workspaceTarget} mounted`);
+              return containerId;
+            }
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
 
-  spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
+  // Check if a container is already running with our workdir mounted
+  const existingContainerId = findContainerWithMount(workdir);
+
+  if (existingContainerId) {
+    // Volume is already created by the existing container — skip creation
+    log(`reusing container "${existingContainerId}" via exec`);
+  } else {
+    spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
+  }
 
   const proxy = await startProxy();
   let cleanedUp = false;
@@ -80,38 +167,84 @@ async function main() {
     }
   }
 
-  const args = [
-    'run', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
-    '--volume', `${workdir}:${workspaceTarget}`,
-    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
-    ...extraVolumes.flatMap(v => ['--volume', v]),
-    '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
-    '--dns', '1.1.1.1',
-    '-e', `HTTP_PROXY=${proxyUrl}`,
-    '-e', `HTTPS_PROXY=${proxyUrl}`,
-    '-e', `ALL_PROXY=${proxyUrl}`,
-    '-e', `http_proxy=${proxyUrl}`,
-    '-e', `https_proxy=${proxyUrl}`,
-    '-e', `all_proxy=${proxyUrl}`,
-    '-w', workspaceTarget,
-    'pi-coding-node:24',
-    '--session-dir', `${workspaceTarget}/.pi/agent/sessions/${sessionTag}`,
+  // Build the pi args (same for both run and exec)
+  const piArgs = [
+    '--session-dir', sessionDir,
     ...extraPiArgs,
   ];
 
-  const child = spawn('container', args, { stdio: 'inherit' });
+  if (existingContainerId) {
+    // Warn if extra volumes/publish were requested — they can't be applied via exec
+    if (extraVolumes.length > 0) {
+      log(`warning: extra --volume arguments are ignored when reusing container "${existingContainerId}"`);
+    }
+    if (extraPublish.length > 0) {
+      log(`warning: extra --publish arguments are ignored when reusing container "${existingContainerId}"`);
+    }
 
-  const forwardSignal = (signal) => {
-    if (!child.killed) child.kill(signal);
-  };
-  process.once('SIGINT', () => forwardSignal('SIGINT'));
-  process.once('SIGTERM', () => forwardSignal('SIGTERM'));
+    const args = [
+      'exec',
+      ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []),
+      '-w', workspaceTarget,
+      '-e', `HTTP_PROXY=${proxyUrl}`,
+      '-e', `HTTPS_PROXY=${proxyUrl}`,
+      '-e', `ALL_PROXY=${proxyUrl}`,
+      '-e', `http_proxy=${proxyUrl}`,
+      '-e', `https_proxy=${proxyUrl}`,
+      '-e', `all_proxy=${proxyUrl}`,
+      existingContainerId,
+      'pi',
+      ...piArgs,
+    ];
 
-  child.on('exit', async (code, signal) => {
-    await cleanup();
-    if (signal) process.kill(process.pid, signal);
-    process.exit(code ?? 0);
-  });
+    log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
+    const child = spawn('container', args, { stdio: 'inherit' });
+
+    const forwardSignal = (signal) => {
+      if (!child.killed) child.kill(signal);
+    };
+    process.once('SIGINT', () => forwardSignal('SIGINT'));
+    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
+
+    child.on('exit', async (code, signal) => {
+      await cleanup();
+      if (signal) process.kill(process.pid, signal);
+      process.exit(code ?? 0);
+    });
+  } else {
+    const args = [
+      'run', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
+      '--volume', `${workdir}:${workspaceTarget}`,
+      '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
+      ...extraVolumes.flatMap(v => ['--volume', v]),
+      ...extraPublish.flatMap(p => ['--publish', p]),
+      '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+      '--dns', '1.1.1.1',
+      '-e', `HTTP_PROXY=${proxyUrl}`,
+      '-e', `HTTPS_PROXY=${proxyUrl}`,
+      '-e', `ALL_PROXY=${proxyUrl}`,
+      '-e', `http_proxy=${proxyUrl}`,
+      '-e', `https_proxy=${proxyUrl}`,
+      '-e', `all_proxy=${proxyUrl}`,
+      '-w', workspaceTarget,
+      'pi-coding-node:24',
+      ...piArgs,
+    ];
+
+    const child = spawn('container', args, { stdio: 'inherit' });
+
+    const forwardSignal = (signal) => {
+      if (!child.killed) child.kill(signal);
+    };
+    process.once('SIGINT', () => forwardSignal('SIGINT'));
+    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
+
+    child.on('exit', async (code, signal) => {
+      await cleanup();
+      if (signal) process.kill(process.pid, signal);
+      process.exit(code ?? 0);
+    });
+  }
 }
 
 main().catch((error) => {

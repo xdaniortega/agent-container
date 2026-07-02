@@ -32,7 +32,8 @@ if [ "${PIC_PNPM_INSTALL:-1}" != "0" ] && [ -f package.json ] && command -v pnpm
 fi
 
 if [ "$should_pnpm_install" = true ]; then
-  echo "[pi-container] running pnpm install --prefer-offline"
+  echo "[pi-container] approving builds and installing"
+  pnpm approve-builds --all
   pnpm install --prefer-offline
 fi
 
