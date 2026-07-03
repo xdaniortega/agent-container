@@ -45,10 +45,14 @@ RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/in
     && cp /root/.pi/agent/extensions/rtk.ts /usr/local/share/pi/extensions/rtk.ts \
     && rm -rf /root/.pi
 
-COPY pi-container-entrypoint.sh /usr/local/bin/pi-container-entrypoint
-RUN chmod +x /usr/local/bin/pi-container-entrypoint
+# Install Claude Code (native binary, lands at ~/.local/bin/claude, already on PATH)
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && claude --version
+
+COPY entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint
 
 WORKDIR /workspace
 
-ENTRYPOINT ["pi-container-entrypoint"]
+ENTRYPOINT ["entrypoint"]
 CMD []

@@ -5,35 +5,34 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const ProxyChain = require('proxy-chain');
 
-const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
-const port = Number(process.env.PIC_PROXY_PORT || 8888);
+const host = process.env.CLC_PROXY_HOST || '192.168.64.1';
+const port = Number(process.env.CLC_PROXY_PORT || 8888);
 const proxyUrl = `http://${host}:${port}`;
-const verbose = process.env.PIC_PROXY_VERBOSE === '1';
-const workdir = process.env.PIC_WORKDIR || process.cwd();
+const verbose = process.env.CLC_PROXY_VERBOSE === '1';
+const workdir = process.env.CLC_WORKDIR || process.cwd();
 const home = process.env.HOME;
 const cliArgs = process.argv.slice(2);
 
-// Extract --volume, --publish/-p arguments from CLI args, the rest pass through to pi
+// Extract --volume, --publish/-p arguments from CLI args, the rest pass through to claude
 const extraVolumes = [];
 const extraPublish = [];
-const extraPiArgs = [];
+const extraClaudeArgs = [];
 for (let i = 0; i < cliArgs.length; i++) {
   const arg = cliArgs[i];
   if ((arg === '--volume' || arg === '-v') && i + 1 < cliArgs.length) {
     extraVolumes.push(cliArgs[i + 1]);
-    i++; // skip the value
+    i++;
   } else if (arg.startsWith('--volume=')) {
     extraVolumes.push(arg.slice(9));
   } else if ((arg === '--publish' || arg === '-p') && i + 1 < cliArgs.length) {
     extraPublish.push(cliArgs[i + 1]);
-    i++; // skip the value
+    i++;
   } else if (arg.startsWith('--publish=')) {
     extraPublish.push(arg.slice(10));
   } else if (arg.startsWith('-p') && arg.length > 2) {
-    // -p5173:5173 (no space variant)
     extraPublish.push(arg.slice(2));
   } else {
-    extraPiArgs.push(arg);
+    extraClaudeArgs.push(arg);
   }
 }
 
@@ -42,20 +41,20 @@ const dirBasename = path.basename(workdir);
 const workspaceTarget = `/workspace/${dirBasename}`;
 const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').slice(0, 12);
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
-const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
+const nodeModulesVolume = `clc-${volumeBasename}-${volumeSuffix}-node-modules`;
 
-// Session directory — pi writes UUID-named session files, no hash needed for isolation
-// Two pi processes in the same container won't collide because session IDs are UUIDs.
-const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
+// Claude Code stores sessions under CLAUDE_CONFIG_DIR/projects/<path-encoded-dir>/
+// We set CLAUDE_CONFIG_DIR to the workspace's .claude dir so sessions persist on the host
+const claudeConfigDir = `${workspaceTarget}/.claude`;
 
 function log(message) {
-  console.log(`[pic-proxy] ${message}`);
+  console.log(`[clc-proxy] ${message}`);
 }
 
 async function startProxy() {
   const server = new ProxyChain.Server({ host, port, verbose });
   server.on('requestFailed', ({ request, error }) => {
-    console.error(`[pic-proxy] request failed ${request?.url || ''}: ${error?.message || error}`);
+    console.error(`[clc-proxy] request failed ${request?.url || ''}: ${error?.message || error}`);
   });
 
   try {
@@ -72,7 +71,7 @@ async function startProxy() {
       const fallbackHost = '0.0.0.0';
       const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
       fallbackServer.on('requestFailed', ({ request, error: reqErr }) => {
-        console.error(`[pic-proxy] request failed ${request?.url || ''}: ${reqErr?.message || reqErr}`);
+        console.error(`[clc-proxy] request failed ${request?.url || ''}: ${reqErr?.message || reqErr}`);
       });
       await fallbackServer.listen();
       log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
@@ -84,12 +83,10 @@ async function startProxy() {
 
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
-  // Normalize the workdir path for comparison
   const normalizedWorkdir = path.resolve(workdirPath);
 
   log(`checking for running container with mount source "${normalizedWorkdir}"`);
 
-  // List running containers as JSON
   const listResult = spawnSync('container', ['list', '--format', 'json'], {
     stdio: ['ignore', 'pipe', 'inherit'],
     encoding: 'utf-8',
@@ -104,7 +101,6 @@ function findContainerWithMount(workdirPath) {
   try {
     containers = JSON.parse(listResult.stdout);
     if (!Array.isArray(containers)) {
-      // Single object when only one container
       containers = [containers];
     }
   } catch {
@@ -116,7 +112,6 @@ function findContainerWithMount(workdirPath) {
     const containerId = container.configuration?.id;
     if (!containerId) continue;
 
-    // Inspect this container to get full mount details
     const inspectResult = spawnSync('container', ['inspect', containerId], {
       stdio: ['ignore', 'pipe', 'inherit'],
       encoding: 'utf-8',
@@ -127,14 +122,17 @@ function findContainerWithMount(workdirPath) {
     let detail;
     try {
       detail = JSON.parse(inspectResult.stdout);
-      // inspect returns an array (one element per container)
       const items = Array.isArray(detail) ? detail : [detail];
       for (const item of items) {
         if (!item.configuration) continue;
+        // Only reuse containers built from agentic-coding-node:24 image
+        const imageName = item.configuration.image || '';
+        if (!imageName.includes('agentic-coding')) {
+          log(`container "${containerId}" uses old image, will not reuse`);
+          continue;
+        }
         for (const mount of item.configuration.mounts || []) {
-          // Mount type "virtiofs" means a host directory bind mount
           if (mount.type === 'virtiofs' || mount.type?.virtiofs !== undefined) {
-            // Resolve the mount source relative to the host
             const mountSource = path.resolve(mount.source);
             if (mountSource === normalizedWorkdir) {
               log(`found running container "${containerId}" with ${workspaceTarget} mounted`);
@@ -154,13 +152,21 @@ function findContainerWithMount(workdirPath) {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
-  fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+  // Copy .claude.json into a temp directory (Apple Container can't bind-mount files)
+  const claudeJsonSrc = path.join(home, '.claude.json');
+  const claudeJsonDir = path.join(workdir, '.claude', 'host-config');
+  if (fs.existsSync(claudeJsonSrc)) {
+    fs.mkdirSync(claudeJsonDir, { recursive: true });
+    fs.copyFileSync(claudeJsonSrc, path.join(claudeJsonDir, 'claude.json'));
+    log(`copied .claude.json to ${claudeJsonDir}/claude.json`);
+  } else {
+    log(`warning: ${claudeJsonSrc} not found, config will be missing inside container`);
+  }
 
   // Check if a container is already running with our workdir mounted
   const existingContainerId = findContainerWithMount(workdir);
 
   if (existingContainerId) {
-    // Volume is already created by the existing container — skip creation
     log(`reusing container "${existingContainerId}" via exec`);
   } else {
     spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
@@ -178,14 +184,13 @@ async function main() {
     }
   }
 
-  // Build the pi args (same for both run and exec)
-  const piArgs = [
-    '--session-dir', sessionDir,
-    ...extraPiArgs,
+  // Build the claude args (same for both run and exec)
+  const claudeArgs = [
+    '--permission-mode', 'bypassPermissions',
+    ...extraClaudeArgs,
   ];
 
   if (existingContainerId) {
-    // Warn if extra volumes/publish were requested — they can't be applied via exec
     if (extraVolumes.length > 0) {
       log(`warning: extra --volume arguments are ignored when reusing container "${existingContainerId}"`);
     }
@@ -203,12 +208,14 @@ async function main() {
       '-e', `http_proxy=${proxyUrl}`,
       '-e', `https_proxy=${proxyUrl}`,
       '-e', `all_proxy=${proxyUrl}`,
+      '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
+      '-e', 'IS_SANDBOX=1',
       existingContainerId,
-      'pi',
-      ...piArgs,
+      'claude',
+      ...claudeArgs,
     ];
 
-    log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
+    log(`exec: container ${args.slice(1, -claudeArgs.length - 1).join(' ')} ... claude --permission-mode bypassPermissions ...`);
     const child = spawn('container', args, { stdio: 'inherit' });
 
     const forwardSignal = (signal) => {
@@ -229,7 +236,8 @@ async function main() {
       '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
       ...extraVolumes.flatMap(v => ['--volume', v]),
       ...extraPublish.flatMap(p => ['--publish', p]),
-      '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+      '--mount', `type=bind,source=${path.join(home, '.claude')},target=/host-claude`,
+      '--mount', `type=bind,source=${claudeJsonDir},target=/host-claude-config`,
       '--dns', '1.1.1.1',
       '-e', `HTTP_PROXY=${proxyUrl}`,
       '-e', `HTTPS_PROXY=${proxyUrl}`,
@@ -237,9 +245,12 @@ async function main() {
       '-e', `http_proxy=${proxyUrl}`,
       '-e', `https_proxy=${proxyUrl}`,
       '-e', `all_proxy=${proxyUrl}`,
+      '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
+      '-e', 'IS_SANDBOX=1',
       '-w', workspaceTarget,
-      'pi-coding-node:24',
-      ...piArgs,
+      'agentic-coding-node:24',
+      'claude',
+      ...claudeArgs,
     ];
 
     const child = spawn('container', args, { stdio: 'inherit' });
@@ -259,6 +270,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`[pic-proxy] ${error.stack || error.message || error}`);
+  console.error(`[clc-proxy] ${error.stack || error.message || error}`);
   process.exit(1);
 });
