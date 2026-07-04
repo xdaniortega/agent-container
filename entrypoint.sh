@@ -14,10 +14,12 @@ case "${1:-}" in
         settings.json \
         settings.local.json \
         statusline-command.sh \
+        CLAUDE.md \
         commands \
         agents \
         skills \
-        plugins
+        plugins \
+        rules
       do
         if [ -e "/host-claude/$item" ]; then
           rm -rf "$claude_config_dir/$item"

@@ -12,12 +12,21 @@ RUN apt-get update \
         fd-find \
         ffmpeg \
         git \
+        jq \
+        less \
+        openssh-client \
         pandoc \
         poppler-utils \
+        python3 \
+        python3-venv \
         ripgrep \
+        procps \
         tesseract-ocr \
+        unzip \
+        zip \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && ln -sf /usr/bin/rg /usr/local/bin/rg \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python \
     && rg --version \
     && arch="$(dpkg --print-architecture)" \
     && case "$arch" in \
