@@ -1,4 +1,9 @@
 node_modules/
 sessions/
+.claude/
+.claude-host-config/
+.pnpm-store/
 npm-debug.log*
 .DS_Store
+Mullvad.local.md
+*.local.md

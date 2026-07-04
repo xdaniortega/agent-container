@@ -4,16 +4,26 @@ set -e
 case "${1:-}" in
   claude)
     # Claude Code setup
+    # Keep Linux-native auth/state in the persistent config volume, but seed only
+    # user-authored config from the host. Avoid copying host work/history/cache files.
+    claude_config_dir="${CLAUDE_CONFIG_DIR:-/root/.claude}"
+    mkdir -p "$claude_config_dir"
+
     if [ -d /host-claude ]; then
-      rm -rf /root/.claude
-      mkdir -p /root/.claude
-      tar -C /host-claude \
-        --exclude='./sessions' \
-        -cf - . | tar -C /root/.claude -xf -
-    fi
-    if [ -d /host-claude-config ]; then
-      mkdir -p /root/.claude
-      cp /host-claude-config/claude.json /root/.claude.json
+      for item in \
+        settings.json \
+        settings.local.json \
+        statusline-command.sh \
+        commands \
+        agents \
+        skills \
+        plugins
+      do
+        if [ -e "/host-claude/$item" ]; then
+          rm -rf "$claude_config_dir/$item"
+          cp -a "/host-claude/$item" "$claude_config_dir/$item"
+        fi
+      done
     fi
 
     shift  # remove 'claude' from args

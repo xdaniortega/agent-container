@@ -131,6 +131,11 @@ function findContainerWithMount(workdirPath) {
       const items = Array.isArray(detail) ? detail : [detail];
       for (const item of items) {
         if (!item.configuration) continue;
+        const imageName = item.configuration.image || '';
+        if (!imageName.includes('agentic-coding')) {
+          log(`container "${containerId}" uses old image, will not reuse`);
+          continue;
+        }
         for (const mount of item.configuration.mounts || []) {
           // Mount type "virtiofs" means a host directory bind mount
           if (mount.type === 'virtiofs' || mount.type?.virtiofs !== undefined) {
@@ -238,7 +243,7 @@ async function main() {
       '-e', `https_proxy=${proxyUrl}`,
       '-e', `all_proxy=${proxyUrl}`,
       '-w', workspaceTarget,
-      'pi-coding-node:24',
+      'agentic-coding-node:24',
       ...piArgs,
     ];
 
