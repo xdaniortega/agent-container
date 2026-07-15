@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# If the caller provides a real executable, run it directly instead of
+# treating the arguments as a Pi prompt. This allows commands like:
+#   container run image pandoc README.md --pdf-engine=typst -o README.pdf
+if [ -n "${1:-}" ] && [ "${1:-}" != "pi" ] && [ "${1:-}" != "claude" ] && command -v "$1" >/dev/null 2>&1; then
+  exec "$@"
+fi
+
 case "${1:-}" in
   claude)
     # Claude Code setup

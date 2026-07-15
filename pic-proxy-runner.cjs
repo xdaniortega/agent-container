@@ -229,7 +229,7 @@ async function main() {
     });
   } else {
     const args = [
-      'run', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
+      'run', '--rm', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
       '--volume', `${workdir}:${workspaceTarget}`,
       '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
       ...extraVolumes.flatMap(v => ['--volume', v]),
