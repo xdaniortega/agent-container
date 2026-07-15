@@ -1,0 +1,45 @@
+#!/bin/sh
+set -e
+
+usage() {
+  cat <<'EOF'
+Usage: md2pdf input.md [output.pdf]
+
+Converts Markdown to PDF using Pandoc + Typst.
+Default font: Noto Serif. Override with PDF_MAINFONT.
+
+Examples:
+  md2pdf README.md
+  md2pdf README.md README.pdf
+  PDF_MAINFONT='Noto Sans' md2pdf README.md README.pdf
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  usage >&2
+  exit 2
+fi
+
+input="$1"
+output="${2:-}"
+font="${PDF_MAINFONT:-Noto Serif}"
+
+if [ ! -f "$input" ]; then
+  echo "md2pdf: input file not found: $input" >&2
+  exit 1
+fi
+
+if [ -z "$output" ]; then
+  case "$input" in
+    *.markdown) output="${input%.markdown}.pdf" ;;
+    *.md) output="${input%.md}.pdf" ;;
+    *) output="${input}.pdf" ;;
+  esac
+fi
+
+exec pandoc "$input" --pdf-engine=typst -V "mainfont=$font" -o "$output"
