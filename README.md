@@ -119,8 +119,9 @@ clc-proxy() {
 Do not bind-mount macOS `~/.claude.json` into the container. Claude Code stores
 macOS credentials in Keychain, while Linux stores credentials under
 `$CLAUDE_CONFIG_DIR/.credentials.json`. `clc-proxy` lets you run `/login` once
-inside the Linux container and persists that Linux credential in a named Apple
-container volume.
+inside Linux and persists that credential in the host-backed Linux config directory
+`~/.clc-container/claude-config`. The directory can be shared by concurrent Apple
+Container VMs without attaching one writable block volume to multiple VMs.
 
 Personal agent preferences:
 - Pi reads your host `~/.pi/agent/SYSTEM.md` through the normal `~/.pi` mount.
@@ -191,11 +192,11 @@ clc-proxy --volume "../web:/workspace/web"
   safe config files into `/root/.pi`, excludes lock/session files, and symlinks
   large directories.
 - **Claude Code proxy**: host `~/.claude` is mounted read-only at `/host-claude`.
-  The entrypoint copies only user-authored config into the persistent Linux config
-  volume at `/claude-config`: `CLAUDE.md`, `rules`, `settings*.json`,
-  `statusline-command.sh`, `commands`, `agents`, `skills`, and `plugins`. It
-  intentionally does not copy credentials, history, cache, debug logs, jobs,
-  paste cache, or old projects.
+  The entrypoint copies only user-authored config into the persistent, host-backed
+  Linux config directory at `~/.clc-container/claude-config`, mounted as
+  `/claude-config`: `CLAUDE.md`, `rules`, `settings*.json`, `statusline-command.sh`,
+  `commands`, `agents`, `skills`, and `plugins`. It intentionally does not copy
+  credentials, history, cache, debug logs, jobs, paste cache, or old projects.
   Run `/login` once in the container; Claude Code persists Linux auth at
   `/claude-config/.credentials.json`. Claude Code project/session history is
   bind-mounted outside the container at `~/.clc-container/claude-projects/<project>`

@@ -43,10 +43,10 @@ const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').sli
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
 const nodeModulesVolume = `clc-${volumeBasename}-${volumeSuffix}-node-modules`;
 
-// Keep Linux-native Claude Code auth/config in a persistent container volume.
-// Host ~/.claude is copied into this dir for settings-like files only; credentials stay in the volume.
+// Keep Linux-native Claude Code auth/config in a host directory shared through VirtioFS.
+// A named Apple Container volume cannot be attached read-write to multiple container VMs.
 const claudeConfigDir = '/claude-config';
-const claudeConfigVolume = 'clc-claude-config';
+const claudeConfigHostDir = path.join(home || process.env.USERPROFILE || '.', '.clc-container', 'claude-config');
 const claudeProjectsDir = `${claudeConfigDir}/projects`;
 const claudeProjectsHostDir = path.join(home || process.env.USERPROFILE || '.', '.clc-container', 'claude-projects', `${volumeBasename}-${volumeSuffix}`);
 const localClaudeDir = path.join(workdir, '.claude');
@@ -131,9 +131,12 @@ function findContainerWithMount(workdirPath) {
       for (const item of items) {
         if (!item.configuration) continue;
         // Only reuse containers built from agentic-coding-node:24 image
-        const imageName = item.configuration.image || '';
+        const image = item.configuration.image;
+        const imageName = typeof image === 'string'
+          ? image
+          : image?.reference || image?.descriptor?.annotations?.['com.apple.containerization.image.name'] || '';
         if (!imageName.includes('agentic-coding')) {
-          log(`container "${containerId}" uses old image, will not reuse`);
+          log(`container "${containerId}" uses image "${imageName || 'unknown'}", will not reuse`);
           continue;
         }
 
@@ -148,15 +151,14 @@ function findContainerWithMount(workdirPath) {
             }
           }
           const mountTarget = mount.target || mount.destination || mount.mountpoint || mount.mountPoint;
-          const mountSourceName = String(mount.source || mount.name || '');
           const mountSourcePath = mount.source ? path.resolve(mount.source) : '';
-          if (mountTarget === claudeConfigDir && mountSourceName.includes(claudeConfigVolume)) {
+          if (mountTarget === claudeConfigDir && mountSourcePath === path.resolve(claudeConfigHostDir)) {
             hasClaudeConfigMount = true;
           }
           if (mountTarget === claudeProjectsDir && mountSourcePath === path.resolve(claudeProjectsHostDir)) {
             hasClaudeProjectsMount = true;
           }
-        }
+          }
         if (hasWorkdirMount && hasClaudeConfigMount && hasClaudeProjectsMount) {
           log(`found running container "${containerId}" with ${workspaceTarget} mounted`);
           return containerId;
@@ -166,7 +168,8 @@ function findContainerWithMount(workdirPath) {
           log(`container "${containerId}" has workdir mounted but is missing current Claude config/session mounts; will start a new container`);
         }
       }
-    } catch {
+    } catch (error) {
+      log(`failed to inspect container "${containerId}": ${error?.message || error}`);
       continue;
     }
   }
@@ -201,6 +204,7 @@ function ensureLocalProjectsLink() {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
+  fs.mkdirSync(claudeConfigHostDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(claudeProjectsHostDir, { recursive: true });
   ensureLocalProjectsLink();
 
@@ -212,7 +216,6 @@ async function main() {
     log(`reusing container "${existingContainerId}" via exec`);
   } else {
     spawnSync('container', ['volume', 'create', nodeModulesVolume], { stdio: verbose ? 'inherit' : 'ignore' });
-    spawnSync('container', ['volume', 'create', claudeConfigVolume], { stdio: verbose ? 'inherit' : 'ignore' });
   }
 
   const proxy = await startProxy();
@@ -281,7 +284,7 @@ async function main() {
       ...extraVolumes.flatMap(v => ['--volume', v]),
       ...extraPublish.flatMap(p => ['--publish', p]),
       '--mount', `type=bind,source=${path.join(home, '.claude')},target=/host-claude,readonly`,
-      '--mount', `type=volume,source=${claudeConfigVolume},target=${claudeConfigDir}`,
+      '--mount', `type=bind,source=${claudeConfigHostDir},target=${claudeConfigDir}`,
       '--mount', `type=bind,source=${claudeProjectsHostDir},target=${claudeProjectsDir}`,
       '--dns', '1.1.1.1',
       '-e', `HTTP_PROXY=${proxyUrl}`,
