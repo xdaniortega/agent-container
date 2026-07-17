@@ -131,9 +131,12 @@ function findContainerWithMount(workdirPath) {
       const items = Array.isArray(detail) ? detail : [detail];
       for (const item of items) {
         if (!item.configuration) continue;
-        const imageName = item.configuration.image || '';
+        const image = item.configuration.image;
+        const imageName = typeof image === 'string'
+          ? image
+          : image?.reference || image?.descriptor?.annotations?.['com.apple.containerization.image.name'] || '';
         if (!imageName.includes('agentic-coding')) {
-          log(`container "${containerId}" uses old image, will not reuse`);
+          log(`container "${containerId}" uses image "${imageName || 'unknown'}", will not reuse`);
           continue;
         }
         for (const mount of item.configuration.mounts || []) {
@@ -148,7 +151,8 @@ function findContainerWithMount(workdirPath) {
           }
         }
       }
-    } catch {
+    } catch (error) {
+      log(`failed to inspect container "${containerId}": ${error?.message || error}`);
       continue;
     }
   }
