@@ -4,6 +4,7 @@
   "type": "commonjs",
   "packageManager": "pnpm@11.5.2",
   "scripts": {
+    "pic": "node ./pic-runner.cjs",
     "proxy": "node ./pic-proxy-runner.cjs",
     "clc-proxy": "node ./clc-proxy-runner.cjs"
   },
@@ -11,6 +12,7 @@
     "proxy-chain": "^2.6.0"
   },
   "bin": {
+    "pic": "./pic-runner.cjs",
     "pic-proxy": "./pic-proxy-runner.cjs",
     "clc-proxy": "./clc-proxy-runner.cjs"
   }

@@ -6,16 +6,16 @@ Run **Pi** (the Pi coding agent) or **Claude Code** inside an Apple container wh
 
 | Command | Use when |
 |---------|----------|
-| `pic` | Normal containerized Pi session; host `~/.pi` is mounted read-only. |
-| `pic-admin` | You need to modify Pi config, e.g. `pi install`, `pi update`, `/login`, or extension/package changes. |
-| `pic-proxy` | A VPN is connected and container networking needs a host-side proxy (Pi). |
-| `clc-proxy` | Claude Code in the container, with host-side proxy, persistent Linux auth, and host-inspectable sessions. |
+| `pic` | Containerized Pi with direct networking. |
+| `pic --proxy` | Containerized Pi through the host-side proxy. |
+| `pic-proxy` | Compatibility alias for `pic --proxy`. |
+| `clc-proxy` | Claude Code with host-side proxy, persistent Linux auth, and host-inspectable sessions. |
 
 ## Requirements
 
 - macOS 26.x with Apple container installed.
 - Apple container system services started.
-- Node.js/npm on the host only if you want to use `pic-proxy` or `clc-proxy`.
+- Node.js/npm on the host for the command runners.
 
 Install Apple container from:
 https://github.com/apple/container/releases
@@ -70,51 +70,24 @@ still fail because the VPN blocks direct public egress from the builder VM.
 
 ## Install the Commands
 
-Add these shell functions to your shell config, for example `~/.zshrc`:
+Install dependencies and link the command runners:
 
-### Pi commands
-```zsh
-pic() {
-  local dir="${PWD##*/}"
-  local session_tag="pic-$(openssl rand -hex 4)"
-  mkdir -p "$PWD/.pi/agent/sessions"
-  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
-  container volume create "$nm_volume" >/dev/null 2>&1 || true
-  container run -it --memory 4g \
-    --volume "$PWD:/workspace/$dir" \
-    --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
-    --mount type=bind,source="$HOME/.pi",target=/host-pi,readonly \
-    --dns 1.1.1.1 \
-    -w "/workspace/$dir" \
-    agentic-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
-}
-
-pic-admin() {
-  local dir="${PWD##*/}"
-  local session_tag="pic-$(openssl rand -hex 4)"
-  mkdir -p "$PWD/.pi/agent/sessions"
-  local nm_volume="pic-node-modules-$(pwd | shasum | cut -c1-12)"
-  container volume create "$nm_volume" >/dev/null 2>&1 || true
-  container run -it --memory 4g \
-    --volume "$PWD:/workspace/$dir" \
-    --mount type=volume,source="$nm_volume",target="/workspace/$dir/node_modules" \
-    --mount type=bind,source="$HOME/.pi",target=/root/.pi \
-    --dns 1.1.1.1 \
-    -w "/workspace/$dir" \
-    agentic-coding-node:24 --session-dir "/workspace/$dir/.pi/agent/sessions/$session_tag"
-}
+```bash
+npm install
+npm link
 ```
 
-### Claude Code command
+This installs `pic`, `pic-proxy`, and `clc-proxy`. Remove any existing shell
+function or alias named `pic`, because shell definitions take precedence over the
+linked executable.
 
-Install `clc-proxy` from this repo rather than hand-writing a shell function. It
-handles Claude Code auth/config/session mounts safely:
+`pic` uses direct networking by default. `pic --proxy` enables the host-side
+proxy; the older `pic-proxy` command remains an equivalent compatibility alias.
 
-```zsh
-clc-proxy() {
-  node /path/to/pi-container/clc-proxy-runner.cjs "$@"
-}
-```
+Direct mode explicitly clears uppercase and lowercase HTTP, HTTPS, and ALL proxy
+variables, including when it reuses a container originally started in proxy mode.
+Containers started by the runner use `--rm`, and a proxy owned by the runner is
+closed when the Pi process exits.
 
 Do not bind-mount macOS `~/.claude.json` into the container. Claude Code stores
 macOS credentials in Keychain, while Linux stores credentials under
@@ -131,26 +104,15 @@ Personal agent preferences:
   it gitignored. Do not use `.claude.local.md`; Claude Code does not load that
   as a standard memory file.
 
-Install `pic-proxy` and `clc-proxy` from this repo:
-```bash
-npm install
-npm link
-```
-
-This exposes both `pic-proxy` and `clc-proxy` as npm-linked executables.
 
 ## Run
 
 From any project directory:
 ```bash
-pic        # Pi coding agent
-clc-proxy  # Claude Code; also works when a VPN needs the proxy
-```
-
-When a VPN is connected, use the proxy variants:
-```bash
-pic-proxy  # Pi with VPN proxy
-clc-proxy  # Claude Code with VPN proxy/auth/session management
+pic             # Pi with direct networking
+pic --proxy     # Pi through the host-side proxy
+pic-proxy       # compatibility alias for `pic --proxy`
+clc-proxy       # Claude Code through the host-side proxy
 ```
 
 You can publish container ports to the host by passing `-p` or `--publish` arguments:
@@ -160,9 +122,9 @@ clc-proxy -p 5173:5173 -p 3000:3000
 
 ### Session Isolation
 
-Pi invocations generate a **unique session tag** under `./.pi/agent/sessions/`.
-Claude Code stores project history under its normal `projects/` layout, but
-`clc-proxy` bind-mounts that directory outside the container at:
+Pi stores UUID-named sessions under `./.pi/agent/sessions/`; concurrent Pi
+processes can safely share that directory. Claude Code stores project history
+under its normal `projects/` layout, but `clc-proxy` bind-mounts that directory outside the container at:
 
 ```text
 ~/.clc-container/claude-projects/<project>/
@@ -174,10 +136,6 @@ For convenience, `clc-proxy` also creates this ignored project-local symlink:
 ./.claude/projects -> ~/.clc-container/claude-projects/<project>/
 ```
 
-Clean up old Pi session tags with:
-```bash
-rm -rf .pi/agent/sessions/pic-*
-```
 
 ### Mounting multiple directories with `--volume`
 
@@ -202,9 +160,6 @@ clc-proxy --volume "../web:/workspace/web"
   bind-mounted outside the container at `~/.clc-container/claude-projects/<project>`
   via `/claude-config/projects`.
 
-`pic-admin` mounts host Pi config directly at `/root/.pi` (writable) for
-configuration changes and login. For Claude Code, prefer `clc-proxy` plus
-container-local `/login`; do not copy macOS credentials into the repo.
 
 ## Test / Debug
 
