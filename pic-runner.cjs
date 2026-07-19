@@ -192,72 +192,12 @@ function stopServer(server, sockets = new Set()) {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-function containerHerdrBridgeScript(bridgePort) {
-  return `
-set -e
-cat > /tmp/pic-herdr-bridge.cjs <<'EOF'
-const net = require('node:net');
-const fs = require('node:fs');
-const socketPath = process.env.HERDR_SOCKET_PATH || '${herdrBridgeSocketPath}';
-const host = process.env.PIC_HERDR_BRIDGE_HOST || '${herdrBridgeHost}';
-const port = Number(process.env.PIC_HERDR_BRIDGE_PORT || '${bridgePort}');
-try { fs.unlinkSync(socketPath); } catch {}
-const server = net.createServer((local) => {
-  const remote = net.connect(port, host);
-  local.pipe(remote);
-  remote.pipe(local);
-  const closeBoth = () => { local.destroy(); remote.destroy(); };
-  local.on('error', closeBoth);
-  remote.on('error', closeBoth);
-});
-server.on('error', (error) => {
-  console.error('[pic-herdr-bridge] ' + (error && error.stack || error));
-  process.exit(1);
-});
-server.listen(socketPath, () => {
-  fs.chmodSync(socketPath, 0o600);
-  console.error('[pic-herdr-bridge] listening on ' + socketPath + ' -> ' + host + ':' + port);
-});
-EOF
-node /tmp/pic-herdr-bridge.cjs &
-bridge_pid=$!
-trap 'kill "$bridge_pid" 2>/dev/null || true; rm -f "$HERDR_SOCKET_PATH"' EXIT INT TERM
-sleep 0.2
-
-if [ -d /host-pi/agent/extensions ]; then
-  mkdir -p /root/.pi/agent/extensions
-  for extension in /host-pi/agent/extensions/*; do
-    [ -e "$extension" ] || continue
-    target="/root/.pi/agent/extensions/$(basename "$extension")"
-    if [ ! -e "$target" ]; then
-      ln -s "$extension" "$target"
-    fi
-  done
-fi
-
-if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extensions/rtk.ts ]; then
-  ln -s /usr/local/share/pi/extensions/rtk.ts /root/.pi/agent/extensions/rtk.ts
-fi
-
-for extension in /root/.pi/agent/extensions/rtk.ts; do
-  [ -f "$extension" ] || continue
-  set -- -e "$extension" "$@"
-done
-
-if [ "\${HERDR_ENV:-}" = "1" ]; then
-  for extension in /root/.pi/agent/extensions/herdr-agent-state.ts; do
-    [ -f "$extension" ] || continue
-    set -- -e "$extension" "$@"
-  done
-fi
-
-exec pi "$@"
-`;
+function containerRunPiCommand(piArgs) {
+  return ['pi', ...piArgs];
 }
 
-function containerPiCommand(piArgs, herdrBridge, useEntrypoint = false) {
-  if (!herdrBridge.started || useEntrypoint) return ['pi', ...piArgs];
-  return ['sh', '-lc', containerHerdrBridgeScript(herdrBridge.port), 'pic-herdr-entrypoint', ...piArgs];
+function containerExecPiCommand(piArgs) {
+  return ['entrypoint', 'pi', ...piArgs];
 }
 
 // Check if a running container already has workdir mounted as a virtiofs share
@@ -417,7 +357,7 @@ async function main() {
       ...herdrEnvironmentArgs(),
       ...herdrBridgeEnvironmentArgs(herdrBridge),
       existingContainerId,
-      ...containerPiCommand(piArgs, herdrBridge, false),
+      ...containerExecPiCommand(piArgs),
     ];
 
     log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
@@ -449,7 +389,7 @@ async function main() {
       ...herdrBridgeEnvironmentArgs(herdrBridge),
       '-w', workspaceTarget,
       'agentic-coding-node:24',
-      ...containerPiCommand(piArgs, herdrBridge, true),
+      ...containerRunPiCommand(piArgs),
     ];
 
     const child = spawn('container', args, { stdio: 'inherit' });
