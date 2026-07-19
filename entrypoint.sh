@@ -61,6 +61,17 @@ case "${1:-}" in
       ln -s /host-pi/agent/git /root/.pi/agent/git
     fi
 
+    if [ -d /host-pi/agent/extensions ]; then
+      mkdir -p /root/.pi/agent/extensions
+      for extension in /host-pi/agent/extensions/*; do
+        [ -e "$extension" ] || continue
+        target="/root/.pi/agent/extensions/$(basename "$extension")"
+        if [ ! -e "$target" ]; then
+          ln -s "$extension" "$target"
+        fi
+      done
+    fi
+
     should_pnpm_install=false
     if [ "${PIC_PNPM_INSTALL:-1}" != "0" ] && [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
       if [ -f pnpm-lock.yaml ]; then
@@ -76,12 +87,52 @@ case "${1:-}" in
       pnpm install --prefer-offline
     fi
 
-    if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extensions/rtk.ts ]; then
-      exec pi -e /usr/local/share/pi/extensions/rtk.ts "$@"
-    fi
-
     # If args start with 'pi', shift it off
     if [ "${1:-}" = "pi" ]; then shift; fi
+
+    if [ "${PIC_HERDR_BRIDGE:-0}" = "1" ] && [ -n "${HERDR_SOCKET_PATH:-}" ]; then
+      cat > /tmp/pic-herdr-bridge.cjs <<'EOF'
+const net = require('node:net');
+const fs = require('node:fs');
+const socketPath = process.env.HERDR_SOCKET_PATH;
+const host = process.env.PIC_HERDR_BRIDGE_HOST || '192.168.64.1';
+const port = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
+try { fs.unlinkSync(socketPath); } catch {}
+const server = net.createServer((local) => {
+  const remote = net.connect(port, host);
+  local.pipe(remote);
+  remote.pipe(local);
+  const closeBoth = () => { local.destroy(); remote.destroy(); };
+  local.on('error', closeBoth);
+  remote.on('error', closeBoth);
+});
+server.on('error', (error) => {
+  console.error('[pic-herdr-bridge] ' + (error && error.stack || error));
+  process.exit(1);
+});
+server.listen(socketPath, () => {
+  fs.chmodSync(socketPath, 0o600);
+  console.error('[pic-herdr-bridge] listening on ' + socketPath + ' -> ' + host + ':' + port);
+});
+EOF
+      node /tmp/pic-herdr-bridge.cjs &
+      bridge_pid=$!
+      trap 'kill "$bridge_pid" 2>/dev/null || true; rm -f "$HERDR_SOCKET_PATH"' EXIT INT TERM
+      sleep 0.2
+    fi
+
+    if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extensions/rtk.ts ]; then
+      ln -s /usr/local/share/pi/extensions/rtk.ts /root/.pi/agent/extensions/rtk.ts
+    fi
+
+    for extension in \
+      /root/.pi/agent/extensions/rtk.ts \
+      /root/.pi/agent/extensions/herdr-agent-state.ts
+    do
+      [ -f "$extension" ] || continue
+      set -- -e "$extension" "$@"
+    done
+
     exec pi "$@"
     ;;
 esac

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const { spawn, spawnSync } = require('node:child_process');
+const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -52,10 +53,51 @@ const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 // Two pi processes in the same container won't collide because session IDs are UUIDs.
 const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
 const proxyEnvironmentNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
+const herdrSocketMountEnabled = process.env.PIC_HERDR_SOCKET_MOUNT === '1';
+const herdrSocketPath = process.env.HERDR_SOCKET_PATH || '';
+const herdrSocketDir = herdrSocketMountEnabled && herdrSocketPath ? path.dirname(herdrSocketPath) : '';
+const herdrSocketBasename = herdrSocketMountEnabled && herdrSocketPath ? path.basename(herdrSocketPath) : '';
+const herdrSocketMountTarget = '/herdr-socket';
+const herdrSocketContainerPath = herdrSocketMountEnabled && herdrSocketPath ? `${herdrSocketMountTarget}/${herdrSocketBasename}` : '';
+const herdrBridgeEnabled = process.env.PIC_HERDR_BRIDGE === '1';
+const herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
+const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
+const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
 
 function proxyEnvironmentArgs() {
   const value = proxyEnabled ? proxyUrl : '';
   return proxyEnvironmentNames.flatMap(name => ['-e', `${name}=${value}`]);
+}
+
+function herdrEnvironmentArgs() {
+  const args = [];
+  for (const name of herdrEnvironmentNames) {
+    const value = process.env[name];
+    if (value !== undefined) args.push('-e', `${name}=${value}`);
+  }
+  if (herdrBridgeEnabled) {
+    args.push('-e', `HERDR_SOCKET_PATH=${herdrBridgeSocketPath}`);
+  } else if (herdrSocketContainerPath) {
+    args.push('-e', `HERDR_SOCKET_PATH=${herdrSocketContainerPath}`);
+  } else if (process.env.HERDR_SOCKET_PATH && herdrSocketMountEnabled) {
+    args.push('-e', `HERDR_SOCKET_PATH=${process.env.HERDR_SOCKET_PATH}`);
+  }
+  return args;
+}
+
+function herdrBridgeEnvironmentArgs(herdrBridge) {
+  if (!herdrBridge.started) return [];
+  return [
+    '-e', 'PIC_HERDR_BRIDGE=1',
+    '-e', `PIC_HERDR_BRIDGE_HOST=${herdrBridgeHost}`,
+    '-e', `PIC_HERDR_BRIDGE_PORT=${herdrBridge.port}`,
+  ];
+}
+
+function herdrSocketVolumeArgs() {
+  if (!herdrSocketMountEnabled || !herdrSocketDir) return [];
+  return ['--volume', `${herdrSocketDir}:${herdrSocketMountTarget}`];
 }
 
 function log(message) {
@@ -90,6 +132,111 @@ async function startProxy() {
     }
     throw error;
   }
+}
+
+function startHerdrHostBridge() {
+  if (!herdrBridgeEnabled) return Promise.resolve({ server: null, started: false, port: null });
+  if (!herdrSocketPath) throw new Error('PIC_HERDR_BRIDGE=1 requires HERDR_SOCKET_PATH to be set by Herdr');
+
+  return new Promise((resolve, reject) => {
+    const sockets = new Set();
+    const server = net.createServer((tcpSocket) => {
+      const unixSocket = net.connect({ path: herdrSocketPath });
+      sockets.add(tcpSocket);
+      sockets.add(unixSocket);
+      tcpSocket.pipe(unixSocket);
+      unixSocket.pipe(tcpSocket);
+
+      const closeBoth = () => {
+        sockets.delete(tcpSocket);
+        sockets.delete(unixSocket);
+        tcpSocket.destroy();
+        unixSocket.destroy();
+      };
+      tcpSocket.on('error', closeBoth);
+      unixSocket.on('error', closeBoth);
+      tcpSocket.on('close', closeBoth);
+      unixSocket.on('close', closeBoth);
+    });
+
+    server.once('error', reject);
+    server.listen(herdrBridgeRequestedPort, herdrBridgeHost, () => {
+      server.off('error', reject);
+      const address = server.address();
+      const actualPort = typeof address === 'object' && address ? address.port : herdrBridgeRequestedPort;
+      log(`Herdr bridge listening on ${herdrBridgeHost}:${actualPort} -> ${herdrSocketPath}`);
+      resolve({ server, sockets, started: true, port: actualPort });
+    });
+  });
+}
+
+function stopServer(server, sockets = new Set()) {
+  for (const socket of sockets) socket.destroy();
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function containerHerdrBridgeScript(bridgePort) {
+  return `
+set -e
+cat > /tmp/pic-herdr-bridge.cjs <<'EOF'
+const net = require('node:net');
+const fs = require('node:fs');
+const socketPath = process.env.HERDR_SOCKET_PATH || '${herdrBridgeSocketPath}';
+const host = process.env.PIC_HERDR_BRIDGE_HOST || '${herdrBridgeHost}';
+const port = Number(process.env.PIC_HERDR_BRIDGE_PORT || '${bridgePort}');
+try { fs.unlinkSync(socketPath); } catch {}
+const server = net.createServer((local) => {
+  const remote = net.connect(port, host);
+  local.pipe(remote);
+  remote.pipe(local);
+  const closeBoth = () => { local.destroy(); remote.destroy(); };
+  local.on('error', closeBoth);
+  remote.on('error', closeBoth);
+});
+server.on('error', (error) => {
+  console.error('[pic-herdr-bridge] ' + (error && error.stack || error));
+  process.exit(1);
+});
+server.listen(socketPath, () => {
+  fs.chmodSync(socketPath, 0o600);
+  console.error('[pic-herdr-bridge] listening on ' + socketPath + ' -> ' + host + ':' + port);
+});
+EOF
+node /tmp/pic-herdr-bridge.cjs &
+bridge_pid=$!
+trap 'kill "$bridge_pid" 2>/dev/null || true; rm -f "$HERDR_SOCKET_PATH"' EXIT INT TERM
+sleep 0.2
+
+if [ -d /host-pi/agent/extensions ]; then
+  mkdir -p /root/.pi/agent/extensions
+  for extension in /host-pi/agent/extensions/*; do
+    [ -e "$extension" ] || continue
+    target="/root/.pi/agent/extensions/$(basename "$extension")"
+    if [ ! -e "$target" ]; then
+      ln -s "$extension" "$target"
+    fi
+  done
+fi
+
+if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extensions/rtk.ts ]; then
+  ln -s /usr/local/share/pi/extensions/rtk.ts /root/.pi/agent/extensions/rtk.ts
+fi
+
+for extension in \
+  /root/.pi/agent/extensions/rtk.ts \
+  /root/.pi/agent/extensions/herdr-agent-state.ts
+do
+  [ -f "$extension" ] || continue
+  set -- -e "$extension" "$@"
+done
+
+exec pi "$@"
+`;
+}
+
+function containerPiCommand(piArgs, herdrBridge, useEntrypoint = false) {
+  if (!herdrBridge.started || useEntrypoint) return ['pi', ...piArgs];
+  return ['sh', '-lc', containerHerdrBridgeScript(herdrBridge.port), 'pic-herdr-entrypoint', ...piArgs];
 }
 
 // Check if a running container already has workdir mounted as a virtiofs share
@@ -152,6 +299,7 @@ function findContainerWithMount(workdirPath) {
         let hasWorkdirMount = false;
         let hasPiConfigMount = false;
         let hasNodeModulesMount = false;
+        let hasHerdrSocketMount = !herdrSocketDir;
         for (const mount of item.configuration.mounts || []) {
           const mountTarget = mount.target || mount.destination || mount.mountpoint || mount.mountPoint;
           const mountSourcePath = mount.source ? path.resolve(mount.source) : '';
@@ -164,16 +312,19 @@ function findContainerWithMount(workdirPath) {
               hasPiConfigMount = true;
             }
           }
+            if (herdrSocketDir && mountSourcePath === path.resolve(herdrSocketDir) && mountTarget === herdrSocketMountTarget) {
+              hasHerdrSocketMount = true;
+            }
           if (mountTarget === `${workspaceTarget}/node_modules` && mountSourceName.includes(nodeModulesVolume)) {
             hasNodeModulesMount = true;
           }
         }
-        if (hasWorkdirMount && hasPiConfigMount && hasNodeModulesMount) {
+        if (hasWorkdirMount && hasPiConfigMount && hasNodeModulesMount && hasHerdrSocketMount) {
           log(`found compatible running container "${containerId}" with ${workspaceTarget} mounted`);
           return containerId;
         }
         if (hasWorkdirMount) {
-          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/node_modules mounts; will not reuse`);
+          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/node_modules/Herdr socket mounts; will not reuse`);
         }
       }
     } catch (error) {
@@ -203,6 +354,7 @@ async function main() {
   const proxy = proxyEnabled
     ? await startProxy()
     : { server: null, started: false };
+  const herdrBridge = await startHerdrHostBridge();
   if (!proxyEnabled) log('proxy disabled; clearing proxy environment for the Pi process');
   let cleanedUp = false;
 
@@ -212,6 +364,10 @@ async function main() {
     if (proxy.started && proxy.server) {
       log('stopping proxy-chain');
       await proxy.server.close(true);
+    }
+    if (herdrBridge.started && herdrBridge.server) {
+      log('stopping Herdr bridge');
+      await stopServer(herdrBridge.server, herdrBridge.sockets);
     }
   }
 
@@ -235,9 +391,10 @@ async function main() {
       ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []),
       '-w', workspaceTarget,
       ...proxyEnvironmentArgs(),
+      ...herdrEnvironmentArgs(),
+      ...herdrBridgeEnvironmentArgs(herdrBridge),
       existingContainerId,
-      'pi',
-      ...piArgs,
+      ...containerPiCommand(piArgs, herdrBridge, false),
     ];
 
     log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
@@ -260,13 +417,16 @@ async function main() {
       '--volume', `${workdir}:${workspaceTarget}`,
       '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
       ...extraVolumes.flatMap(v => ['--volume', v]),
+      ...herdrSocketVolumeArgs(),
       ...extraPublish.flatMap(p => ['--publish', p]),
       '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
       '--dns', '1.1.1.1',
       ...proxyEnvironmentArgs(),
+      ...herdrEnvironmentArgs(),
+      ...herdrBridgeEnvironmentArgs(herdrBridge),
       '-w', workspaceTarget,
       'agentic-coding-node:24',
-      ...piArgs,
+      ...containerPiCommand(piArgs, herdrBridge, true),
     ];
 
     const child = spawn('container', args, { stdio: 'inherit' });
