@@ -15,6 +15,9 @@ const home = process.env.HOME;
 const cliArgs = process.argv.slice(2);
 let proxyEnabled = process.env.PIC_PROXY_MODE === '1';
 const commandName = process.env.PIC_COMMAND_NAME || 'pic';
+if (process.env.HERDR_ENV === '1' && !process.env.HERDR_AGENT) {
+  process.env.HERDR_AGENT = 'pi';
+}
 
 // Extract runner-level --proxy, --volume, and --publish/-p arguments; pass the rest to Pi.
 const extraVolumes = [];
@@ -60,7 +63,8 @@ const herdrSocketDir = herdrSocketMountEnabled && herdrSocketPath ? path.dirname
 const herdrSocketBasename = herdrSocketMountEnabled && herdrSocketPath ? path.basename(herdrSocketPath) : '';
 const herdrSocketMountTarget = '/herdr-socket';
 const herdrSocketContainerPath = herdrSocketMountEnabled && herdrSocketPath ? `${herdrSocketMountTarget}/${herdrSocketBasename}` : '';
-const herdrBridgeEnabled = process.env.PIC_HERDR_BRIDGE === '1';
+const herdrBridgeEnv = process.env.PIC_HERDR_BRIDGE;
+const herdrBridgeEnabled = herdrBridgeEnv === '1' || (herdrBridgeEnv !== '0' && process.env.HERDR_ENV === '1' && Boolean(herdrSocketPath) && Boolean(process.env.HERDR_PANE_ID));
 const herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
 const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
 const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
@@ -104,6 +108,19 @@ function log(message) {
   console.log(`[${commandName}] ${message}`);
 }
 
+function maybeRenameHerdrAgent() {
+  if (process.env.PIC_HERDR_RENAME === '0') return;
+  if (process.env.HERDR_ENV !== '1' || !process.env.HERDR_PANE_ID) return;
+  const name = process.env.PIC_HERDR_NAME || dirBasename;
+  if (!name) return;
+  const herdrBin = process.env.HERDR_BIN_PATH || 'herdr';
+  const result = spawnSync(herdrBin, ['agent', 'rename', process.env.HERDR_PANE_ID, name], {
+    stdio: verbose ? 'inherit' : 'ignore',
+  });
+  if (verbose && result.status !== 0) {
+    log(`warning: failed to rename Herdr agent ${process.env.HERDR_PANE_ID} to "${name}"`);
+  }
+}
 async function startProxy() {
   const server = new ProxyChain.Server({ host, port, verbose });
   server.on('requestFailed', ({ request, error }) => {
@@ -222,13 +239,17 @@ if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extens
   ln -s /usr/local/share/pi/extensions/rtk.ts /root/.pi/agent/extensions/rtk.ts
 fi
 
-for extension in \
-  /root/.pi/agent/extensions/rtk.ts \
-  /root/.pi/agent/extensions/herdr-agent-state.ts
-do
+for extension in /root/.pi/agent/extensions/rtk.ts; do
   [ -f "$extension" ] || continue
   set -- -e "$extension" "$@"
 done
+
+if [ "\${HERDR_ENV:-}" = "1" ]; then
+  for extension in /root/.pi/agent/extensions/herdr-agent-state.ts; do
+    [ -f "$extension" ] || continue
+    set -- -e "$extension" "$@"
+  done
+fi
 
 exec pi "$@"
 `;
@@ -340,6 +361,8 @@ async function main() {
   if (!home) throw new Error('HOME is not set');
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+
+  maybeRenameHerdrAgent();
 
   // Check if a container is already running with our workdir mounted
   const existingContainerId = findContainerWithMount(workdir);
