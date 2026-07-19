@@ -115,6 +115,26 @@ pic-proxy       # compatibility alias for `pic --proxy`
 clc-proxy       # Claude Code through the host-side proxy
 ```
 
+### Herdr integration
+
+When `pic` or `pic-proxy` is launched inside a Herdr pane, the runner auto-enables Pi status reporting through a host/container socket bridge. No Herdr socket is bind-mounted into the Apple container.
+
+```bash
+pic-proxy
+# or
+herdr agent start "$(basename "$PWD")" --cwd "$PWD" -- pic-proxy
+```
+
+The Herdr agent is renamed to the current directory basename by default. Override or disable that with:
+
+```bash
+PIC_HERDR_NAME=my-agent pic-proxy
+PIC_HERDR_RENAME=0 pic-proxy
+PIC_HERDR_BRIDGE=0 pic-proxy   # disable Herdr status bridge
+```
+
+Run `herdr integration install pi` on the host once. The entrypoint loads `herdr-agent-state.ts` only when `HERDR_ENV=1`.
+
 You can publish container ports to the host by passing `-p` or `--publish` arguments:
 ```bash
 clc-proxy -p 5173:5173 -p 3000:3000
