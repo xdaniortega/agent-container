@@ -64,7 +64,11 @@ const herdrSocketBasename = herdrSocketMountEnabled && herdrSocketPath ? path.ba
 const herdrSocketMountTarget = '/herdr-socket';
 const herdrSocketContainerPath = herdrSocketMountEnabled && herdrSocketPath ? `${herdrSocketMountTarget}/${herdrSocketBasename}` : '';
 const herdrBridgeEnv = process.env.PIC_HERDR_BRIDGE;
-const herdrBridgeEnabled = herdrBridgeEnv === '1' || (herdrBridgeEnv !== '0' && process.env.HERDR_ENV === '1' && Boolean(herdrSocketPath) && Boolean(process.env.HERDR_PANE_ID));
+const herdrSessionDetected = process.env.HERDR_ENV === '1'
+  && Boolean(herdrSocketPath)
+  && Boolean(process.env.HERDR_PANE_ID)
+  && fs.existsSync(herdrSocketPath);
+const herdrBridgeEnabled = herdrBridgeEnv === '1' || (herdrBridgeEnv !== '0' && herdrSessionDetected);
 const herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
 const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
 const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
@@ -176,14 +180,27 @@ function startHerdrHostBridge() {
       unixSocket.on('close', closeBoth);
     });
 
-    server.once('error', reject);
-    server.listen(herdrBridgeRequestedPort, herdrBridgeHost, () => {
-      server.off('error', reject);
-      const address = server.address();
-      const actualPort = typeof address === 'object' && address ? address.port : herdrBridgeRequestedPort;
-      log(`Herdr bridge listening on ${herdrBridgeHost}:${actualPort} -> ${herdrSocketPath}`);
-      resolve({ server, sockets, started: true, port: actualPort });
+    const listen = (listenHost, advertisedHost = herdrBridgeHost) => {
+      server.listen(herdrBridgeRequestedPort, listenHost, () => {
+        server.removeAllListeners('error');
+        const address = server.address();
+        const actualPort = typeof address === 'object' && address ? address.port : herdrBridgeRequestedPort;
+        const suffix = listenHost === advertisedHost ? '' : ` (advertised to container as ${advertisedHost}:${actualPort})`;
+        log(`Herdr bridge listening on ${listenHost}:${actualPort} -> ${herdrSocketPath}${suffix}`);
+        resolve({ server, sockets, started: true, port: actualPort });
+      });
+    };
+
+    server.once('error', (error) => {
+      if (error && error.code === 'EADDRNOTAVAIL' && herdrBridgeHost !== '0.0.0.0') {
+        log(`Herdr bridge address ${herdrBridgeHost} is not available, falling back to 0.0.0.0`);
+        listen('0.0.0.0', herdrBridgeHost);
+      } else {
+        reject(error);
+      }
     });
+
+    listen(herdrBridgeHost);
   });
 }
 
@@ -200,6 +217,38 @@ function containerExecPiCommand(piArgs) {
   return ['entrypoint', 'pi', ...piArgs];
 }
 
+function startContainerSystemIfNeeded() {
+  log('container service is not responding; running `container system start`');
+  const startResult = spawnSync('container', ['system', 'start'], {
+    stdio: 'inherit',
+    encoding: 'utf-8',
+  });
+  if (startResult.status !== 0) {
+    log(`container system start failed (exit ${startResult.status}); continuing anyway`);
+    return false;
+  }
+  return true;
+}
+
+function listContainersJson({ allowStart = true } = {}) {
+  const runList = () => spawnSync('container', ['list', '--format', 'json'], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    encoding: 'utf-8',
+  });
+
+  let listResult = runList();
+  if (listResult.status === 0) return listResult;
+
+  if (allowStart && startContainerSystemIfNeeded()) {
+    for (let attempt = 1; attempt <= 15; attempt += 1) {
+      listResult = runList();
+      if (listResult.status === 0) return listResult;
+      spawnSync('sleep', ['1'], { stdio: 'ignore' });
+    }
+  }
+
+  return listResult;
+}
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
   // Normalize the workdir path for comparison
@@ -207,11 +256,7 @@ function findContainerWithMount(workdirPath) {
 
   log(`checking for running container with mount source "${normalizedWorkdir}"`);
 
-  // List running containers as JSON
-  const listResult = spawnSync('container', ['list', '--format', 'json'], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    encoding: 'utf-8',
-  });
+  const listResult = listContainersJson();
 
   if (listResult.status !== 0) {
     log(`container list failed (exit ${listResult.status}), will start a new container`);
