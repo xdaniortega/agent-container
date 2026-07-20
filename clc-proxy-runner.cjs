@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const ProxyChain = require('proxy-chain');
+const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 
 const host = process.env.CLC_PROXY_HOST || '192.168.64.1';
 const port = Number(process.env.CLC_PROXY_PORT || 8888);
@@ -86,16 +87,17 @@ async function startProxy() {
   }
 }
 
+function listContainersJson() {
+  return listContainersJsonWithRecovery({ log });
+}
+
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
   const normalizedWorkdir = path.resolve(workdirPath);
 
   log(`checking for running container with mount source "${normalizedWorkdir}"`);
 
-  const listResult = spawnSync('container', ['list', '--format', 'json'], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    encoding: 'utf-8',
-  });
+  const listResult = listContainersJson();
 
   if (listResult.status !== 0) {
     log(`container list failed (exit ${listResult.status}), will start a new container`);

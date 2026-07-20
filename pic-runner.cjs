@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const ProxyChain = require('proxy-chain');
+const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 
 const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
 const port = Number(process.env.PIC_PROXY_PORT || 8888);
@@ -217,37 +218,8 @@ function containerExecPiCommand(piArgs) {
   return ['entrypoint', 'pi', ...piArgs];
 }
 
-function startContainerSystemIfNeeded() {
-  log('container service is not responding; running `container system start`');
-  const startResult = spawnSync('container', ['system', 'start'], {
-    stdio: 'inherit',
-    encoding: 'utf-8',
-  });
-  if (startResult.status !== 0) {
-    log(`container system start failed (exit ${startResult.status}); continuing anyway`);
-    return false;
-  }
-  return true;
-}
-
-function listContainersJson({ allowStart = true } = {}) {
-  const runList = () => spawnSync('container', ['list', '--format', 'json'], {
-    stdio: ['ignore', 'pipe', 'inherit'],
-    encoding: 'utf-8',
-  });
-
-  let listResult = runList();
-  if (listResult.status === 0) return listResult;
-
-  if (allowStart && startContainerSystemIfNeeded()) {
-    for (let attempt = 1; attempt <= 15; attempt += 1) {
-      listResult = runList();
-      if (listResult.status === 0) return listResult;
-      spawnSync('sleep', ['1'], { stdio: 'ignore' });
-    }
-  }
-
-  return listResult;
+function listContainersJson() {
+  return listContainersJsonWithRecovery({ log });
 }
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
