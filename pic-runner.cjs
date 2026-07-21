@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-const { spawn, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const ProxyChain = require('proxy-chain');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
+const {
+  parseContainerRunnerArgs,
+  proxyEnvironmentArgs: buildProxyEnvironmentArgs,
+  runChildProcess,
+  startProxy: startProxyWithFallback,
+} = require('./runner-utils.cjs');
 
 const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
 const port = Number(process.env.PIC_PROXY_PORT || 8888);
@@ -21,30 +26,10 @@ if (process.env.HERDR_ENV === '1' && !process.env.HERDR_AGENT) {
 }
 
 // Extract runner-level --proxy, --volume, and --publish/-p arguments; pass the rest to Pi.
-const extraVolumes = [];
-const extraPublish = [];
-const extraPiArgs = [];
-for (let i = 0; i < cliArgs.length; i++) {
-  const arg = cliArgs[i];
-  if (arg === '--proxy') {
-    proxyEnabled = true;
-  } else if ((arg === '--volume' || arg === '-v') && i + 1 < cliArgs.length) {
-    extraVolumes.push(cliArgs[i + 1]);
-    i++; // skip the value
-  } else if (arg.startsWith('--volume=')) {
-    extraVolumes.push(arg.slice(9));
-  } else if ((arg === '--publish' || arg === '-p') && i + 1 < cliArgs.length) {
-    extraPublish.push(cliArgs[i + 1]);
-    i++; // skip the value
-  } else if (arg.startsWith('--publish=')) {
-    extraPublish.push(arg.slice(10));
-  } else if (arg.startsWith('-p') && arg.length > 2) {
-    // -p5173:5173 (no space variant)
-    extraPublish.push(arg.slice(2));
-  } else {
-    extraPiArgs.push(arg);
-  }
-}
+const parsedArgs = parseContainerRunnerArgs(cliArgs, { booleanFlags: ['--proxy'] });
+if (parsedArgs.flags['--proxy']) proxyEnabled = true;
+const { extraVolumes, extraPublish } = parsedArgs;
+const extraPiArgs = parsedArgs.passthroughArgs;
 
 // Use the basename of the current directory so multiple mounts can coexist under /workspace
 const dirBasename = path.basename(workdir);
@@ -56,7 +41,6 @@ const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 // Session directory — pi writes UUID-named session files, no hash needed for isolation
 // Two pi processes in the same container won't collide because session IDs are UUIDs.
 const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
-const proxyEnvironmentNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
 const herdrSocketMountEnabled = process.env.PIC_HERDR_SOCKET_MOUNT === '1';
 const herdrSocketPath = process.env.HERDR_SOCKET_PATH || '';
@@ -75,8 +59,7 @@ const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
 const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
 
 function proxyEnvironmentArgs() {
-  const value = proxyEnabled ? proxyUrl : '';
-  return proxyEnvironmentNames.flatMap(name => ['-e', `${name}=${value}`]);
+  return buildProxyEnvironmentArgs(proxyUrl, { enabled: proxyEnabled });
 }
 
 function herdrEnvironmentArgs() {
@@ -127,33 +110,7 @@ function maybeRenameHerdrAgent() {
   }
 }
 async function startProxy() {
-  const server = new ProxyChain.Server({ host, port, verbose });
-  server.on('requestFailed', ({ request, error }) => {
-    console.error(`[${commandName}] request failed ${request?.url || ''}: ${error?.message || error}`);
-  });
-
-  try {
-    await server.listen();
-    log(`proxy-chain listening on ${proxyUrl}`);
-    return { server, started: true };
-  } catch (error) {
-    if (error && error.code === 'EADDRINUSE') {
-      log(`reusing existing proxy on ${proxyUrl}`);
-      return { server: null, started: false };
-    }
-    if (error && error.code === 'EADDRNOTAVAIL') {
-      log(`address ${host} not available, falling back to 0.0.0.0`);
-      const fallbackHost = '0.0.0.0';
-      const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
-      fallbackServer.on('requestFailed', ({ request, error: reqErr }) => {
-        console.error(`[${commandName}] request failed ${request?.url || ''}: ${reqErr?.message || reqErr}`);
-      });
-      await fallbackServer.listen();
-      log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
-      return { server: fallbackServer, started: true };
-    }
-    throw error;
-  }
+  return startProxyWithFallback({ host, port, proxyUrl, verbose, log, logPrefix: commandName });
 }
 
 function startHerdrHostBridge() {
@@ -378,19 +335,7 @@ async function main() {
     ];
 
     log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
-    const child = spawn('container', args, { stdio: 'inherit' });
-
-    const forwardSignal = (signal) => {
-      if (!child.killed) child.kill(signal);
-    };
-    process.once('SIGINT', () => forwardSignal('SIGINT'));
-    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
-
-    child.on('exit', async (code, signal) => {
-      await cleanup();
-      if (signal) process.kill(process.pid, signal);
-      process.exit(code ?? 0);
-    });
+    runChildProcess('container', args, { cleanup });
   } else {
     const args = [
       'run', '--rm', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
@@ -409,19 +354,7 @@ async function main() {
       ...containerRunPiCommand(piArgs),
     ];
 
-    const child = spawn('container', args, { stdio: 'inherit' });
-
-    const forwardSignal = (signal) => {
-      if (!child.killed) child.kill(signal);
-    };
-    process.once('SIGINT', () => forwardSignal('SIGINT'));
-    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
-
-    child.on('exit', async (code, signal) => {
-      await cleanup();
-      if (signal) process.kill(process.pid, signal);
-      process.exit(code ?? 0);
-    });
+    runChildProcess('container', args, { cleanup });
   }
 }
 

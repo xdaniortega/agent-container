@@ -1,10 +1,15 @@
 #!/usr/bin/env node
-const { spawn, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const ProxyChain = require('proxy-chain');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
+const {
+  parseContainerRunnerArgs,
+  proxyEnvironmentArgs,
+  runChildProcess,
+  startProxy: startProxyWithFallback,
+} = require('./runner-utils.cjs');
 
 const host = process.env.CLC_PROXY_HOST || '192.168.64.1';
 const port = Number(process.env.CLC_PROXY_PORT || 8888);
@@ -14,28 +19,8 @@ const workdir = process.env.CLC_WORKDIR || process.cwd();
 const home = process.env.HOME;
 const cliArgs = process.argv.slice(2);
 
-// Extract --volume, --publish/-p arguments from CLI args, the rest pass through to claude
-const extraVolumes = [];
-const extraPublish = [];
-const extraClaudeArgs = [];
-for (let i = 0; i < cliArgs.length; i++) {
-  const arg = cliArgs[i];
-  if ((arg === '--volume' || arg === '-v') && i + 1 < cliArgs.length) {
-    extraVolumes.push(cliArgs[i + 1]);
-    i++;
-  } else if (arg.startsWith('--volume=')) {
-    extraVolumes.push(arg.slice(9));
-  } else if ((arg === '--publish' || arg === '-p') && i + 1 < cliArgs.length) {
-    extraPublish.push(cliArgs[i + 1]);
-    i++;
-  } else if (arg.startsWith('--publish=')) {
-    extraPublish.push(arg.slice(10));
-  } else if (arg.startsWith('-p') && arg.length > 2) {
-    extraPublish.push(arg.slice(2));
-  } else {
-    extraClaudeArgs.push(arg);
-  }
-}
+// Extract --volume, --publish/-p arguments from CLI args; pass the rest through to claude.
+const { extraVolumes, extraPublish, passthroughArgs: extraClaudeArgs } = parseContainerRunnerArgs(cliArgs);
 
 // Use the basename of the current directory so multiple mounts can coexist under /workspace
 const dirBasename = path.basename(workdir);
@@ -58,33 +43,7 @@ function log(message) {
 }
 
 async function startProxy() {
-  const server = new ProxyChain.Server({ host, port, verbose });
-  server.on('requestFailed', ({ request, error }) => {
-    console.error(`[clc-proxy] request failed ${request?.url || ''}: ${error?.message || error}`);
-  });
-
-  try {
-    await server.listen();
-    log(`proxy-chain listening on ${proxyUrl}`);
-    return { server, started: true };
-  } catch (error) {
-    if (error && error.code === 'EADDRINUSE') {
-      log(`reusing existing proxy on ${proxyUrl}`);
-      return { server: null, started: false };
-    }
-    if (error && error.code === 'EADDRNOTAVAIL') {
-      log(`address ${host} not available, falling back to 0.0.0.0`);
-      const fallbackHost = '0.0.0.0';
-      const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
-      fallbackServer.on('requestFailed', ({ request, error: reqErr }) => {
-        console.error(`[clc-proxy] request failed ${request?.url || ''}: ${reqErr?.message || reqErr}`);
-      });
-      await fallbackServer.listen();
-      log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
-      return { server: fallbackServer, started: true };
-    }
-    throw error;
-  }
+  return startProxyWithFallback({ host, port, proxyUrl, verbose, log, logPrefix: 'clc-proxy' });
 }
 
 function listContainersJson() {
@@ -250,12 +209,7 @@ async function main() {
       'exec',
       ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []),
       '-w', workspaceTarget,
-      '-e', `HTTP_PROXY=${proxyUrl}`,
-      '-e', `HTTPS_PROXY=${proxyUrl}`,
-      '-e', `ALL_PROXY=${proxyUrl}`,
-      '-e', `http_proxy=${proxyUrl}`,
-      '-e', `https_proxy=${proxyUrl}`,
-      '-e', `all_proxy=${proxyUrl}`,
+      ...proxyEnvironmentArgs(proxyUrl),
       '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
       '-e', 'IS_SANDBOX=1',
       existingContainerId,
@@ -265,19 +219,7 @@ async function main() {
     ];
 
     log(`exec: container ${args.slice(1, -claudeArgs.length - 1).join(' ')} ... claude --permission-mode bypassPermissions ...`);
-    const child = spawn('container', args, { stdio: 'inherit' });
-
-    const forwardSignal = (signal) => {
-      if (!child.killed) child.kill(signal);
-    };
-    process.once('SIGINT', () => forwardSignal('SIGINT'));
-    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
-
-    child.on('exit', async (code, signal) => {
-      await cleanup();
-      if (signal) process.kill(process.pid, signal);
-      process.exit(code ?? 0);
-    });
+    runChildProcess('container', args, { cleanup });
   } else {
     const args = [
       'run', '--rm', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
@@ -289,12 +231,7 @@ async function main() {
       '--mount', `type=bind,source=${claudeConfigHostDir},target=${claudeConfigDir}`,
       '--mount', `type=bind,source=${claudeProjectsHostDir},target=${claudeProjectsDir}`,
       '--dns', '1.1.1.1',
-      '-e', `HTTP_PROXY=${proxyUrl}`,
-      '-e', `HTTPS_PROXY=${proxyUrl}`,
-      '-e', `ALL_PROXY=${proxyUrl}`,
-      '-e', `http_proxy=${proxyUrl}`,
-      '-e', `https_proxy=${proxyUrl}`,
-      '-e', `all_proxy=${proxyUrl}`,
+      ...proxyEnvironmentArgs(proxyUrl),
       '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
       '-e', 'IS_SANDBOX=1',
       '-w', workspaceTarget,
@@ -303,19 +240,7 @@ async function main() {
       ...claudeArgs,
     ];
 
-    const child = spawn('container', args, { stdio: 'inherit' });
-
-    const forwardSignal = (signal) => {
-      if (!child.killed) child.kill(signal);
-    };
-    process.once('SIGINT', () => forwardSignal('SIGINT'));
-    process.once('SIGTERM', () => forwardSignal('SIGTERM'));
-
-    child.on('exit', async (code, signal) => {
-      await cleanup();
-      if (signal) process.kill(process.pid, signal);
-      process.exit(code ?? 0);
-    });
+    runChildProcess('container', args, { cleanup });
   }
 }
 
