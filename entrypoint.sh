@@ -82,9 +82,8 @@ case "${1:-}" in
     fi
 
     if [ "$should_pnpm_install" = true ]; then
-      echo "[pi-container] approving builds and installing"
-      pnpm approve-builds --all
-      pnpm install --prefer-offline
+      echo "[pi-container] pnpm project detected; skipping automatic install"
+      echo "[pi-container] run manually if needed: pnpm approve-builds <package> && pnpm install"
     fi
 
     # If args start with 'pi', shift it off

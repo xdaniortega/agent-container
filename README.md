@@ -109,10 +109,11 @@ Personal agent preferences:
 
 From any project directory:
 ```bash
-pic             # Pi with direct networking
-pic --proxy     # Pi through the host-side proxy
-pic-proxy       # compatibility alias for `pic --proxy`
-clc-proxy       # Claude Code through the host-side proxy
+pic              # Pi with direct networking
+pic --proxy      # Pi through the host-side proxy
+pic-proxy        # compatibility alias for `pic --proxy`
+pic-proxy attach # shell in the matching project container, or start one
+clc-proxy        # Claude Code through the host-side proxy
 ```
 
 ### Herdr integration

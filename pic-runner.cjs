@@ -29,7 +29,8 @@ if (process.env.HERDR_ENV === '1' && !process.env.HERDR_AGENT) {
 const parsedArgs = parseContainerRunnerArgs(cliArgs, { booleanFlags: ['--proxy'] });
 if (parsedArgs.flags['--proxy']) proxyEnabled = true;
 const { extraVolumes, extraPublish } = parsedArgs;
-const extraPiArgs = parsedArgs.passthroughArgs;
+const attachMode = parsedArgs.passthroughArgs[0] === 'attach';
+const extraPiArgs = attachMode ? parsedArgs.passthroughArgs.slice(1) : parsedArgs.passthroughArgs;
 
 // Use the basename of the current directory so multiple mounts can coexist under /workspace
 const dirBasename = path.basename(workdir);
@@ -165,6 +166,47 @@ function startHerdrHostBridge() {
 function stopServer(server, sockets = new Set()) {
   for (const socket of sockets) socket.destroy();
   return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function interactiveContainerArgs() {
+  return process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : [];
+}
+
+function warnIgnoredRunOnlyArgs(containerId) {
+  if (extraVolumes.length > 0) {
+    log(`warning: extra --volume arguments are ignored when reusing container "${containerId}"`);
+  }
+  if (extraPublish.length > 0) {
+    log(`warning: extra --publish arguments are ignored when reusing container "${containerId}"`);
+  }
+}
+
+function containerExecArgs(containerId, commandArgs, { envArgs = [] } = {}) {
+  return [
+    'exec',
+    ...interactiveContainerArgs(),
+    '-w', workspaceTarget,
+    ...envArgs,
+    containerId,
+    ...commandArgs,
+  ];
+}
+
+function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = false } = {}) {
+  return [
+    'run', '--rm', ...interactiveContainerArgs(), '--memory', '4g',
+    '--volume', `${workdir}:${workspaceTarget}`,
+    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
+    ...extraVolumes.flatMap(v => ['--volume', v]),
+    ...(includeHerdrSocket ? herdrSocketVolumeArgs() : []),
+    ...extraPublish.flatMap(p => ['--publish', p]),
+    '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+    '--dns', '1.1.1.1',
+    ...envArgs,
+    '-w', workspaceTarget,
+    'agentic-coding-node:24',
+    ...commandArgs,
+  ];
 }
 
 function containerRunPiCommand(piArgs) {
@@ -308,6 +350,26 @@ async function main() {
     }
   }
 
+  if (attachMode) {
+    const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
+    const envArgs = proxyEnvironmentArgs();
+
+    if (existingContainerId) {
+      warnIgnoredRunOnlyArgs(existingContainerId);
+      const args = containerExecArgs(existingContainerId, shellArgs, { envArgs });
+
+      log(`attach: container exec ${existingContainerId} ${shellArgs.join(' ')}`);
+      runChildProcess('container', args, { cleanup });
+      return;
+    }
+
+    const args = containerRunArgs(shellArgs, { envArgs });
+
+    log(`attach: starting shell in new container at ${workspaceTarget}`);
+    runChildProcess('container', args, { cleanup });
+    return;
+  }
+
   // Build the pi args (same for both run and exec)
   const piArgs = [
     '--session-dir', sessionDir,
@@ -316,43 +378,28 @@ async function main() {
 
   if (existingContainerId) {
     // Warn if extra volumes/publish were requested — they can't be applied via exec
-    if (extraVolumes.length > 0) {
-      log(`warning: extra --volume arguments are ignored when reusing container "${existingContainerId}"`);
-    }
-    if (extraPublish.length > 0) {
-      log(`warning: extra --publish arguments are ignored when reusing container "${existingContainerId}"`);
-    }
+    warnIgnoredRunOnlyArgs(existingContainerId);
 
-    const args = [
-      'exec',
-      ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []),
-      '-w', workspaceTarget,
-      ...proxyEnvironmentArgs(),
-      ...herdrEnvironmentArgs(),
-      ...herdrBridgeEnvironmentArgs(herdrBridge),
-      existingContainerId,
-      ...containerExecPiCommand(piArgs),
-    ];
+    const commandArgs = containerExecPiCommand(piArgs);
+    const args = containerExecArgs(existingContainerId, commandArgs, {
+      envArgs: [
+        ...proxyEnvironmentArgs(),
+        ...herdrEnvironmentArgs(),
+        ...herdrBridgeEnvironmentArgs(herdrBridge),
+      ],
+    });
 
     log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
     runChildProcess('container', args, { cleanup });
   } else {
-    const args = [
-      'run', '--rm', ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []), '--memory', '4g',
-      '--volume', `${workdir}:${workspaceTarget}`,
-      '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
-      ...extraVolumes.flatMap(v => ['--volume', v]),
-      ...herdrSocketVolumeArgs(),
-      ...extraPublish.flatMap(p => ['--publish', p]),
-      '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
-      '--dns', '1.1.1.1',
-      ...proxyEnvironmentArgs(),
-      ...herdrEnvironmentArgs(),
-      ...herdrBridgeEnvironmentArgs(herdrBridge),
-      '-w', workspaceTarget,
-      'agentic-coding-node:24',
-      ...containerRunPiCommand(piArgs),
-    ];
+    const args = containerRunArgs(containerRunPiCommand(piArgs), {
+      includeHerdrSocket: true,
+      envArgs: [
+        ...proxyEnvironmentArgs(),
+        ...herdrEnvironmentArgs(),
+        ...herdrBridgeEnvironmentArgs(herdrBridge),
+      ],
+    });
 
     runChildProcess('container', args, { cleanup });
   }
