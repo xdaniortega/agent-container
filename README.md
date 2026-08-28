@@ -170,6 +170,23 @@ clc-proxy --volume "../web:/workspace/web"
 - **Pi**: host `~/.pi` is mounted at `/host-pi` (read-only). The entrypoint copies
   safe config files into `/root/.pi`, excludes lock/session files, and symlinks
   large directories.
+
+### Ignoring local auth with an Anthropic key
+
+Pi resolves stored credentials (from `auth.json`) before env keys, so a copied
+`auth.json` would shadow `ANTHROPIC_API_KEY`. Two ways to ignore the local auth:
+
+- **In the container**: when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or
+  `ANTHROPIC_OAUTH_TOKEN` is set on the host, `pic`/`pic-proxy` forward that env
+  into the container and pass `PIC_EXCLUDE_AUTH=1`; `entrypoint.sh` then skips
+  copying `~/.pi/agent/auth.json`, so the env key wins. Without any Anthropic key
+  env, local auth is used as before.
+
+- **On the host** (outside the container), add the `pik` shell function (see
+  `~/.zshrc`): it points `PI_CODING_AGENT_DIR` at `~/.pi-anthropic/agent`, where
+  `auth.json` is an empty stub and everything else is symlinked back to
+  `~/.pi/agent`. Run `pik "prompt"` with `ANTHROPIC_API_KEY` set to get a Pi
+  that ignores local `auth.json`; normal `pi` keeps using it.
 - **Claude Code proxy**: host `~/.claude` is mounted read-only at `/host-claude`.
   The entrypoint copies only user-authored config into the persistent, host-backed
   Linux config directory at `~/.clc-container/claude-config`, mounted as

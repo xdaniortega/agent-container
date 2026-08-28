@@ -43,14 +43,16 @@ case "${1:-}" in
     if [ -d /host-pi ]; then
       rm -rf /root/.pi
       mkdir -p /root/.pi
-      tar -C /host-pi \
-        --exclude='./agent/bin' \
-        --exclude='./agent/sessions' \
-        --exclude='./agent/npm' \
-        --exclude='./agent/git' \
-        --exclude='./agent/settings.json.lock' \
-        --exclude='./agent/auth.json.lock' \
-        -cf - . | tar -C /root/.pi -xf -
+      # Build the exclude list as a single word-split string (no spaces in the
+      # patterns). When the runner passes PIC_EXCLUDE_AUTH=1 (an Anthropic key
+      # env was provided), also drop auth.json so the env key wins over any
+      # stored credential instead of being shadowed by it.
+      _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
+      if [ "${PIC_EXCLUDE_AUTH:-0}" = "1" ]; then
+        _pi_excludes="$_pi_excludes --exclude=./agent/auth.json"
+      fi
+      # shellcheck disable=SC2086 # intentional word-splitting into tar args
+      tar -C /host-pi $_pi_excludes -cf - . | tar -C /root/.pi -xf -
     fi
 
     mkdir -p /root/.pi/agent

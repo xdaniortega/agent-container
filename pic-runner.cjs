@@ -63,6 +63,27 @@ function proxyEnvironmentArgs() {
   return buildProxyEnvironmentArgs(proxyUrl, { enabled: proxyEnabled });
 }
 
+// Anthropic env keys to forward into the container. The container does not
+// inherit the host env, so without this the key never reaches Pi inside.
+const anthropicEnvironmentNames = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN'];
+
+function anthropicEnvironmentArgs() {
+  const args = [];
+  let any = false;
+  for (const name of anthropicEnvironmentNames) {
+    const value = process.env[name];
+    if (value) {
+      args.push('-e', `${name}=${value}`);
+      any = true;
+    }
+  }
+  // When an Anthropic key env is provided, ignore the host's stored auth.json:
+  // Pi resolves stored credentials before env keys, so a copied auth.json would
+  // shadow ANTHROPIC_API_KEY. entrypoint.sh honors PIC_EXCLUDE_AUTH=1 to skip it.
+  if (any) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
+  return args;
+}
+
 function herdrEnvironmentArgs() {
   const args = [];
   for (const name of herdrEnvironmentNames) {
@@ -352,7 +373,7 @@ async function main() {
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = proxyEnvironmentArgs();
+    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs()];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -384,6 +405,7 @@ async function main() {
     const args = containerExecArgs(existingContainerId, commandArgs, {
       envArgs: [
         ...proxyEnvironmentArgs(),
+        ...anthropicEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
@@ -396,6 +418,7 @@ async function main() {
       includeHerdrSocket: true,
       envArgs: [
         ...proxyEnvironmentArgs(),
+        ...anthropicEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
