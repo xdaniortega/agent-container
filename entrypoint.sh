@@ -74,19 +74,22 @@ case "${1:-}" in
       done
     fi
 
-    # Project-local Pi skills live in the mounted project at ./.pi/agent/skills.
+    # Project-local Pi skills may live in either:
+    #   ./skills/<name>              (versioned project skills)
+    #   ./.pi/agent/skills/<name>    (Pi local convention / compatibility)
     # Pi loads skills from ~/.pi/agent/skills, so expose project-local skills there
     # at container startup. Keep this narrow: do not copy project sessions/cache/state.
-    if [ -d "$PWD/.pi/agent/skills" ]; then
-      mkdir -p /root/.pi/agent/skills
-      for skill in "$PWD"/.pi/agent/skills/*; do
+    mkdir -p /root/.pi/agent/skills
+    for skill_dir in "$PWD"/skills "$PWD"/.pi/agent/skills; do
+      [ -d "$skill_dir" ] || continue
+      for skill in "$skill_dir"/*; do
         [ -e "$skill" ] || continue
         target="/root/.pi/agent/skills/$(basename "$skill")"
         if [ ! -e "$target" ]; then
           ln -s "$skill" "$target"
         fi
       done
-    fi
+    done
 
     should_pnpm_install=false
     if [ "${PIC_PNPM_INSTALL:-1}" != "0" ] && [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
