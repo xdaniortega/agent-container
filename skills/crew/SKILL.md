@@ -18,44 +18,60 @@ Use this recipe for normal runs. Consult the official `herdr` skill only for rec
 - The current Pi session is the **brain**.
 - The brain remains the final decision-maker.
 - Each delegated role runs as a separate agent in its own Herdr pane.
-- Role panes have clear names such as `scout`, `oracle`, `executor`, and `reviewer`.
 - Leave role panes visible after completion unless the user asks to clean them up.
 - Reuse an existing idle same-cwd role pane by default.
 - Prefer short, focused role tasks over long autonomous chains.
 
 ## Roles
 
-### scout
+Default roles are defined in `crew.config.json` next to this skill and can be copied to `~/.pi/crew.config.json` for global use.
 
-Read-only context gatherer.
+Built-in defaults:
 
-Use for repository reconnaissance, online research, locating files, finding prior art, identifying constraints, and mapping implementation seams.
+- `scout`: read-only context and research
+- `oracle`: read-only planning and tradeoff advice
+- `executor`: mutation-capable implementation
+- `reviewer`: strictly read-only validation
 
-Expected output: relevant facts, files/symbols or sources, key observations, risks, and suggested next step.
+Custom roles may be added in config. Unknown roles should not be invented; ask the user to define them.
 
-### oracle
+## Config
 
-Read-only planner and tradeoff advisor.
+Global config path:
 
-Use for architecture choices, implementation strategy, sequencing, alternatives, and risk analysis.
+```text
+~/.pi/crew.config.json
+```
 
-Expected output: recommended approach, alternatives, tradeoffs, risks, and open decisions for the brain.
+Default template:
 
-### executor
+```text
+skills/crew/crew.config.json
+```
 
-Mutation-capable implementer.
+Config shape:
 
-Use only after the brain has a sufficiently clear plan. Executor may modify files in the current project. The brain owns final acceptance.
+```json
+{
+  "roles": {
+    "scout": {
+      "description": "Finds local and online context...",
+      "model": "openai-codex/gpt-5.4-mini",
+      "authority": "read-only"
+    }
+  }
+}
+```
 
-Expected output: changed files, summary, validation run, failures or skipped checks, and remaining risks.
+Use `description` as the role's standing behavior, `model` as an exact provider/id, and `authority` as either `read-only` or `can-edit`.
 
-### reviewer
+Lookup order:
 
-Strictly read-only validator.
+1. `~/.pi/crew.config.json`
+2. `./.pi/crew.config.json` when present
+3. built-in role defaults from this skill
 
-Use after planning or implementation.
-
-Expected output: actionable findings, file/line evidence when relevant, missed requirements, test gaps, maintainability risks, and verdict: approve, approve with nits, request changes, or blocked.
+If a role has no configured model, use the default runner model. Do not invent or fuzzy-match model names. If a requested model or role is missing or ambiguous, ask the user.
 
 ## Preflight
 
@@ -71,19 +87,51 @@ Role pane launch command depends on where the brain is running: use `pic-proxy` 
 
 ## Normal command recipe
 
-Use this recipe for ordinary single-role delegation. Substitute the role name and prompt text.
+Use this recipe for ordinary single-role delegation. Substitute the role name and user task.
 
 ```bash
 set -euo pipefail
 
 role=scout
-prompt='You are scout. <task>.'
+user_task='<task>'
+
+config_path=""
+if [ -f "$HOME/.pi/crew.config.json" ]; then
+  config_path="$HOME/.pi/crew.config.json"
+elif [ -f .pi/crew.config.json ]; then
+  config_path=.pi/crew.config.json
+fi
+
+role_description=""
+role_authority=""
+role_model=""
+if [ -n "$config_path" ]; then
+  role_description=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.description) console.log(r.description)')
+  role_authority=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.authority) console.log(r.authority)')
+  role_model=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.model) console.log(r.model)')
+fi
+
+if [ -z "$role_description" ]; then
+  case "$role" in
+    scout) role_description="Finds local and online context. Reports relevant facts, files, sources, risks, and suggested next steps."; role_authority=${role_authority:-read-only} ;;
+    oracle) role_description="Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks."; role_authority=${role_authority:-read-only} ;;
+    executor) role_description="Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks."; role_authority=${role_authority:-can-edit} ;;
+    reviewer) role_description="Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings."; role_authority=${role_authority:-read-only} ;;
+    *) printf 'Unknown crew role: %s\n' "$role" >&2; exit 1 ;;
+  esac
+fi
+
+prompt="You are $role."
+[ -n "$role_description" ] && prompt="$prompt $role_description"
+[ -n "$role_authority" ] && prompt="$prompt Authority: $role_authority."
+prompt="$prompt Task: $user_task"
 
 if [ "${PIC_HERDR_BRIDGE:-}" = "1" ] || [ -n "${PIC_HERDR_BRIDGE_HOST:-}" ]; then
   role_command=pic-proxy
 else
   role_command=pi
 fi
+[ -n "$role_model" ] && role_command="$role_command --model $role_model"
 
 current_json=$(herdr pane current --current)
 role_cwd=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; const cwd=p.foreground_cwd||p.cwd||""; if(!cwd){process.exit(1)} console.log(cwd)})')
@@ -124,6 +172,7 @@ Notes:
 - The brain may run inside a container while Herdr controls host panes. Always get the host cwd from `herdr pane current --current`; do not use container `$PWD` for pane creation.
 - Use `pic-proxy` for role panes when `PIC_HERDR_BRIDGE=1` or `PIC_HERDR_BRIDGE_HOST` is set. Otherwise use `pi`. If launch fails, read the pane output and report the failure.
 - Record `created_pane` when a pane is created. Cleanup may only close panes recorded by the current workflow.
+- A configured model is applied when creating a new role pane. Reused panes keep the model they were launched with; create a fresh pane when changing a role's model.
 - If a wait or prompt times out, read the role pane output before deciding whether to steer, retry, ask the user, or leave the pane running.
 
 ## Reading role output
@@ -149,14 +198,15 @@ Fallback: if pane output is missing, truncated, or too long, ask the role:
 
 ## Prompting conventions
 
-The user can be terse, such as "ask scout to map the auth flow". The brain expands that into a compact role contract.
+The user can be terse, such as "ask scout to map the auth flow". The brain expands that into a compact role contract using the role config.
 
 Include only what matters:
 
 - role identity
+- configured role description and authority
 - task objective
 - relevant context from the brain
-- expected output shape
+- expected output shape when needed
 - true invariants
 
 Avoid long procedural scripts. Define the destination and let the role choose the efficient path.
@@ -164,16 +214,16 @@ Avoid long procedural scripts. Define the destination and let the role choose th
 Examples:
 
 - user says: "ask scout where this is handled"
-- brain prompts scout: "You are scout. Goal: find where this behavior is handled. Return relevant files/symbols, key observations, and risks."
+- brain prompts scout: "You are scout. Finds local and online context. Authority: read-only. Task: find where this behavior is handled and return relevant files/symbols, key observations, and risks."
 
 - user says: "ask oracle for a plan"
-- brain prompts oracle: "You are oracle. Given the context below, propose a pragmatic implementation plan with tradeoffs, risks, and open decisions."
+- brain prompts oracle: "You are oracle. Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks. Authority: read-only. Task: given the context below, propose a pragmatic implementation plan."
 
 - user says: "ask executor to implement it"
-- brain prompts executor: "You are executor. Implement the approved scope below. Keep changes minimal. Return changed files, validation, and remaining risks."
+- brain prompts executor: "You are executor. Implements the approved plan with minimal pragmatic changes. Authority: can-edit. Task: implement the approved scope below and return changed files, validation, and remaining risks."
 
 - user says: "ask reviewer to check the diff"
-- brain prompts reviewer: "You are reviewer. Review the current diff against the goal below. Return actionable findings and a verdict."
+- brain prompts reviewer: "You are reviewer. Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings. Authority: read-only. Task: review the current diff against the goal below and return a verdict."
 
 ## Sequencing patterns
 
@@ -199,11 +249,11 @@ Default:
 
 The brain owns delegation, synthesis, and final acceptance. Roles do not decide final product, release, merge, or safety questions silently. Escalate unresolved decisions back to the brain.
 
-Use one mutation-capable role in the active project at a time unless the user explicitly requests isolated worktrees or parallel writers. Scouts, oracles, and reviewers are read-only. Executor is the normal writer role.
+Use one mutation-capable role in the active project at a time unless the user explicitly requests isolated worktrees or parallel writers. Role authority comes from config; by default scouts, oracles, and reviewers are read-only, and executor is the writer role.
 
 ## Model routing
 
-Use the default runner/model unless the user provides an exact supported launch command or exact configured alias. Do not invent or guess model names. If a requested model or alias is missing or ambiguous, ask the user.
+Role models come from `~/.pi/crew.config.json` when configured. Use exact provider/id values only. The brain model is whatever Pi was started with; it is not configured here.
 
 ## Minimal operating principle
 

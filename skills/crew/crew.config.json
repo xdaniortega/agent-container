@@ -1,0 +1,24 @@
+{
+  "roles": {
+    "scout": {
+      "description": "Finds local and online context. Reports relevant facts, files, sources, risks, and suggested next steps.",
+      "model": "openai-codex/gpt-5.4-mini",
+      "authority": "read-only"
+    },
+    "oracle": {
+      "description": "Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks.",
+      "model": "openai-codex/gpt-5.6-sol",
+      "authority": "read-only"
+    },
+    "executor": {
+      "description": "Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks.",
+      "model": "openai-codex/gpt-5.5",
+      "authority": "can-edit"
+    },
+    "reviewer": {
+      "description": "Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings.",
+      "model": "openai-codex/gpt-5.6-luna",
+      "authority": "read-only"
+    }
+  }
+}
