@@ -93,7 +93,7 @@ Use this recipe for ordinary single-role delegation. Substitute the role name an
 set -euo pipefail
 
 role=scout
-user_task='<task>'
+user_task='<task plus the relevant brain context needed to do it>'
 
 config_path=""
 if [ -f "$HOME/.pi/crew.config.json" ]; then
@@ -124,7 +124,7 @@ fi
 prompt="You are $role."
 [ -n "$role_description" ] && prompt="$prompt $role_description"
 [ -n "$role_authority" ] && prompt="$prompt Authority: $role_authority."
-prompt="$prompt Task: $user_task"
+prompt="$prompt Task and context: $user_task"
 
 if [ "${PIC_HERDR_BRIDGE:-}" = "1" ] || [ -n "${PIC_HERDR_BRIDGE_HOST:-}" ]; then
   role_command=pic-proxy
@@ -143,7 +143,30 @@ if herdr agent get "$role" >/tmp/crew-agent.json 2>/dev/null; then
 fi
 
 if [ -z "$role_pane" ]; then
-  split_json=$(herdr pane split --current --direction right --cwd "$role_cwd" --no-focus)
+  crew_pane=$(workspace_id="$workspace_id" role_cwd="$role_cwd" node - <<'NODE'
+const fs = require('fs');
+const known = new Set(['scout', 'oracle', 'executor', 'reviewer']);
+let input = '';
+process.stdin.on('data', d => input += d);
+process.stdin.on('end', () => {
+  try {
+    const agents = JSON.parse(input).result.agents || [];
+    const match = agents.find(a =>
+      known.has(a.name) &&
+      a.workspace_id === process.env.workspace_id &&
+      (a.foreground_cwd === process.env.role_cwd || a.cwd === process.env.role_cwd)
+    );
+    if (match) console.log(match.pane_id);
+  } catch {}
+});
+NODE
+  <<<"$(herdr agent list)")
+
+  if [ -n "$crew_pane" ]; then
+    split_json=$(herdr pane split "$crew_pane" --direction down --cwd "$role_cwd" --no-focus)
+  else
+    split_json=$(herdr pane split --current --direction right --cwd "$role_cwd" --no-focus)
+  fi
   role_pane=$(printf '%s' "$split_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; if(!p.pane_id){process.exit(1)} console.log(p.pane_id)})')
   created_pane="$role_pane"
   herdr pane run "$role_pane" "$role_command"
@@ -200,6 +223,8 @@ Fallback: if pane output is missing, truncated, or too long, ask the role:
 
 The user can be terse, such as "ask scout to map the auth flow". The brain expands that into a compact role contract using the role config.
 
+When the user says "above", "that", "the plan", "the review", "implement it", or similar, the brain must expand the reference before delegating. Include the relevant prior messages, decisions, files, role outputs, and acceptance criteria in the role prompt. Do not send unresolved conversational references to a role pane.
+
 Include only what matters:
 
 - role identity
@@ -209,6 +234,7 @@ Include only what matters:
 - expected output shape when needed
 - true invariants
 
+Before launching executor, the brain must provide an explicit approved scope. If the implementation depends on earlier scout/oracle/reviewer output, include that output or a faithful excerpt in the executor prompt. If the brain cannot identify the approved scope, ask the user instead of delegating.
 Avoid long procedural scripts. Define the destination and let the role choose the efficient path.
 
 Examples:
@@ -220,7 +246,7 @@ Examples:
 - brain prompts oracle: "You are oracle. Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks. Authority: read-only. Task: given the context below, propose a pragmatic implementation plan."
 
 - user says: "ask executor to implement it"
-- brain prompts executor: "You are executor. Implements the approved plan with minimal pragmatic changes. Authority: can-edit. Task: implement the approved scope below and return changed files, validation, and remaining risks."
+- brain prompts executor: "You are executor. Implements the approved plan with minimal pragmatic changes. Authority: can-edit. Task and context: implement the approved scope below. Context: <paste the relevant plan/decision/requirements from the brain conversation>. Return changed files, validation, and remaining risks."
 
 - user says: "ask reviewer to check the diff"
 - brain prompts reviewer: "You are reviewer. Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings. Authority: read-only. Task: review the current diff against the goal below and return a verdict."
@@ -240,6 +266,8 @@ Default:
 
 - reuse an existing named role pane when it is idle, in the same workspace, and in the same cwd
 - otherwise create a new pane
+- first crew role splits the brain pane to the right
+- later crew roles split an existing crew pane downward, keeping the brain pane as the left/main pane
 - keep user focus on the brain pane with `--no-focus`
 - leave completed role panes visible for inspection
 - close only panes created by the current workflow and only when the user asks for cleanup
