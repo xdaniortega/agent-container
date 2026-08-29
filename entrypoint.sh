@@ -74,16 +74,28 @@ case "${1:-}" in
       done
     fi
 
-    # Project-local Pi skills may live in either:
-    #   ./skills/<name>              (versioned project skills)
-    #   ./.pi/agent/skills/<name>    (Pi local convention / compatibility)
-    # Pi loads skills from ~/.pi/agent/skills, so expose project-local skills there
-    # at container startup. Keep this narrow: do not copy project sessions/cache/state.
+    # Project-local Pi skills may live in:
+    #   ./skills/<name>              (versioned project skills, preferred here)
+    #   ./.pi/skills/<name>          (Pi project-local convention)
+    #   ./.pi/agent/skills/<name>    (legacy compatibility)
+    # Pi loads runtime skills from ~/.pi/agent/skills. Expose project-local skills there
+    # at container startup. Versioned ./skills entries override stale/user entries
+    # with the same name; ./.pi entries fill gaps only.
     mkdir -p /root/.pi/agent/skills
-    for skill_dir in "$PWD"/skills "$PWD"/.pi/agent/skills; do
+
+    if [ -d "$PWD/skills" ]; then
+      for skill in "$PWD"/skills/*; do
+        [ -e "$skill/SKILL.md" ] || continue
+        target="/root/.pi/agent/skills/$(basename "$skill")"
+        rm -rf "$target"
+        ln -s "$skill" "$target"
+      done
+    fi
+
+    for skill_dir in "$PWD"/.pi/skills "$PWD"/.pi/agent/skills; do
       [ -d "$skill_dir" ] || continue
       for skill in "$skill_dir"/*; do
-        [ -e "$skill" ] || continue
+        [ -e "$skill/SKILL.md" ] || continue
         target="/root/.pi/agent/skills/$(basename "$skill")"
         if [ ! -e "$target" ]; then
           ln -s "$skill" "$target"

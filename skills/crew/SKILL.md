@@ -9,223 +9,155 @@ description: |
 
 # Crew
 
-Use this skill when the user wants a main brain session to delegate work to a visible crew of role panes managed by Herdr.
+Use this skill when the user wants a main brain session to delegate work to visible role panes managed by Herdr.
 
-This skill is intentionally lightweight. Use the command recipe below for normal runs. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
+Use this recipe for normal runs. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
 
 ## Core model
 
 - The current Pi session is the **brain**.
 - The brain remains the final decision-maker.
-- Each delegated role runs as a separate Pi agent in its own Herdr pane.
-- Role panes should have clear, unique names such as `scout`, `oracle`, `executor`, and `reviewer`.
-- Role panes are temporary but visible by default: create, prompt, wait, read, synthesize, then leave the pane open for user inspection unless the user explicitly asks to clean it up.
+- Each delegated role runs as a separate agent in its own Herdr pane.
+- Role panes have clear names such as `scout`, `oracle`, `executor`, and `reviewer`.
+- Leave role panes visible after completion unless the user asks to clean them up.
+- Reuse an existing idle same-cwd role pane by default.
 - Prefer short, focused role tasks over long autonomous chains.
-- This is a day-to-day coding workflow, not a background task-queue system.
-
-## Preconditions
-
-Before controlling Herdr, verify both conditions:
-
-```bash
-test "${HERDR_ENV:-}" = 1
-command -v herdr >/dev/null 2>&1
-```
-
-If `HERDR_ENV` is not `1`, stop and tell the user: "I am not currently running inside Herdr. Start me through Herdr first, then I can orchestrate visible role panes."
-
-If the `herdr` command is missing, stop and tell the user: "I am inside a Herdr pane, but the Herdr CLI is not available in this environment. Install or expose the Herdr CLI in the container, then retry."
-
-Do not inspect or control Herdr from outside a Herdr-managed session. Do not continue without the `herdr` CLI.
-
-## Container rule
-
-When the project is running through the containerized Pi workflow, role panes start a new Pi session through the project runner:
-
-```bash
-pic-proxy
-```
-
-The brain runs inside the container while Herdr controls host panes. Read the host pane cwd from Herdr, then use that host path for splits:
-
-```bash
-herdr pane current --current
-```
-
-Use the returned pane `foreground_cwd` when present, otherwise `cwd`. If the returned path is missing or looks wrong, stop and ask the user.
 
 ## Roles
-
-### brain
-
-The current Pi session. Owns orchestration and final synthesis.
-
-Responsibilities:
-
-- clarify the user goal
-- decide which roles to launch
-- write focused prompts for roles
-- read role outputs
-- resolve conflicts between roles
-- decide whether executor may modify files
-- ask for review after changes
-- report final results to the user
 
 ### scout
 
 Read-only context gatherer.
 
-Use for:
+Use for repository reconnaissance, online research, locating files, finding prior art, identifying constraints, and mapping implementation seams.
 
-- locating relevant files
-- understanding project structure
-- finding prior art
-- identifying constraints
-- mapping possible implementation seams
-
-Expected output:
-
-- relevant files and symbols
-- key observations
-- risks or unknowns
-- suggested next investigation
-
-Scout must not modify files.
+Expected output: relevant facts, files/symbols or sources, key observations, risks, and suggested next step.
 
 ### oracle
 
 Read-only planner and tradeoff advisor.
 
-Use for:
+Use for architecture choices, implementation strategy, sequencing, alternatives, and risk analysis.
 
-- architecture choices
-- implementation strategy
-- sequencing
-- risk analysis
-- comparing alternatives
-
-Expected output:
-
-- recommended approach
-- alternatives considered
-- tradeoffs
-- risks
-- open decisions for the brain
-
-Oracle must not modify files.
+Expected output: recommended approach, alternatives, tradeoffs, risks, and open decisions for the brain.
 
 ### executor
 
 Mutation-capable implementer.
 
-Use only after the brain has a sufficiently clear plan.
+Use only after the brain has a sufficiently clear plan. Executor may modify files in the current project. The brain owns final acceptance.
 
-Executor may modify files in the current project, following the same authority model as Pi subagents: the brain delegates implementation, but the brain owns final acceptance.
-
-Expected output:
-
-- summary of changes
-- files changed
-- tests or checks run
-- failures or skipped validation
-- risks and follow-up items
+Expected output: changed files, summary, validation run, failures or skipped checks, and remaining risks.
 
 ### reviewer
 
-Read-only validator by default.
+Strictly read-only validator.
 
 Use after planning or implementation.
 
-Expected output:
+Expected output: actionable findings, file/line evidence when relevant, missed requirements, test gaps, maintainability risks, and verdict: approve, approve with nits, request changes, or blocked.
 
-- actionable findings
-- correctness issues
-- missed requirements
-- test gaps
-- maintainability risks
-- verdict: approve, approve with nits, request changes, or blocked
+## Preflight
 
-Reviewer must not modify files unless explicitly promoted by the brain.
+Before controlling Herdr, verify:
 
-## Standard lifecycle
+```bash
+test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1
+```
 
-Default to a sibling pane in the current tab, same host cwd, no focus change.
+If this fails, stop and tell the user: "I am not currently able to control Herdr from this session. Start me inside Herdr with the Herdr CLI available, then retry."
 
-1. Verify Herdr preconditions with exactly:
-
-   ```bash
-   test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1
-   ```
-
-2. Read the current host pane info:
-
-   ```bash
-   herdr pane current --current
-   ```
-
-3. Choose `role_cwd` from `foreground_cwd`, falling back to `cwd`.
-4. Split a pane from the current brain pane using `--cwd "$role_cwd"` and `--no-focus`.
-5. In containerized projects, run `pic-proxy` in the new pane.
-6. Wait for Herdr to detect the Pi agent in the new pane, then rename it to the role name if needed.
-7. Prompt the role with a compact task contract.
-8. Wait for the role to settle.
-9. Read the role output using `recent-unwrapped`.
-10. Synthesize the result into the brain's working context.
-11. Leave the completed role pane open for inspection unless the user explicitly requested cleanup. If cleanup is requested, close only panes created by this workflow and only after confirming the agent is idle or done.
-
-Use the command recipe in this skill for normal runs. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
+Role pane launch command depends on where the brain is running: use `pic-proxy` when the brain is inside the containerized Pi runner, otherwise use `pi`.
 
 ## Normal command recipe
 
-Use this recipe for ordinary single-role delegation. Substitute `scout` with the role name and replace the prompt text.
+Use this recipe for ordinary single-role delegation. Substitute the role name and prompt text.
 
 ```bash
 set -euo pipefail
+
+role=scout
+prompt='You are scout. <task>.'
+
+if [ "${PIC_HERDR_BRIDGE:-}" = "1" ] || [ -n "${PIC_HERDR_BRIDGE_HOST:-}" ]; then
+  role_command=pic-proxy
+else
+  role_command=pi
+fi
+
 current_json=$(herdr pane current --current)
-role_cwd=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; console.log(p.foreground_cwd || p.cwd || "")})')
-[ -n "$role_cwd" ]
-split_json=$(herdr pane split --current --direction right --cwd "$role_cwd" --no-focus)
-role_pane=$(printf '%s' "$split_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>console.log(JSON.parse(s).result.pane.pane_id))')
-herdr pane run "$role_pane" pic-proxy
-herdr agent wait "$role_pane" --timeout 120000
-herdr agent rename "$role_pane" scout
-herdr agent prompt scout "You are scout. <task>." --wait --timeout 120000
-herdr agent read scout --source recent-unwrapped --lines 200
+role_cwd=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; const cwd=p.foreground_cwd||p.cwd||""; if(!cwd){process.exit(1)} console.log(cwd)})')
+workspace_id=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; console.log(p.workspace_id||"")})')
+
+role_pane=""
+if herdr agent get "$role" >/tmp/crew-agent.json 2>/dev/null; then
+  role_pane=$(workspace_id="$workspace_id" role_cwd="$role_cwd" node -e 'const a=require("fs").readFileSync("/tmp/crew-agent.json","utf8"); const p=JSON.parse(a).result.agent; if((p.agent_status==="idle"||p.agent_status==="done") && p.workspace_id===process.env.workspace_id && (p.foreground_cwd===process.env.role_cwd||p.cwd===process.env.role_cwd)){console.log(p.pane_id)}' )
+fi
+
+if [ -z "$role_pane" ]; then
+  split_json=$(herdr pane split --current --direction right --cwd "$role_cwd" --no-focus)
+  role_pane=$(printf '%s' "$split_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; if(!p.pane_id){process.exit(1)} console.log(p.pane_id)})')
+  created_pane="$role_pane"
+  herdr pane run "$role_pane" "$role_command"
+
+  # Agent detection can lag briefly after pane run.
+  herdr agent wait "$role_pane" --timeout 120000 || {
+    sleep 3
+    herdr agent wait "$role_pane" --timeout 120000 || {
+      herdr pane read "$role_pane" --source recent-unwrapped --lines 120
+      exit 1
+    }
+  }
+  herdr agent rename "$role_pane" "$role"
+fi
+
+herdr agent prompt "$role" "$prompt" --wait --timeout 120000 || {
+  herdr agent read "$role" --source recent-unwrapped --lines 160
+  exit 1
+}
+
+herdr agent read "$role" --source recent-unwrapped --lines 200
 ```
 
-For repeated work, reuse an existing named role pane when it is in the same workspace, has the right cwd, and is idle. Otherwise create a new pane.
+Notes:
 
-## Output return policy
+- The brain may run inside a container while Herdr controls host panes. Always get the host cwd from `herdr pane current --current`; do not use container `$PWD` for pane creation.
+- Use `pic-proxy` for role panes when `PIC_HERDR_BRIDGE=1` or `PIC_HERDR_BRIDGE_HOST` is set. Otherwise use `pi`. If launch fails, read the pane output and report the failure.
+- Record `created_pane` when a pane is created. Cleanup may only close panes recorded by the current workflow.
+- If a wait or prompt times out, read the role pane output before deciding whether to steer, retry, ask the user, or leave the pane running.
 
-Primary path: read the role pane transcript.
+## Reading role output
 
-Use:
+When the user asks to read a role status or output, preserve detail by default.
+
+Return:
+
+1. role name, Herdr status, pane id, and cwd
+2. the recent role output verbatim or near-verbatim
+
+Do not compress reviewer/oracle/scout findings into a short summary unless the user asks for a summary. Preserve numbered findings, bullets, caveats, verdicts, sources, and file references. If the pane output is too long, include the most relevant contiguous section and say what was truncated.
+
+Primary read command:
 
 ```bash
 herdr agent read <role-name> --source recent-unwrapped --lines 200
 ```
 
-Increase lines when needed, but do not rely on terminal scrollback for very large outputs.
-
-Fallback path: ask the role to write a Markdown handoff file only when pane output is missing, truncated, or too long.
-
-Fallback prompt:
+Fallback: if pane output is missing, truncated, or too long, ask the role:
 
 "Your previous answer was not fully recoverable from the terminal. Write your complete final answer as Markdown in a temporary file inside the project or `/tmp`, then reply only with `RESULT_PATH=<path>`."
 
-Do not request file output in the initial prompt unless the task is expected to produce a long report.
-
 ## Prompting conventions
 
-The user-facing request can be terse, such as "ask scout to map the auth flow". Do not require the user to repeat role rules like "read-only" or "do not modify files" when the role already defines them.
+The user can be terse, such as "ask scout to map the auth flow". The brain expands that into a compact role contract.
 
-The brain should expand the user's task into a compact role contract before prompting the pane:
+Include only what matters:
 
 - role identity
 - task objective
 - relevant context from the brain
 - expected output shape
-- true invariants only
+- true invariants
 
 Avoid long procedural scripts. Define the destination and let the role choose the efficient path.
 
@@ -245,88 +177,33 @@ Examples:
 
 ## Sequencing patterns
 
-### Scout first
+Use only the roles that materially improve the outcome.
 
-Use when the brain lacks project context.
+- Scout first: `brain -> scout -> brain synthesis -> oracle or executor`
+- Plan review: `brain -> scout -> oracle -> brain decision -> executor`
+- Implementation review: `brain -> executor -> reviewer -> brain fixes or acceptance`
+- Full flow: `brain -> scout -> oracle -> executor -> reviewer -> brain final`
 
-```text
-brain -> scout -> brain synthesis -> oracle or executor
-```
-
-### Plan review
-
-Use before implementation when the change is non-trivial.
-
-```text
-brain -> scout -> oracle -> brain decision -> executor
-```
-
-### Implementation review
-
-Use after executor changes files.
-
-```text
-brain -> executor -> reviewer -> brain fixes or acceptance
-```
-
-### Full pragmatic flow
-
-```text
-brain -> scout -> oracle -> executor -> reviewer -> brain final
-```
-
-Do not force the full flow for small tasks. Use only the roles that materially improve the outcome.
-
-## Pane lifecycle policy
+## Pane lifecycle
 
 Default:
 
-- role panes are temporary work surfaces, but leave them visible after completion for DX and auditability
+- reuse an existing named role pane when it is idle, in the same workspace, and in the same cwd
+- otherwise create a new pane
 - keep user focus on the brain pane with `--no-focus`
-- do not close panes unless the user explicitly asks for cleanup, or the prompt explicitly says to clean up after reading
-- do not close panes you did not create
-- do not kill blocked agents without reading the pane and asking the user if needed
-
-If a role is blocked:
-
-1. read the role pane
-2. decide whether the brain can answer safely
-3. ask the user when approval, credentials, destructive actions, or ambiguity are involved
+- leave completed role panes visible for inspection
+- close only panes created by the current workflow and only when the user asks for cleanup
+- never kill a blocked agent without reading the pane and asking the user when approval, credentials, destructive actions, or ambiguity are involved
 
 ## Authority model
 
 The brain owns delegation, synthesis, and final acceptance. Roles do not decide final product, release, merge, or safety questions silently. Escalate unresolved decisions back to the brain.
 
-Use one mutation-capable role in the active project at a time unless the user explicitly requests isolated worktrees or parallel writers. Scouts, oracles, and reviewers are read-only by role. Executor is the normal writer role.
+Use one mutation-capable role in the active project at a time unless the user explicitly requests isolated worktrees or parallel writers. Scouts, oracles, and reviewers are read-only. Executor is the normal writer role.
 
 ## Model routing
 
-For now, all roles are Pi agents. Do not invent or guess model names.
-
-Model routing should remain configuration-driven and typo-resistant. Until a stable config exists, use the brain's current model for all role panes unless the user gives an exact launch argument.
-
-When the user asks for a specific model or alias:
-
-- use only exact aliases from a maintained crew model map
-- if the alias is missing or ambiguous, ask the user instead of guessing
-- pass model arguments to `pic-proxy` or the underlying Pi command only when the local runner supports them
-
-Suggested future model map shape, kept as documentation or a small project file, not code:
-
-```text
-scout: <exact launch args>
-oracle: <exact launch args>
-executor: <exact launch args>
-reviewer: <exact launch args>
-```
-
-Pragmatic defaults once configured:
-
-- brain: strongest reliable general coding/reasoning model
-- scout: fast/cheap model is acceptable
-- oracle: strongest reasoning model
-- executor: strong coding model
-- reviewer: strong reasoning/coding review model
+Use the default runner/model unless the user provides an exact supported launch command or exact configured alias. Do not invent or guess model names. If a requested model or alias is missing or ambiguous, ask the user.
 
 ## Minimal operating principle
 
@@ -334,8 +211,6 @@ Keep orchestration boring:
 
 - one role
 - one focused task
-- read result
+- read detailed result
 - synthesize
-- leave visible for inspection by default; clean up only when asked
-
-Add scripts only after the manual Herdr command pattern has stabilized.
+- leave visible for inspection
