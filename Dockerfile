@@ -66,6 +66,11 @@ RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/in
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && claude --version
 
+# Install Herdr CLI so containerized Pi sessions can control the host Herdr
+# session through the socket bridge created by pic/pic-proxy.
+RUN curl -fsSL https://herdr.dev/install.sh | sh \
+    && herdr --version
+
 COPY entrypoint.sh /usr/local/bin/entrypoint
 COPY md2pdf /usr/local/bin/md2pdf
 RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/md2pdf
