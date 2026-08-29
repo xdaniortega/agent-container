@@ -74,6 +74,20 @@ case "${1:-}" in
       done
     fi
 
+    # Project-local Pi skills live in the mounted project at ./.pi/agent/skills.
+    # Pi loads skills from ~/.pi/agent/skills, so expose project-local skills there
+    # at container startup. Keep this narrow: do not copy project sessions/cache/state.
+    if [ -d "$PWD/.pi/agent/skills" ]; then
+      mkdir -p /root/.pi/agent/skills
+      for skill in "$PWD"/.pi/agent/skills/*; do
+        [ -e "$skill" ] || continue
+        target="/root/.pi/agent/skills/$(basename "$skill")"
+        if [ ! -e "$target" ]; then
+          ln -s "$skill" "$target"
+        fi
+      done
+    fi
+
     should_pnpm_install=false
     if [ "${PIC_PNPM_INSTALL:-1}" != "0" ] && [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
       if [ -f pnpm-lock.yaml ]; then
