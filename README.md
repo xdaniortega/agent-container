@@ -174,19 +174,31 @@ clc-proxy --volume "../web:/workspace/web"
 ### Ignoring local auth with an Anthropic key
 
 Pi resolves stored credentials (from `auth.json`) before env keys, so a copied
-`auth.json` would shadow `ANTHROPIC_API_KEY`. Two ways to ignore the local auth:
+`auth.json` would shadow `ANTHROPIC_API_KEY`. The container and host both
+support an opt-in `--anthropic` (`-a`) mode that ignores local auth:
 
-- **In the container**: when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or
-  `ANTHROPIC_OAUTH_TOKEN` is set on the host, `pic`/`pic-proxy` forward that env
-  into the container and pass `PIC_EXCLUDE_AUTH=1`; `entrypoint.sh` then skips
-  copying `~/.pi/agent/auth.json`, so the env key wins. Without any Anthropic key
-  env, local auth is used as before.
+- **In the container**: `pic --anthropic "prompt"` (or `pic -a`) forwards
+  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_OAUTH_TOKEN` from the
+  host env into the container and passes `PIC_EXCLUDE_AUTH=1`; `entrypoint.sh`
+  then skips copying `~/.pi/agent/auth.json`, so the key wins. Without the flag,
+  `pic`/`pic-proxy` run exactly as before and keep using local auth.
 
-- **On the host** (outside the container), add the `pik` shell function (see
-  `~/.zshrc`): it points `PI_CODING_AGENT_DIR` at `~/.pi-anthropic/agent`, where
+- **Source a key without storing it**: when `--anthropic` is passed but no
+  `ANTHROPIC_*` key is in the environment, the runner runs the command given by
+  the generic `PI_ANTHROPIC_KEY_CMD` env var and uses its stdout as the key
+  (e.g. a 1Password lookup). The repo contains only this indirection, never the
+  secret or the command itself. Example (in `~/.zshrc`, outside the repo):
+
+  ```bash
+  export PI_ANTHROPIC_KEY_CMD='op read --account NFKJESXBABCS5FBEBGKA4ZZ3LQ "op://Employee/Anthropic pi dev key/password"'
+  ```
+
+- **On the host** (outside the container), the `pik` shell function (see
+  `~/.zshrc`) points `PI_CODING_AGENT_DIR` at `~/.pi-anthropic/agent`, where
   `auth.json` is an empty stub and everything else is symlinked back to
-  `~/.pi/agent`. Run `pik "prompt"` with `ANTHROPIC_API_KEY` set to get a Pi
-  that ignores local `auth.json`; normal `pi` keeps using it.
+  `~/.pi/agent`. It sources the same `PI_ANTHROPIC_KEY_CMD` (or a set
+  `ANTHROPIC_API_KEY`), so `pik "prompt"` also ignores local `auth.json`;
+  normal `pi` keeps using it.
 - **Claude Code proxy**: host `~/.claude` is mounted read-only at `/host-claude`.
   The entrypoint copies only user-authored config into the persistent, host-backed
   Linux config directory at `~/.clc-container/claude-config`, mounted as

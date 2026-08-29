@@ -25,9 +25,11 @@ if (process.env.HERDR_ENV === '1' && !process.env.HERDR_AGENT) {
   process.env.HERDR_AGENT = 'pi';
 }
 
-// Extract runner-level --proxy, --volume, and --publish/-p arguments; pass the rest to Pi.
-const parsedArgs = parseContainerRunnerArgs(cliArgs, { booleanFlags: ['--proxy'] });
+// Extract runner-level --proxy, --anthropic/-a, --volume, and --publish/-p
+// arguments; pass the rest to Pi.
+const parsedArgs = parseContainerRunnerArgs(cliArgs, { booleanFlags: ['--proxy', '--anthropic', '-a'] });
 if (parsedArgs.flags['--proxy']) proxyEnabled = true;
+const anthropicEnabled = parsedArgs.flags['--anthropic'] || parsedArgs.flags['-a'];
 const { extraVolumes, extraPublish } = parsedArgs;
 const attachMode = parsedArgs.passthroughArgs[0] === 'attach';
 const extraPiArgs = attachMode ? parsedArgs.passthroughArgs.slice(1) : parsedArgs.passthroughArgs;
@@ -67,7 +69,28 @@ function proxyEnvironmentArgs() {
 // inherit the host env, so without this the key never reaches Pi inside.
 const anthropicEnvironmentNames = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN'];
 
-function anthropicEnvironmentArgs() {
+// Generic, opt-in way to source a key without storing it anywhere: when
+// --anthropic is passed but no ANTHROPIC_* key is in the environment, run the
+// command given by PI_ANTHROPIC_KEY_CMD (e.g. an `op read` 1Password lookup)
+// on the host and use its stdout as ANTHROPIC_API_KEY. The repo never contains
+// the secret or the command itself — only this indirection.
+function runAnthropicKeyCommand(cmd) {
+  try {
+    const result = spawnSync(cmd, { shell: true, encoding: 'utf8' });
+    if (result.status === 0) {
+      const key = (result.stdout || '').trim();
+      return key || '';
+    }
+    const err = (result.stderr || '').trim();
+    log(`warning: PI_ANTHROPIC_KEY_CMD exited with status ${result.status}${err ? `: ${err}` : ''}`);
+  } catch (err) {
+    log(`warning: PI_ANTHROPIC_KEY_CMD failed: ${err.message}`);
+  }
+  return '';
+}
+
+function anthropicEnvironmentArgs({ useAnthropic } = {}) {
+  if (!useAnthropic) return [];
   const args = [];
   let any = false;
   for (const name of anthropicEnvironmentNames) {
@@ -77,7 +100,21 @@ function anthropicEnvironmentArgs() {
       any = true;
     }
   }
-  // When an Anthropic key env is provided, ignore the host's stored auth.json:
+  if (!any) {
+    const cmd = process.env.PI_ANTHROPIC_KEY_CMD;
+    if (cmd) {
+      const key = runAnthropicKeyCommand(cmd);
+      if (key) {
+        args.push('-e', `ANTHROPIC_API_KEY=${key}`);
+        any = true;
+      } else {
+        log('warning: --anthropic requested but PI_ANTHROPIC_KEY_CMD produced no key; using local auth');
+      }
+    } else {
+      log('warning: --anthropic requested but no ANTHROPIC_* key in env and PI_ANTHROPIC_KEY_CMD unset; using local auth');
+    }
+  }
+  // When an Anthropic key is in play, ignore the host's stored auth.json:
   // Pi resolves stored credentials before env keys, so a copied auth.json would
   // shadow ANTHROPIC_API_KEY. entrypoint.sh honors PIC_EXCLUDE_AUTH=1 to skip it.
   if (any) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
@@ -373,7 +410,7 @@ async function main() {
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs()];
+    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled })];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -405,7 +442,7 @@ async function main() {
     const args = containerExecArgs(existingContainerId, commandArgs, {
       envArgs: [
         ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs(),
+        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
@@ -418,7 +455,7 @@ async function main() {
       includeHerdrSocket: true,
       envArgs: [
         ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs(),
+        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
