@@ -4,9 +4,9 @@ import {
   chooseSplitTarget,
   chooseAgentName,
   compactRoleOutput,
+  configCandidates,
   findReusableRolePane,
   findReusableRolePaneInList,
-  findReusableNamedRolePaneInList,
   parseCrewConfig,
   resolveRole,
   selectLaunchCommand,
@@ -47,10 +47,12 @@ test("role config parsing and defaults preserve configured fields", () => {
   assert.match(buildRolePrompt("scout", role, "map files"), /You are scout\. Custom scout Authority: read-only\. Task: map files/);
 });
 
-test("compactRoleOutput keeps only output after the last prompt", () => {
+test("compactRoleOutput keeps output after the last prompt without extra truncation", () => {
   const prompt = "You are scout. Task: say hello";
-  const output = `pi --model x\nstartup noise\n${prompt}\nThinking\nHello.\n${prompt}\nPreparing\nHello again.`;
-  assert.equal(compactRoleOutput(output, prompt), "Preparing\nHello again.");
+  const tail = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n");
+  const output = `pi --model x\nstartup noise\n${prompt}\nThinking\nHello.\n${prompt}\n${tail}`;
+  assert.equal(compactRoleOutput(output, prompt), tail);
+  assert.equal(compactRoleOutput(output, prompt, 2), "line 59\nline 60");
 });
 
 test("role defaults supply built-in description and authority", () => {
@@ -63,6 +65,20 @@ test("role defaults supply built-in description and authority", () => {
 
 test("unknown roles are rejected", () => {
   assert.throws(() => resolveRole("invented", {}), /Unknown crew role/);
+});
+
+test("invalid configured authority and model are rejected", () => {
+  assert.throws(() => resolveRole("scout", { roles: { scout: { authority: "write-all" as never } } }), /Invalid authority/);
+  assert.throws(() => resolveRole("scout", { roles: { scout: { model: "bad model" } } }), /Invalid model/);
+});
+
+test("config candidates include project-local skill config", () => {
+  assert.deepEqual(configCandidates("/repo", "/home/me"), [
+    "/home/me/.pi/crew.config.json",
+    "/repo/.pi/crew.config.json",
+    "/repo/.pi/skills/crew/crew.config.json",
+    "/repo/skills/crew/crew.config.json",
+  ]);
 });
 
 test("reuse eligibility requires same role, idle or done, workspace, cwd, and pane", () => {
@@ -83,13 +99,6 @@ test("reuse lookup finds existing role from agent list", () => {
   assert.equal(findReusableRolePaneInList(agents, "reviewer", "ws", "/repo"), "pane-reviewer");
 });
 
-test("global role lookup finds idle named role outside current workspace", () => {
-  const agents = [
-    { name: "scout", pane_id: "pane-scout", workspace_id: "team", cwd: "/repo", status: "Idle" },
-  ];
-  assert.equal(findReusableNamedRolePaneInList(agents, "scout"), "pane-scout");
-  assert.equal(findReusableNamedRolePaneInList([{ ...agents[0], status: "Working" }], "scout"), undefined);
-});
 
 test("agent naming scopes to workspace and tab when base role exists elsewhere", () => {
   const agents = [
@@ -113,12 +122,28 @@ test("agent naming reuses scoped same-tab role", () => {
   assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6");
 });
 
+test("agent naming avoids busy or wrong-cwd scoped collisions", () => {
+  const agents = [
+    { name: "scout", pane_id: "pane-scout", workspace_id: "team", tab_id: "team-tab", cwd: "/repo", status: "Idle" },
+    { name: "scout-w5-t6", pane_id: "pane-busy", workspace_id: "w5", tab_id: "w5:t6", cwd: "/repo", status: "Working" },
+    { name: "scout-w5-t6-2", pane_id: "pane-other-cwd", workspace_id: "w5", tab_id: "w5:t6", cwd: "/other", status: "Idle" },
+  ];
+  assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6-3");
+});
+
 test("split decision creates below existing same-cwd crew pane", () => {
   const decision = chooseSplitTarget([
     { name: "scout", pane_id: "pane-scout", workspace_id: "ws", cwd: "/repo" },
   ], "ws", "/repo");
   assert.equal(decision.policy, "below-existing-crew");
   assert.deepEqual(decision.args, ["pane", "split", "pane-scout", "--direction", "down", "--cwd", "/repo", "--no-focus"]);
+});
+
+test("split decision recognizes configured custom crew roles", () => {
+  const decision = chooseSplitTarget([
+    { name: "analyst-ws-t1", pane_id: "pane-analyst", workspace_id: "ws", tab_id: "t1", cwd: "/repo" },
+  ], "ws", "/repo", "t1", new Set(["analyst"]));
+  assert.equal(decision.policy, "below-existing-crew");
 });
 
 test("split decision creates right of current when no crew pane matches", () => {

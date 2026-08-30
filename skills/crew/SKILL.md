@@ -19,7 +19,7 @@ Prefer the project-local `crew_role` Pi extension tool when it is available. Use
 - The brain remains the final decision-maker.
 - Each delegated role runs as a separate agent in its own Herdr pane.
 - Leave role panes visible after completion unless the user asks to clean them up.
-- Reuse an existing idle same-cwd role pane by default.
+- Reuse an existing idle same-cwd role pane in the same workspace/tab by default, so role panes stay close to the brain pane.
 - Prefer short, focused role tasks over long autonomous chains.
 
 ## Roles
@@ -87,9 +87,11 @@ Role pane launch command depends on where the brain is running: use `pic-proxy` 
 
 ## Preferred tool
 
-When Pi has discovered the project-local crew extension, use the `crew_role` tool for ordinary single-role delegation instead of hand-running the shell recipe. Pass the role name and focused task. The tool creates or reuses a visible same-workspace/same-cwd role pane, applies the configured model when launching a new pane, prompts the role, waits, reads recent output, and returns structured details including pane id, cwd, config path, model, and whether the pane was reused or created.
+When Pi has discovered the project-local crew extension, use the `crew_role` tool for ordinary single-role delegation instead of hand-running the shell recipe. Pass the role name and focused task. The tool creates or reuses a visible same-workspace/same-cwd/same-tab role pane, applies the configured model when launching a new pane, prompts the role, waits, reads recent output, and returns structured details including pane id, cwd, config path, configuredModel, launchModel, actualModel/actualModelKnown, and whether the pane was reused or created.
 
 Keep panes visible after tool use. If the tool is unavailable, errors before starting the role, or does not cover the needed recovery path, use the fallback shell recipe.
+
+Because Herdr agent names are globally unique, the tool uses a scoped name such as `scout-w5-t6` when plain `scout` is already used in another workspace or tab. The prompt still says "You are scout..." so role behavior is unchanged.
 
 ## Normal command recipe
 

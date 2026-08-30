@@ -19,7 +19,7 @@ type ExtensionAPI = {
 type Role = {
   description?: string;
   model?: string;
-  authority?: "read-only" | "can-edit" | string;
+  authority?: "read-only" | "can-edit";
 };
 
 type CrewConfig = { roles?: Record<string, Role> };
@@ -73,6 +73,7 @@ export function configCandidates(cwd = process.cwd(), home = homedir()): string[
   return [
     join(home, ".pi", "crew.config.json"),
     join(cwd, ".pi", "crew.config.json"),
+    join(cwd, ".pi", "skills", "crew", "crew.config.json"),
     resolve(cwd, "skills", "crew", "crew.config.json"),
   ];
 }
@@ -85,17 +86,42 @@ export function loadCrewConfig(cwd = process.cwd(), home = homedir()): { config:
   return { config: {}, path: undefined };
 }
 
+function assertValidAuthority(authority: unknown, roleName: string): asserts authority is Role["authority"] | undefined {
+  if (authority === undefined) return;
+  if (authority !== "read-only" && authority !== "can-edit") {
+    throw new Error(`Invalid authority for crew role ${roleName}: expected read-only or can-edit`);
+  }
+}
+
+function assertValidModel(model: unknown, roleName: string): asserts model is string | undefined {
+  if (model === undefined) return;
+  if (typeof model !== "string" || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._:~-]+$/.test(model)) {
+    throw new Error(`Invalid model for crew role ${roleName}: expected exact provider/model id`);
+  }
+}
+
+function assertValidRoleName(roleName: string): void {
+  if (!/^[A-Za-z0-9._-]+$/.test(roleName)) {
+    throw new Error("crew_role role must be non-blank and contain only letters, numbers, dot, underscore, or hyphen");
+  }
+}
+
 export function resolveRole(roleName: string, config: CrewConfig): Role & { name: string } {
+  assertValidRoleName(roleName);
   const configured = config.roles?.[roleName];
   const fallback = DEFAULT_ROLES[roleName];
   if (!configured && !fallback) {
     throw new Error(`Unknown crew role: ${roleName}`);
   }
+  const authority = configured?.authority ?? fallback?.authority;
+  const model = configured?.model;
+  assertValidAuthority(authority, roleName);
+  assertValidModel(model, roleName);
   return {
     name: roleName,
     description: configured?.description ?? fallback?.description,
-    authority: configured?.authority ?? fallback?.authority,
-    model: configured?.model,
+    authority,
+    model,
   };
 }
 
@@ -106,7 +132,7 @@ export function buildRolePrompt(roleName: string, role: Role, task: string): str
   return `${prompt} Task: ${task}`;
 }
 
-export function compactRoleOutput(output: string, prompt: string, maxLines = 40): string {
+export function compactRoleOutput(output: string, prompt: string, maxLines?: number): string {
   const normalized = output.replace(/\r\n/g, "\n");
   const promptIndex = normalized.lastIndexOf(prompt);
   const relevant = promptIndex >= 0 ? normalized.slice(promptIndex + prompt.length) : normalized;
@@ -114,7 +140,8 @@ export function compactRoleOutput(output: string, prompt: string, maxLines = 40)
     .split("\n")
     .map((line) => line.trimEnd())
     .filter((line) => line.trim() !== "");
-  return lines.slice(-maxLines).join("\n").trim() || normalized.split("\n").slice(-maxLines).join("\n").trim();
+  const kept = maxLines && Number.isFinite(maxLines) ? lines.slice(-maxLines) : lines;
+  return kept.join("\n").trim() || normalized.split("\n").slice(maxLines ? -maxLines : undefined).join("\n").trim();
 }
 
 function normalizedAgentStatus(agent: AgentLike): string {
@@ -126,6 +153,17 @@ function scopedRoleName(role: string, workspaceId: string, tabId?: string): stri
   const tabSuffix = tabId?.includes(":") ? tabId.split(":").pop() : tabId;
   const safeTab = (tabSuffix || "tab").replace(/[^A-Za-z0-9._-]/g, "-");
   return `${role}-${safeWorkspace}-${safeTab}`;
+}
+
+function roleNameInUse(agents: AgentLike[], name: string): boolean {
+  return agents.some((agent) => agent.name === name);
+}
+
+function isKnownCrewAgentName(name: string, roleNames: Set<string>): boolean {
+  for (const role of roleNames) {
+    if (name === role || name.startsWith(`${role}-`)) return true;
+  }
+  return false;
 }
 
 export function isReusableRoleAgent(agent: AgentLike, role: string, workspaceId: string, cwd: string, tabId?: string): boolean {
@@ -149,19 +187,16 @@ export function findReusableRolePaneInList(agents: AgentLike[], role: string, wo
   return agents.find((agent) => isReusableRoleAgent(agent, role, workspaceId, cwd, tabId))?.pane_id;
 }
 
-export function findReusableNamedRolePaneInList(agents: AgentLike[], role: string): string | undefined {
-  return agents.find((agent) => {
-    const status = normalizedAgentStatus(agent);
-    return agent.name === role && (status === "idle" || status === "done") && !!agent.pane_id;
-  })?.pane_id;
-}
-
 export function chooseAgentName(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string): string {
   if (findReusableRolePaneInList(agents, role, workspaceId, cwd, tabId)) return role;
-  const scoped = scopedRoleName(role, workspaceId, tabId);
-  if (findReusableRolePaneInList(agents, scoped, workspaceId, cwd, tabId)) return scoped;
-  if (agents.some((agent) => agent.name === role)) return scoped;
-  return role;
+  const baseName = roleNameInUse(agents, role) ? scopedRoleName(role, workspaceId, tabId) : role;
+  if (findReusableRolePaneInList(agents, baseName, workspaceId, cwd, tabId)) return baseName;
+  if (!roleNameInUse(agents, baseName)) return baseName;
+  for (let i = 2; i < 100; i += 1) {
+    const candidate = `${baseName}-${i}`;
+    if (!roleNameInUse(agents, candidate)) return candidate;
+  }
+  throw new Error(`Could not choose an unused crew agent name for role ${role}`);
 }
 
 export function chooseSplitTarget(
@@ -169,12 +204,13 @@ export function chooseSplitTarget(
   workspaceId: string,
   cwd: string,
   tabId?: string,
+  roleNames = new Set(Object.keys(DEFAULT_ROLES)),
 ): { args: string[]; policy: "below-existing-crew" | "right-of-current" } {
   const crew = agents.find(
     (agent) =>
       !!agent.pane_id &&
       !!agent.name &&
-      KNOWN_ROLES.has(agent.name.split("-")[0]) &&
+      isKnownCrewAgentName(agent.name, roleNames) &&
       agent.workspace_id === workspaceId &&
       (!tabId || !agent.tab_id || agent.tab_id === tabId) &&
       (agent.foreground_cwd === cwd || agent.cwd === cwd),
@@ -205,11 +241,13 @@ async function herdr(pi: ExtensionAPI, args: string[], timeout = PROMPT_TIMEOUT_
 
 async function readAgent(pi: ExtensionAPI, role: string, lines: number): Promise<string> {
   const result = await herdr(pi, ["agent", "read", role, "--source", "recent-unwrapped", "--lines", String(lines)]);
+  expectOk(result, `herdr agent read ${role}`);
   return result.stdout || result.stderr;
 }
 
 async function readPane(pi: ExtensionAPI, paneId: string, lines: number): Promise<string> {
   const result = await herdr(pi, ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)]);
+  expectOk(result, `herdr pane read ${paneId}`);
   return result.stdout || result.stderr;
 }
 
@@ -232,6 +270,26 @@ async function listAgents(pi: ExtensionAPI): Promise<AgentLike[]> {
   return parseJson(result.stdout, "herdr agent list").result?.agents ?? [];
 }
 
+async function preflight(pi: ExtensionAPI): Promise<void> {
+  const result = await pi.exec("bash", ["-lc", 'test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1'], { timeout: 2_000 });
+  if (result.code !== 0) {
+    throw new Error("I am not currently able to control Herdr from this session. Start me inside Herdr with the Herdr CLI available, then retry.");
+  }
+}
+
+function positiveInteger(value: unknown, fallback: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(`crew_role ${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function normalizeTask(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") throw new Error("crew_role requires a non-blank task string");
+  return value;
+}
+
 type CrewRoleParams = {
   role?: string;
   task?: string;
@@ -243,14 +301,20 @@ type CrewRoleParams = {
 
 async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   const roleName = params.role ?? "scout";
-  if (!params.task || typeof params.task !== "string") throw new Error("crew_role requires a task string");
+  assertValidRoleName(roleName);
+  const task = normalizeTask(params.task);
+  const timeoutMs = positiveInteger(params.timeoutMs, PROMPT_TIMEOUT_MS, "timeoutMs");
+  const readLines = positiveInteger(params.readLines, DEFAULT_READ_LINES, "readLines");
+  await preflight(pi);
 
   const configCwd = params.configCwd ?? process.cwd();
   const { config, path: configPath } = loadCrewConfig(configCwd);
+  const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
-  const prompt = buildRolePrompt(roleName, role, params.task);
+  const prompt = buildRolePrompt(roleName, role, task);
   const baseCommand = selectLaunchCommand();
-  const roleCommand = role.model ? `${baseCommand} --model ${role.model}` : baseCommand;
+  const launchModel = role.model;
+  const roleCommand = launchModel ? `${baseCommand} --model ${launchModel}` : baseCommand;
 
   const current = await herdr(pi, ["pane", "current", "--current"]);
   expectOk(current, "herdr pane current");
@@ -261,15 +325,14 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   if (!roleCwd) throw new Error("herdr pane current did not report a cwd");
 
   let agents = await listAgents(pi);
-  const agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
+  let agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
   let paneId = findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId);
-  let reusedOutsideWorkspace = false;
   let createdPane: string | undefined;
   let splitPolicy: string | undefined;
   let renameConflictRecovered = false;
 
   if (!paneId) {
-    const split = chooseSplitTarget(agents, workspaceId, roleCwd, tabId);
+    const split = chooseSplitTarget(agents, workspaceId, roleCwd, tabId, roleNames);
     splitPolicy = split.policy;
     const splitResult = await herdr(pi, split.args);
     expectOk(splitResult, "herdr pane split");
@@ -286,22 +349,28 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
       throw new Error(`agent detection failed for pane ${paneId}: ${waitResult.stderr || waitResult.stdout}\n\n${output}`);
     }
 
-    const rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
+    let rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
+    if (rename.code !== 0 && /agent_name_taken/.test(rename.stderr || rename.stdout)) {
+      agents = await listAgents(pi);
+      agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
+      rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
+      renameConflictRecovered = rename.code === 0;
+    }
     expectOk(rename, "herdr agent rename");
   }
 
   const promptArgs = ["agent", "prompt", agentName, prompt];
   if (params.wait ?? true) {
-    promptArgs.push("--wait", "--timeout", String(params.timeoutMs ?? PROMPT_TIMEOUT_MS));
+    promptArgs.push("--wait", "--timeout", String(timeoutMs));
   }
-  const promptResult = await herdr(pi, promptArgs, (params.timeoutMs ?? PROMPT_TIMEOUT_MS) + 5_000);
+  const promptResult = await herdr(pi, promptArgs, timeoutMs + 5_000);
   if (promptResult.code !== 0) {
     const output = await readAgent(pi, agentName, FAILURE_READ_LINES);
     throw new Error(`crew role prompt failed for ${agentName}: ${promptResult.stderr || promptResult.stdout}\n\n${output}`);
   }
 
-  const output = await readAgent(pi, agentName, params.readLines ?? DEFAULT_READ_LINES);
-  const compactOutput = compactRoleOutput(output, prompt);
+  const output = await readAgent(pi, agentName, readLines);
+  const compactOutput = compactRoleOutput(output, prompt, readLines);
   return {
     content: [{ type: "text", text: compactOutput }],
     details: {
@@ -315,10 +384,14 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
       workspaceId,
       cwd: roleCwd,
       command: baseCommand,
-      model: role.model ?? null,
+      configuredModel: role.model ?? null,
+      launchModel: createdPane ? launchModel ?? null : null,
+      actualModel: createdPane ? launchModel ?? null : null,
+      actualModelKnown: !!createdPane && !!launchModel,
       authority: role.authority ?? null,
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
+      renameConflictRecovered,
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
     },
