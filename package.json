@@ -6,7 +6,8 @@
   "scripts": {
     "pic": "node ./pic-runner.cjs",
     "proxy": "node ./pic-proxy-runner.cjs",
-    "clc-proxy": "node ./clc-proxy-runner.cjs"
+    "clc-proxy": "node ./clc-proxy-runner.cjs",
+    "install-crew": "node --experimental-strip-types scripts/install-crew.ts"
   },
   "dependencies": {
     "proxy-chain": "^2.6.0"
