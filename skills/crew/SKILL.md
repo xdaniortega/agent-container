@@ -34,15 +34,14 @@ Custom roles may be added in crew config. Unknown roles should not be invented; 
 
 ## Config
 
-`crew_role` reads crew config for role descriptions, authorities, and launch models.
+`crew_role` and `crew_rules` read crew config for role descriptions, authorities, and launch models.
 
 Lookup order:
 
-1. `~/.pi/crew.config.json`
-2. `./.pi/crew.config.json`
-3. `./.pi/skills/crew/crew.config.json`
-4. `./skills/crew/crew.config.json`
-5. built-in defaults
+1. `./.pi/crew.config.json`
+2. `./.pi/skills/crew/crew.config.json`
+3. `./skills/crew/crew.config.json`
+4. `~/.pi/crew.config.json`
 
 Config shape:
 
@@ -60,6 +59,8 @@ Config shape:
 
 Use `description` as the role's standing behavior, `model` as an exact provider/id, and `authority` as either `read-only` or `can-edit`.
 
+Use `crew_rules` to inspect the resolved role configuration and source path when needed.
+
 ## Using `crew_role`
 
 For ordinary delegation, call `crew_role` with:
@@ -68,7 +69,7 @@ For ordinary delegation, call `crew_role` with:
 - `task`: the fully expanded task and relevant context
 - optional `timeoutMs` / `readLines` only when defaults are insufficient
 
-`crew_role` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, and reading output.
+`crew_role` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, queuing, and reading output.
 
 Because Herdr agent names are globally unique, `crew_role` may use a scoped name such as `scout-w5-t6` when plain `scout` is already used elsewhere. The prompt still says "You are scout...", so role behavior is unchanged.
 

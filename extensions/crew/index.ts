@@ -71,10 +71,10 @@ export function parseCrewConfig(raw: string): CrewConfig {
 
 export function configCandidates(cwd = process.cwd(), home = homedir()): string[] {
   return [
-    join(home, ".pi", "crew.config.json"),
     join(cwd, ".pi", "crew.config.json"),
     join(cwd, ".pi", "skills", "crew", "crew.config.json"),
     resolve(cwd, "skills", "crew", "crew.config.json"),
+    join(home, ".pi", "crew.config.json"),
   ];
 }
 
@@ -101,8 +101,8 @@ function assertValidModel(model: unknown, roleName: string): asserts model is st
 }
 
 function assertValidRoleName(roleName: string): void {
-  if (!/^[A-Za-z0-9._-]+$/.test(roleName)) {
-    throw new Error("crew_role role must be non-blank and contain only letters, numbers, dot, underscore, or hyphen");
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(roleName)) {
+    throw new Error("crew_role role must match Herdr agent names: lowercase letter followed by lowercase letters, numbers, underscore, or hyphen; max 32 chars");
   }
 }
 
@@ -177,11 +177,12 @@ function normalizedAgentStatus(agent: AgentLike): string {
   return String(agent.agent_status ?? agent.status ?? "").toLowerCase();
 }
 
-function scopedRoleName(role: string, workspaceId: string, tabId?: string): string {
-  const safeWorkspace = workspaceId.replace(/[^A-Za-z0-9._-]/g, "-") || "workspace";
+export function scopedRoleName(role: string, workspaceId: string, tabId?: string): string {
   const tabSuffix = tabId?.includes(":") ? tabId.split(":").pop() : tabId;
-  const safeTab = (tabSuffix || "tab").replace(/[^A-Za-z0-9._-]/g, "-");
-  return `${role}-${safeWorkspace}-${safeTab}`;
+  const suffix = `${workspaceId}-${tabSuffix || "tab"}`.replace(/[^a-z0-9_-]/g, "-").toLowerCase();
+  const maxRoleLength = Math.max(1, 31 - suffix.length);
+  const safeRole = role.slice(0, maxRoleLength).replace(/-+$/g, "") || "r";
+  return `${safeRole}-${suffix}`.slice(0, 32).replace(/-+$/g, "");
 }
 
 function roleNameInUse(agents: AgentLike[], name: string): boolean {
@@ -322,7 +323,6 @@ function normalizeTask(value: unknown): string {
 type CrewRoleParams = {
   role?: string;
   task?: string;
-  wait?: boolean;
   timeoutMs?: number;
   readLines?: number;
   configCwd?: string;
@@ -391,10 +391,7 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
     expectOk(rename, "herdr agent rename");
   }
 
-  const promptArgs = ["agent", "prompt", agentName, prompt];
-  if (params.wait ?? true) {
-    promptArgs.push("--wait", "--timeout", String(timeoutMs));
-  }
+  const promptArgs = ["agent", "prompt", agentName, prompt, "--wait", "--timeout", String(timeoutMs)];
   const promptResult = await herdr(pi, promptArgs, timeoutMs + 5_000);
   if (promptResult.code !== 0) {
     const output = await readAgent(pi, agentName, FAILURE_READ_LINES);
@@ -433,6 +430,37 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   };
 }
 
+let crewRoleQueue: Promise<void> = Promise.resolve();
+
+function enqueueCrewRole<T>(work: () => Promise<T>): Promise<T> {
+  const run = crewRoleQueue.then(work, work);
+  crewRoleQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+type CrewRulesParams = { configCwd?: string };
+
+function executeCrewRules(params: CrewRulesParams = {}) {
+  const configCwd = params.configCwd ?? process.cwd();
+  const { config, path: configPath } = loadCrewConfig(configCwd);
+  const roleNames = [...new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})])].sort();
+  const roles = Object.fromEntries(roleNames.map((name) => {
+    const role = resolveRole(name, config);
+    return [name, {
+      description: role.description ?? null,
+      authority: role.authority ?? null,
+      model: role.model ?? null,
+    }];
+  }));
+  return {
+    content: [{ type: "text", text: JSON.stringify({ configPath: configPath ?? null, roles }, null, 2) }],
+    details: { version: VERSION, configPath: configPath ?? null, roles },
+  };
+}
+
 export default function crewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "crew_role",
@@ -442,7 +470,6 @@ export default function crewExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use this for crew delegation when Herdr is available.",
       "Keep tasks short and focused. Reused panes keep their launch model.",
-      "If the tool is unavailable or fails before starting, use the crew skill's shell recipe fallback.",
     ],
     parameters: {
       type: "object",
@@ -450,7 +477,6 @@ export default function crewExtension(pi: ExtensionAPI) {
       properties: {
         role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
         task: { type: "string", description: "Focused task for the role." },
-        wait: { type: "boolean", description: "Wait for completion before reading output. Defaults to true." },
         timeoutMs: { type: "number", description: "Prompt wait timeout in milliseconds. Defaults to 120000." },
         readLines: { type: "number", description: "Recent output lines to return. Defaults to 200." },
         configCwd: { type: "string", description: "Directory for project .pi/crew.config.json lookup. Defaults to current process cwd." },
@@ -458,7 +484,25 @@ export default function crewExtension(pi: ExtensionAPI) {
       additionalProperties: false,
     },
     async execute(_toolCallId, rawParams) {
-      return executeCrewRole(pi, { ...((rawParams ?? {}) as CrewRoleParams), toolCallId: _toolCallId });
+      return enqueueCrewRole(() => executeCrewRole(pi, { ...((rawParams ?? {}) as CrewRoleParams), toolCallId: _toolCallId }));
+    },
+  });
+
+
+  pi.registerTool({
+    name: "crew_rules",
+    label: "Crew Rules",
+    description: "Load resolved crew role configuration: descriptions, authority, models, and config source.",
+    promptSnippet: "Inspect configured crew roles and models.",
+    parameters: {
+      type: "object",
+      properties: {
+        configCwd: { type: "string", description: "Directory for project .pi/crew.config.json lookup. Defaults to current process cwd." },
+      },
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, rawParams) {
+      return executeCrewRules((rawParams ?? {}) as CrewRulesParams);
     },
   });
 }

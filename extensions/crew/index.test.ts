@@ -88,12 +88,19 @@ test("invalid configured authority and model are rejected", () => {
   assert.throws(() => resolveRole("scout", { roles: { scout: { model: "bad model" } } }), /Invalid model/);
 });
 
-test("config candidates include project-local skill config", () => {
+test("role names must be Herdr-compatible", () => {
+  assert.throws(() => resolveRole("Scout", {}), /Herdr agent names/);
+  assert.throws(() => resolveRole("1scout", {}), /Herdr agent names/);
+  assert.throws(() => resolveRole("scout.with.dot", {}), /Herdr agent names/);
+  assert.throws(() => resolveRole("a".repeat(33), {}), /Herdr agent names/);
+});
+
+test("config candidates prefer project config before global config", () => {
   assert.deepEqual(configCandidates("/repo", "/home/me"), [
-    "/home/me/.pi/crew.config.json",
     "/repo/.pi/crew.config.json",
     "/repo/.pi/skills/crew/crew.config.json",
     "/repo/skills/crew/crew.config.json",
+    "/home/me/.pi/crew.config.json",
   ]);
 });
 
@@ -145,6 +152,13 @@ test("agent naming avoids busy or wrong-cwd scoped collisions", () => {
     { name: "scout-w5-t6-2", pane_id: "pane-other-cwd", workspace_id: "w5", tab_id: "w5:t6", cwd: "/other", status: "Idle" },
   ];
   assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6-3");
+});
+
+test("agent naming keeps scoped names Herdr-compatible and length-safe", () => {
+  const agents = [{ name: "averylongcustomrolename-that-exists", pane_id: "p", workspace_id: "other", cwd: "/repo", status: "Idle" }];
+  const name = chooseAgentName(agents, "averylongcustomrolename", "workspace-with-long-name", "/repo", "workspace-with-long-name:t123456789");
+  assert.match(name, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.ok(name.length <= 32);
 });
 
 test("split decision creates below existing same-cwd crew pane", () => {
