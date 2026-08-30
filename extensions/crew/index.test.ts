@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import {
   buildRolePrompt,
+  appendMarkerInstruction,
+  buildCrewMarker,
   chooseSplitTarget,
   chooseAgentName,
   compactRoleOutput,
   configCandidates,
+  extractMarkerOutput,
   findReusableRolePane,
   findReusableRolePaneInList,
   parseCrewConfig,
@@ -53,6 +56,16 @@ test("compactRoleOutput keeps output after the last prompt without extra truncat
   const output = `pi --model x\nstartup noise\n${prompt}\nThinking\nHello.\n${prompt}\n${tail}`;
   assert.equal(compactRoleOutput(output, prompt), tail);
   assert.equal(compactRoleOutput(output, prompt, 2), "line 59\nline 60");
+});
+
+test("marker helpers extract final answer after unique marker", () => {
+  const marker = buildCrewMarker("call:a/b");
+  assert.match(marker, /^CREW_RESULT_/);
+  const prompt = appendMarkerInstruction("You are scout. Task: say hello", marker);
+  assert.match(prompt, new RegExp(marker));
+  const output = `startup\n${marker}\nold answer\nnoise\n${marker}\nFinal answer\nline 2`;
+  assert.deepEqual(extractMarkerOutput(output, marker), { text: "Final answer\nline 2", found: true });
+  assert.deepEqual(extractMarkerOutput(output, "missing"), { text: "", found: false });
 });
 
 test("role defaults supply built-in description and authority", () => {

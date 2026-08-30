@@ -132,6 +132,28 @@ export function buildRolePrompt(roleName: string, role: Role, task: string): str
   return `${prompt} Task: ${task}`;
 }
 
+export function buildCrewMarker(toolCallId: string): string {
+  const safe = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_").slice(-48) || `${Date.now()}`;
+  return `CREW_RESULT_${safe}`;
+}
+
+export function appendMarkerInstruction(prompt: string, marker: string): string {
+  return `${prompt}\n\nWhen you are finished, print exactly this marker on its own line, then put your final answer after it:\n${marker}`;
+}
+
+export function extractMarkerOutput(output: string, marker: string, maxLines?: number): { text: string; found: boolean } {
+  const normalized = output.replace(/\r\n/g, "\n");
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex < 0) return { text: "", found: false };
+  const after = normalized.slice(markerIndex + marker.length);
+  const lines = after
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+  const kept = maxLines && Number.isFinite(maxLines) ? lines.slice(-maxLines) : lines;
+  return { text: kept.join("\n").trim(), found: true };
+}
+
 export function compactRoleOutput(output: string, prompt: string, maxLines?: number): string {
   const normalized = output.replace(/\r\n/g, "\n");
   const promptIndex = normalized.lastIndexOf(prompt);
@@ -297,6 +319,7 @@ type CrewRoleParams = {
   timeoutMs?: number;
   readLines?: number;
   configCwd?: string;
+  toolCallId?: string;
 };
 
 async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
@@ -311,7 +334,9 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   const { config, path: configPath } = loadCrewConfig(configCwd);
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
-  const prompt = buildRolePrompt(roleName, role, task);
+  const basePrompt = buildRolePrompt(roleName, role, task);
+  const marker = buildCrewMarker(params.toolCallId ?? "crew-role");
+  const prompt = appendMarkerInstruction(basePrompt, marker);
   const baseCommand = selectLaunchCommand();
   const launchModel = role.model;
   const roleCommand = launchModel ? `${baseCommand} --model ${launchModel}` : baseCommand;
@@ -370,7 +395,8 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   }
 
   const output = await readAgent(pi, agentName, readLines);
-  const compactOutput = compactRoleOutput(output, prompt, readLines);
+  const markerOutput = extractMarkerOutput(output, marker, readLines);
+  const compactOutput = markerOutput.found && markerOutput.text ? markerOutput.text : compactRoleOutput(output, basePrompt, readLines);
   return {
     content: [{ type: "text", text: compactOutput }],
     details: {
@@ -392,6 +418,7 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
       renameConflictRecovered,
+      markerFound: markerOutput.found,
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
     },
@@ -423,7 +450,7 @@ export default function crewExtension(pi: ExtensionAPI) {
       additionalProperties: false,
     },
     async execute(_toolCallId, rawParams) {
-      return executeCrewRole(pi, (rawParams ?? {}) as CrewRoleParams);
+      return executeCrewRole(pi, { ...((rawParams ?? {}) as CrewRoleParams), toolCallId: _toolCallId });
     },
   });
 }

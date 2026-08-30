@@ -93,6 +93,8 @@ Keep panes visible after tool use. If the tool is unavailable, errors before sta
 
 Because Herdr agent names are globally unique, the tool uses a scoped name such as `scout-w5-t6` when plain `scout` is already used in another workspace or tab. The prompt still says "You are scout..." so role behavior is unchanged.
 
+For normal successful calls, `crew_role` asks the role to print a unique result marker and returns the text after that marker, so startup banners and previous terminal scrollback are omitted. If the marker is missing, the tool falls back to recent-output trimming and failure diagnostics still include recent pane output.
+
 ## Normal command recipe
 
 Use this recipe for ordinary single-role delegation. Substitute the role name and user task.
