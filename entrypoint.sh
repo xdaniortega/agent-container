@@ -47,7 +47,7 @@ case "${1:-}" in
       # patterns). When the runner passes PIC_EXCLUDE_AUTH=1 (an Anthropic key
       # env was provided), also drop auth.json so the env key wins over any
       # stored credential instead of being shadowed by it.
-      _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
+      _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/skills --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
       if [ "${PIC_EXCLUDE_AUTH:-0}" = "1" ]; then
         _pi_excludes="$_pi_excludes --exclude=./agent/auth.json"
       fi
@@ -74,32 +74,63 @@ case "${1:-}" in
       done
     fi
 
-    # Project-local Pi skills may live in:
-    #   ./skills/<name>              (versioned project skills, preferred here)
-    #   ./.pi/skills/<name>          (Pi project-local convention)
-    #   ./.pi/agent/skills/<name>    (legacy compatibility)
-    # Pi loads runtime skills from ~/.pi/agent/skills. Expose project-local skills there
-    # at container startup. Versioned ./skills entries override stale/user entries
-    # with the same name; ./.pi entries fill gaps only.
+    # Pi skills may live in:
+    #   ./skills/<name>                 (versioned project skills, preferred here)
+    #   ./.pi/skills/<name>             (Pi project-local convention)
+    #   ./.pi/agent/skills/<name>       (legacy compatibility)
+    #   ./.pi/host-agent-skills/<name>  (host ~/.pi/agent/skills staged by pic-runner)
+    # Pi loads runtime skills from ~/.pi/agent/skills. Materialize skills there
+    # at container startup. Precedence is: ./skills > ./.pi/skills >
+    # ./.pi/agent/skills > staged host skills.
     mkdir -p /root/.pi/agent/skills
+
+    # Install skills by copying and dereferencing symlinks instead of linking to
+    # the source. Host skills are staged by the host-side runner first, because
+    # arbitrary host symlink targets are not visible from inside the container.
+    install_skill() {
+      src="$1"
+      dest="$2"
+      tmp="$dest.$$"
+      lock="$dest.lock"
+      if mkdir "$lock" 2>/dev/null; then
+        rm -rf "$tmp"
+        if cp -aL "$src" "$tmp" 2>/dev/null; then
+          rm -rf "$dest"
+          if mv "$tmp" "$dest" 2>/dev/null; then
+            rmdir "$lock" 2>/dev/null || true
+            return 0
+          fi
+        fi
+        rm -rf "$tmp"
+        rmdir "$lock" 2>/dev/null || true
+        return 1
+      fi
+      [ -e "$dest" ] || [ -L "$dest" ]
+    }
 
     if [ -d "$PWD/skills" ]; then
       for skill in "$PWD"/skills/*; do
         [ -e "$skill/SKILL.md" ] || continue
         target="/root/.pi/agent/skills/$(basename "$skill")"
         rm -rf "$target"
-        ln -s "$skill" "$target"
+        install_skill "$skill" "$target"
       done
     fi
 
-    for skill_dir in "$PWD"/.pi/skills "$PWD"/.pi/agent/skills; do
+    for skill_dir in "$PWD"/.pi/skills "$PWD"/.pi/agent/skills "$PWD"/.pi/host-agent-skills; do
       [ -d "$skill_dir" ] || continue
       for skill in "$skill_dir"/*; do
         [ -e "$skill/SKILL.md" ] || continue
         target="/root/.pi/agent/skills/$(basename "$skill")"
-        if [ ! -e "$target" ]; then
-          ln -s "$skill" "$target"
+        # If a stale/dangling entry is present, remove it before materializing
+        # this accessible skill directory.
+        if [ -e "$target" ]; then
+          continue
         fi
+        if [ -L "$target" ]; then
+          rm -rf "$target"
+        fi
+        install_skill "$skill" "$target"
       done
     done
 

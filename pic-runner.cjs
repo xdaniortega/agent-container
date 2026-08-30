@@ -44,6 +44,7 @@ const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 // Session directory — pi writes UUID-named session files, no hash needed for isolation
 // Two pi processes in the same container won't collide because session IDs are UUIDs.
 const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
+const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
 const herdrSocketMountEnabled = process.env.PIC_HERDR_SOCKET_MOUNT === '1';
 const herdrSocketPath = process.env.HERDR_SOCKET_PATH || '';
@@ -153,6 +154,34 @@ function herdrSocketVolumeArgs() {
 
 function log(message) {
   console.log(`[${commandName}] ${message}`);
+}
+
+function stageHostSkills() {
+  const sourceDir = path.join(home, '.pi', 'agent', 'skills');
+  fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
+  fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
+
+  if (!fs.existsSync(sourceDir)) return;
+
+  for (const name of fs.readdirSync(sourceDir)) {
+    const source = path.join(sourceDir, name);
+    const skillFile = path.join(source, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) {
+      const stat = fs.lstatSync(source);
+      if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
+      continue;
+    }
+
+    try {
+      fs.cpSync(source, path.join(stagedHostSkillsDir, name), {
+        recursive: true,
+        dereference: true,
+        force: true,
+      });
+    } catch (error) {
+      log(`warning: failed to stage host skill "${name}": ${error.message}`);
+    }
+  }
 }
 
 function maybeRenameHerdrAgent() {
@@ -375,6 +404,7 @@ async function main() {
   if (!home) throw new Error('HOME is not set');
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+  stageHostSkills();
 
   maybeRenameHerdrAgent();
 
