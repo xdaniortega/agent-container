@@ -102,7 +102,7 @@ function assertValidModel(model: unknown, roleName: string): asserts model is st
 
 function assertValidRoleName(roleName: string): void {
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(roleName)) {
-    throw new Error("crew_role role must match Herdr agent names: lowercase letter followed by lowercase letters, numbers, underscore, or hyphen; max 32 chars");
+    throw new Error("crew_launch role must match Herdr agent names: lowercase letter followed by lowercase letters, numbers, underscore, or hyphen; max 32 chars");
   }
 }
 
@@ -310,13 +310,13 @@ async function preflight(pi: ExtensionAPI): Promise<void> {
 function positiveInteger(value: unknown, fallback: number, name: string): number {
   if (value === undefined) return fallback;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
-    throw new Error(`crew_role ${name} must be a positive integer`);
+    throw new Error(`crew_launch ${name} must be a positive integer`);
   }
   return value;
 }
 
 function normalizeTask(value: unknown): string {
-  if (typeof value !== "string" || value.trim() === "") throw new Error("crew_role requires a non-blank task string");
+  if (typeof value !== "string" || value.trim() === "") throw new Error("crew_launch requires a non-blank task string");
   return value;
 }
 
@@ -463,8 +463,8 @@ function executeCrewRules(params: CrewRulesParams = {}) {
 
 export default function crewExtension(pi: ExtensionAPI) {
   pi.registerTool({
-    name: "crew_role",
-    label: "Crew Role",
+    name: "crew_launch",
+    label: "Crew Launch",
     description: "Run or reuse a visible Herdr role pane, prompt it, wait, read output, and return structured details.",
     promptSnippet: "Delegate a focused task to a visible crew role pane.",
     promptGuidelines: [

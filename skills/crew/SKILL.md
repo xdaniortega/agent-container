@@ -3,14 +3,14 @@ name: crew
 description: |
   Run a visible role crew from a main brain session, with each role in its own Herdr pane.
   Use when the user wants scout/oracle/executor/reviewer-style delegation for pragmatic
-  day-to-day coding workflows. Prefer the crew_role extension tool.
+  day-to-day coding workflows. Prefer the crew_launch extension tool.
 ---
 
 # Crew
 
 Use this skill when the user wants the current Pi session to delegate work to visible role panes managed by Herdr.
 
-Use the project-local `crew_role` tool for normal delegation. If `crew_role` or Herdr is unavailable, stop and tell the user to reload/restart Pi or fix Herdr availability. Do not recreate the old shell workflow by hand.
+Use the project-local `crew_launch` tool for normal delegation.
 
 ## Core model
 
@@ -34,7 +34,7 @@ Custom roles may be added in crew config. Unknown roles should not be invented; 
 
 ## Config
 
-`crew_role` and `crew_rules` read crew config for role descriptions, authorities, and launch models.
+`crew_launch` and `crew_rules` read crew config for role descriptions, authorities, and launch models.
 
 Lookup order:
 
@@ -61,19 +61,19 @@ Use `description` as the role's standing behavior, `model` as an exact provider/
 
 Use `crew_rules` to inspect the resolved role configuration and source path when needed.
 
-## Using `crew_role`
+## Using `crew_launch`
 
-For ordinary delegation, call `crew_role` with:
+For ordinary delegation, call `crew_launch` with:
 
 - `role`: role name, such as `scout`, `oracle`, `executor`, `reviewer`, or a configured custom role
 - `task`: the fully expanded task and relevant context
 - optional `timeoutMs` / `readLines` only when defaults are insufficient
 
-`crew_role` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, queuing, and reading output.
+`crew_launch` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, queuing, and reading output.
 
-Because Herdr agent names are globally unique, `crew_role` may use a scoped name such as `scout-w5-t6` when plain `scout` is already used elsewhere. The prompt still says "You are scout...", so role behavior is unchanged.
+Because Herdr agent names are globally unique, `crew_launch` may use a scoped name such as `scout-w5-t6` when plain `scout` is already used elsewhere. The prompt still says "You are scout...", so role behavior is unchanged.
 
-For successful calls, `crew_role` returns the role's marked final answer and hides terminal scrollback. Preserve that output unless the user asks for a summary.
+For successful calls, `crew_launch` returns the role's marked final answer and hides terminal scrollback. Preserve that output unless the user asks for a summary.
 
 ## Prompting conventions
 
@@ -103,16 +103,16 @@ Avoid long procedural scripts. Define the destination and constraints, then let 
 Examples:
 
 - user says: "ask scout where this is handled"
-- brain uses `crew_role`: role `scout`, task "Find where this behavior is handled. Return relevant files/symbols, key observations, risks, and suggested next steps."
+- brain uses `crew_launch`: role `scout`, task "Find where this behavior is handled. Return relevant files/symbols, key observations, risks, and suggested next steps."
 
 - user says: "ask oracle for a plan"
-- brain uses `crew_role`: role `oracle`, task "Given the context below, propose a pragmatic implementation plan with tradeoffs, risks, and a recommended sequence."
+- brain uses `crew_launch`: role `oracle`, task "Given the context below, propose a pragmatic implementation plan with tradeoffs, risks, and a recommended sequence."
 
 - user says: "ask executor to implement it"
-- brain uses `crew_role`: role `executor`, task "Implement the approved scope below. Context: <relevant plan/decision/requirements>. Return changed files, validation, and remaining risks."
+- brain uses `crew_launch`: role `executor`, task "Implement the approved scope below. Context: <relevant plan/decision/requirements>. Return changed files, validation, and remaining risks."
 
 - user says: "ask reviewer to check the diff"
-- brain uses `crew_role`: role `reviewer`, task "Review the current diff against the goal below. Return a verdict, blocking findings, test gaps, and residual risks."
+- brain uses `crew_launch`: role `reviewer`, task "Review the current diff against the goal below. Return a verdict, blocking findings, test gaps, and residual risks."
 
 ## Reading role output
 
@@ -136,7 +136,7 @@ Use only the roles that materially improve the outcome.
 
 ## Pane lifecycle
 
-Default behavior is owned by `crew_role`:
+Default behavior is owned by `crew_launch`:
 
 - reuse an idle matching role pane near the brain when possible
 - otherwise create a visible pane near the brain
