@@ -132,26 +132,33 @@ export function buildRolePrompt(roleName: string, role: Role, task: string): str
   return `${prompt} Task: ${task}`;
 }
 
-export function buildCrewMarker(toolCallId: string): string {
+export function buildCrewMarkers(toolCallId: string): { start: string; end: string } {
   const safe = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_").slice(-48) || `${Date.now()}`;
-  return `CREW_RESULT_${safe}`;
+  return { start: `CREW_RESULT_START_${safe}`, end: `CREW_RESULT_END_${safe}` };
 }
 
-export function appendMarkerInstruction(prompt: string, marker: string): string {
-  return `${prompt}\n\nWhen you are finished, print exactly this marker on its own line, then put your final answer after it:\n${marker}`;
+export function appendMarkerInstruction(prompt: string, markers: { start: string; end: string }): string {
+  return `${prompt}\n\nFor your final answer, print ${markers.start} on its own line, then your answer, then ${markers.end} on its own line.`;
 }
 
-export function extractMarkerOutput(output: string, marker: string, maxLines?: number): { text: string; found: boolean } {
-  const normalized = output.replace(/\r\n/g, "\n");
-  const markerIndex = normalized.lastIndexOf(marker);
-  if (markerIndex < 0) return { text: "", found: false };
-  const after = normalized.slice(markerIndex + marker.length);
-  const lines = after
+function boundedLines(text: string, maxLines?: number): string {
+  const lines = text
+    .replace(/\r\n/g, "\n")
     .split("\n")
     .map((line) => line.trimEnd())
     .filter((line) => line.trim() !== "");
   const kept = maxLines && Number.isFinite(maxLines) ? lines.slice(-maxLines) : lines;
-  return { text: kept.join("\n").trim(), found: true };
+  return kept.join("\n").trim();
+}
+
+export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): { text: string; mode: "marker-pair" | "marker-start" | "missing" } {
+  const normalized = output.replace(/\r\n/g, "\n");
+  const startIndex = normalized.lastIndexOf(markers.start);
+  if (startIndex < 0) return { text: "", mode: "missing" };
+  const afterStart = normalized.slice(startIndex + markers.start.length);
+  const endIndex = afterStart.indexOf(markers.end);
+  if (endIndex >= 0) return { text: boundedLines(afterStart.slice(0, endIndex), maxLines), mode: "marker-pair" };
+  return { text: boundedLines(afterStart, maxLines), mode: "marker-start" };
 }
 
 export function compactRoleOutput(output: string, prompt: string, maxLines?: number): string {
@@ -335,8 +342,8 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
   const basePrompt = buildRolePrompt(roleName, role, task);
-  const marker = buildCrewMarker(params.toolCallId ?? "crew-role");
-  const prompt = appendMarkerInstruction(basePrompt, marker);
+  const markers = buildCrewMarkers(params.toolCallId ?? "crew-role");
+  const prompt = appendMarkerInstruction(basePrompt, markers);
   const baseCommand = selectLaunchCommand();
   const launchModel = role.model;
   const roleCommand = launchModel ? `${baseCommand} --model ${launchModel}` : baseCommand;
@@ -395,8 +402,8 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
   }
 
   const output = await readAgent(pi, agentName, readLines);
-  const markerOutput = extractMarkerOutput(output, marker, readLines);
-  const compactOutput = markerOutput.found && markerOutput.text ? markerOutput.text : compactRoleOutput(output, basePrompt, readLines);
+  const markerOutput = extractMarkerOutput(output, markers, readLines);
+  const compactOutput = markerOutput.mode !== "missing" && markerOutput.text ? markerOutput.text : compactRoleOutput(output, basePrompt, readLines);
   return {
     content: [{ type: "text", text: compactOutput }],
     details: {
@@ -418,7 +425,8 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
       renameConflictRecovered,
-      markerFound: markerOutput.found,
+      markerFound: markerOutput.mode !== "missing",
+      extractionMode: markerOutput.mode === "missing" ? "prompt-fallback" : markerOutput.mode,
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
     },

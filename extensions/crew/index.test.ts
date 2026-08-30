@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import {
   buildRolePrompt,
   appendMarkerInstruction,
-  buildCrewMarker,
+  buildCrewMarkers,
   chooseSplitTarget,
   chooseAgentName,
   compactRoleOutput,
@@ -58,14 +58,17 @@ test("compactRoleOutput keeps output after the last prompt without extra truncat
   assert.equal(compactRoleOutput(output, prompt, 2), "line 59\nline 60");
 });
 
-test("marker helpers extract final answer after unique marker", () => {
-  const marker = buildCrewMarker("call:a/b");
-  assert.match(marker, /^CREW_RESULT_/);
-  const prompt = appendMarkerInstruction("You are scout. Task: say hello", marker);
-  assert.match(prompt, new RegExp(marker));
-  const output = `startup\n${marker}\nold answer\nnoise\n${marker}\nFinal answer\nline 2`;
-  assert.deepEqual(extractMarkerOutput(output, marker), { text: "Final answer\nline 2", found: true });
-  assert.deepEqual(extractMarkerOutput(output, "missing"), { text: "", found: false });
+test("marker helpers extract only the final answer between marker pair", () => {
+  const markers = buildCrewMarkers("call:a/b");
+  assert.match(markers.start, /^CREW_RESULT_START_/);
+  assert.match(markers.end, /^CREW_RESULT_END_/);
+  const prompt = appendMarkerInstruction("You are scout. Task: say hello", markers);
+  assert.match(prompt, new RegExp(markers.start));
+  assert.match(prompt, new RegExp(markers.end));
+  const output = `startup\n${markers.start}\nold answer\n${markers.end}\nnoise\n${markers.start}\nFinal answer\nline 2\n${markers.end}\nfooter noise`;
+  assert.deepEqual(extractMarkerOutput(output, markers), { text: "Final answer\nline 2", mode: "marker-pair" });
+  assert.deepEqual(extractMarkerOutput(`${markers.start}\nFinal answer\nfooter`, markers), { text: "Final answer\nfooter", mode: "marker-start" });
+  assert.deepEqual(extractMarkerOutput("missing", markers), { text: "", mode: "missing" });
 });
 
 test("role defaults supply built-in description and authority", () => {

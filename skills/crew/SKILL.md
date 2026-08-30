@@ -3,15 +3,15 @@ name: crew
 description: |
   Run a visible role crew from a main brain session, with each role in its own Herdr pane.
   Use when the user wants scout/oracle/executor/reviewer-style delegation for pragmatic
-  day-to-day coding workflows. Provides a small command recipe for launching,
-  prompting, reading, and leaving visible role panes open.
+  day-to-day coding workflows. Prefer the crew_role extension tool; keep shell usage only
+  as a recovery fallback.
 ---
 
 # Crew
 
 Use this skill when the user wants a main brain session to delegate work to visible role panes managed by Herdr.
 
-Prefer the project-local `crew_role` Pi extension tool when it is available. Use the shell recipe below as a fallback when the tool is unavailable, Herdr control fails before a pane starts, or you need to debug/recover unusual layouts. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
+Prefer the project-local `crew_role` Pi extension tool. Use shell commands only as a fallback when the tool is unavailable or you are debugging/recovering Herdr state.
 
 ## Core model
 
@@ -93,120 +93,21 @@ Keep panes visible after tool use. If the tool is unavailable, errors before sta
 
 Because Herdr agent names are globally unique, the tool uses a scoped name such as `scout-w5-t6` when plain `scout` is already used in another workspace or tab. The prompt still says "You are scout..." so role behavior is unchanged.
 
-For normal successful calls, `crew_role` asks the role to print a unique result marker and returns the text after that marker, so startup banners and previous terminal scrollback are omitted. If the marker is missing, the tool falls back to recent-output trimming and failure diagnostics still include recent pane output.
+For successful calls, `crew_role` returns the role's marked final answer and hides terminal scrollback. If markers are missing, it falls back to recent-output trimming.
 
-## Normal command recipe
+## Shell fallback
 
-Use this recipe for ordinary single-role delegation. Substitute the role name and user task.
+Use this only when `crew_role` is unavailable or Herdr needs manual recovery.
 
 ```bash
-set -euo pipefail
-
-role=scout
-user_task='<task plus the relevant brain context needed to do it>'
-
-config_path=""
-if [ -f "$HOME/.pi/crew.config.json" ]; then
-  config_path="$HOME/.pi/crew.config.json"
-elif [ -f .pi/crew.config.json ]; then
-  config_path=.pi/crew.config.json
-fi
-
-role_description=""
-role_authority=""
-role_model=""
-if [ -n "$config_path" ]; then
-  role_description=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.description) console.log(r.description)')
-  role_authority=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.authority) console.log(r.authority)')
-  role_model=$(role="$role" config_path="$config_path" node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.env.config_path,"utf8")); const r=c.roles?.[process.env.role]; if(r?.model) console.log(r.model)')
-fi
-
-if [ -z "$role_description" ]; then
-  case "$role" in
-    scout) role_description="Finds local and online context. Reports relevant facts, files, sources, risks, and suggested next steps."; role_authority=${role_authority:-read-only} ;;
-    oracle) role_description="Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks."; role_authority=${role_authority:-read-only} ;;
-    executor) role_description="Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks."; role_authority=${role_authority:-can-edit} ;;
-    reviewer) role_description="Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings."; role_authority=${role_authority:-read-only} ;;
-    *) printf 'Unknown crew role: %s\n' "$role" >&2; exit 1 ;;
-  esac
-fi
-
-prompt="You are $role."
-[ -n "$role_description" ] && prompt="$prompt $role_description"
-[ -n "$role_authority" ] && prompt="$prompt Authority: $role_authority."
-prompt="$prompt Task and context: $user_task"
-
-if [ "${PIC_HERDR_BRIDGE:-}" = "1" ] || [ -n "${PIC_HERDR_BRIDGE_HOST:-}" ]; then
-  role_command=pic-proxy
-else
-  role_command=pi
-fi
-[ -n "$role_model" ] && role_command="$role_command --model $role_model"
-
-current_json=$(herdr pane current --current)
-role_cwd=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; const cwd=p.foreground_cwd||p.cwd||""; if(!cwd){process.exit(1)} console.log(cwd)})')
-workspace_id=$(printf '%s' "$current_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; console.log(p.workspace_id||"")})')
-
-role_pane=""
-if herdr agent get "$role" >/tmp/crew-agent.json 2>/dev/null; then
-  role_pane=$(workspace_id="$workspace_id" role_cwd="$role_cwd" node -e 'const a=require("fs").readFileSync("/tmp/crew-agent.json","utf8"); const p=JSON.parse(a).result.agent; if((p.agent_status==="idle"||p.agent_status==="done") && p.workspace_id===process.env.workspace_id && (p.foreground_cwd===process.env.role_cwd||p.cwd===process.env.role_cwd)){console.log(p.pane_id)}' )
-fi
-
-if [ -z "$role_pane" ]; then
-  crew_pane=$(workspace_id="$workspace_id" role_cwd="$role_cwd" node - <<'NODE'
-const fs = require('fs');
-const known = new Set(['scout', 'oracle', 'executor', 'reviewer']);
-let input = '';
-process.stdin.on('data', d => input += d);
-process.stdin.on('end', () => {
-  try {
-    const agents = JSON.parse(input).result.agents || [];
-    const match = agents.find(a =>
-      known.has(a.name) &&
-      a.workspace_id === process.env.workspace_id &&
-      (a.foreground_cwd === process.env.role_cwd || a.cwd === process.env.role_cwd)
-    );
-    if (match) console.log(match.pane_id);
-  } catch {}
-});
-NODE
-  <<<"$(herdr agent list)")
-
-  if [ -n "$crew_pane" ]; then
-    split_json=$(herdr pane split "$crew_pane" --direction down --cwd "$role_cwd" --no-focus)
-  else
-    split_json=$(herdr pane split --current --direction right --cwd "$role_cwd" --no-focus)
-  fi
-  role_pane=$(printf '%s' "$split_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const p=JSON.parse(s).result.pane; if(!p.pane_id){process.exit(1)} console.log(p.pane_id)})')
-  created_pane="$role_pane"
-  herdr pane run "$role_pane" "$role_command"
-
-  # Agent detection can lag briefly after pane run.
-  herdr agent wait "$role_pane" --timeout 120000 || {
-    sleep 3
-    herdr agent wait "$role_pane" --timeout 120000 || {
-      herdr pane read "$role_pane" --source recent-unwrapped --lines 120
-      exit 1
-    }
-  }
-  herdr agent rename "$role_pane" "$role"
-fi
-
-herdr agent prompt "$role" "$prompt" --wait --timeout 120000 || {
-  herdr agent read "$role" --source recent-unwrapped --lines 160
-  exit 1
-}
-
-herdr agent read "$role" --source recent-unwrapped --lines 200
+test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1
+herdr pane current --current
+herdr agent list
+herdr agent prompt <role-or-scoped-agent-name> '<expanded role prompt>' --wait --timeout 120000
+herdr agent read <role-or-scoped-agent-name> --source recent-unwrapped --lines 200
 ```
 
-Notes:
-
-- The brain may run inside a container while Herdr controls host panes. Always get the host cwd from `herdr pane current --current`; do not use container `$PWD` for pane creation.
-- Use `pic-proxy` for role panes when `PIC_HERDR_BRIDGE=1` or `PIC_HERDR_BRIDGE_HOST` is set. Otherwise use `pi`. If launch fails, read the pane output and report the failure.
-- Record `created_pane` when a pane is created. Cleanup may only close panes recorded by the current workflow.
-- A configured model is applied when creating a new role pane. Reused panes keep the model they were launched with; create a fresh pane when changing a role's model.
-- If a wait or prompt times out, read the role pane output before deciding whether to steer, retry, ask the user, or leave the pane running.
+For pane creation, model selection, scoped names, marker parsing, and normal reuse, delegate to `crew_role` instead of copying the old recipe.
 
 ## Reading role output
 
