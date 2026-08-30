@@ -11,7 +11,7 @@ description: |
 
 Use this skill when the user wants a main brain session to delegate work to visible role panes managed by Herdr.
 
-Use this recipe for normal runs. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
+Prefer the project-local `crew_role` Pi extension tool when it is available. Use the shell recipe below as a fallback when the tool is unavailable, Herdr control fails before a pane starts, or you need to debug/recover unusual layouts. Consult the official `herdr` skill only for recovery, unusual layouts, or command syntax changes.
 
 ## Core model
 
@@ -84,6 +84,12 @@ test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1
 If this fails, stop and tell the user: "I am not currently able to control Herdr from this session. Start me inside Herdr with the Herdr CLI available, then retry."
 
 Role pane launch command depends on where the brain is running: use `pic-proxy` when the brain is inside the containerized Pi runner, otherwise use `pi`.
+
+## Preferred tool
+
+When Pi has discovered the project-local crew extension, use the `crew_role` tool for ordinary single-role delegation instead of hand-running the shell recipe. Pass the role name and focused task. The tool creates or reuses a visible same-workspace/same-cwd role pane, applies the configured model when launching a new pane, prompts the role, waits, reads recent output, and returns structured details including pane id, cwd, config path, model, and whether the pane was reused or created.
+
+Keep panes visible after tool use. If the tool is unavailable, errors before starting the role, or does not cover the needed recovery path, use the fallback shell recipe.
 
 ## Normal command recipe
 
