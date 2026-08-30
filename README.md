@@ -116,6 +116,14 @@ pic-proxy attach # shell in the matching project container, or start one
 clc-proxy        # Claude Code through the host-side proxy
 ```
 
+### Crew skill
+
+The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets Pi delegate focused work to visible Herdr role panes such as `scout`, `oracle`, `executor`, and `reviewer`. It works with both `pic` and `pic-proxy`; use it when you want parallel research, planning, implementation, or review from the current Pi session. Install the local crew extension with:
+
+```bash
+npm run install-crew
+```
+
 ### Herdr integration
 
 When `pic` or `pic-proxy` is launched inside a Herdr pane, the runner auto-enables Pi status reporting through a host/container socket bridge. No Herdr socket is bind-mounted into the Apple container.
