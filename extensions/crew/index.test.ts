@@ -9,11 +9,13 @@ import {
   compactRoleOutput,
   configCandidates,
   extractMarkerOutput,
+  updateMarkerOutput,
   findReusableRolePane,
   findReusableRolePaneInList,
   parseCrewConfig,
   resolveRole,
   selectLaunchCommand,
+  scopedRoleName,
   normalizeTask,
   parseModelCatalog,
   modelMatch,
@@ -27,6 +29,8 @@ test("unresolved delegation references are rejected conservatively", () => {
   assert.throws(() => normalizeTask("implement the plan above"), /incomplete/i);
   assert.throws(() => normalizeTask("fix it in auth.ts"), /incomplete/i);
   assert.doesNotThrow(() => normalizeTask("Review the authentication parser and report whether it handles expired tokens."));
+  assert.doesNotThrow(() => normalizeTask("Review that", { context: "Assess the concrete Alpha Vantage and Trade212 API proposal, including command shape and failure handling." }));
+  assert.doesNotThrow(() => normalizeTask("Review the previous API research and report implementation risks."));
 });
 
 test("model catalog requires exact IDs", () => {
@@ -40,6 +44,7 @@ test("model catalog requires exact IDs", () => {
 test("blocked and timeout statuses are not completion", () => {
   assert.equal(classifyAgentStatus("blocked"), "blocked");
   assert.equal(classifyAgentStatus("timed_out"), "timed_out");
+  assert.equal(classifyAgentStatus("working"), "working");
 });
 
 function test(name: string, fn: () => void) {
@@ -107,6 +112,14 @@ test("marker helpers extract only the final answer between marker pair", () => {
   assert.deepEqual(extractMarkerOutput("missing", markers), { text: "", mode: "missing" });
 });
 
+test("marker capture survives the start marker scrolling out of later snapshots", () => {
+  const markers = buildCrewMarkers("scrolled-marker");
+  let capture = extractMarkerOutput("", markers);
+  capture = updateMarkerOutput(capture, `${markers.start}\nline 1\nline 2`, markers);
+  capture = updateMarkerOutput(capture, `line 2\nline 3\n${markers.end}\nfooter`, markers);
+  assert.deepEqual(capture, { text: "line 1\nline 2\nline 3", mode: "marker-pair" });
+});
+
 test("marker text embedded in the echoed prompt is not treated as role output", () => {
   const markers = buildCrewMarkers("embedded-marker");
   const echoedPrompt = `For your final answer, print ${markers.start} on its own line, then your answer, then ${markers.end} on its own line.`;
@@ -116,6 +129,10 @@ test("marker text embedded in the echoed prompt is not treated as role output", 
 test("interactive trust prompts are treated as blocked startup", () => {
   assert.equal(isStartupBlockedOutput("Trust project folder?\n→ Trust"), true);
   assert.equal(isStartupBlockedOutput("Pi can explain its own features."), false);
+});
+
+test("scoped role names preserve uppercase workspace characters without doubled separators", () => {
+  assert.equal(scopedRoleName("scout", "wA", "wA:t1"), "scout-wa-t1");
 });
 
 test("role defaults supply built-in description and authority", () => {

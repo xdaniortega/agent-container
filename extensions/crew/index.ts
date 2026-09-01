@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
+type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
+type ToolUpdate = (partialResult: ToolResult) => void;
 type ExtensionAPI = {
   exec(command: string, args?: string[], options?: { timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
   registerTool(tool: {
@@ -12,7 +14,7 @@ type ExtensionAPI = {
     promptSnippet?: string;
     promptGuidelines?: string[];
     parameters?: unknown;
-    execute(toolCallId: string, params: unknown): Promise<unknown>;
+    execute(toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate): Promise<unknown>;
   }): void;
 };
 
@@ -43,6 +45,9 @@ const DEFAULT_READ_LINES = 200;
 const FAILURE_READ_LINES = 160;
 const STARTUP_READY_STABLE_MS = 3_000;
 const STARTUP_POLL_MS = 500;
+const MARKER_READ_LINES = 2_000;
+const ROLE_POLL_MS = 15_000;
+const PROMPT_START_GRACE_MS = 5_000;
 const KNOWN_ROLES = new Set(["scout", "oracle", "executor", "reviewer"]);
 
 const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authority">>> = {
@@ -199,6 +204,34 @@ export function extractMarkerOutput(output: string, markers: { start: string; en
   return { text: "", mode: "missing" };
 }
 
+type MarkerOutput = ReturnType<typeof extractMarkerOutput>;
+
+function mergeOverlappingText(previous: string, next: string): string {
+  const previousLines = previous.replace(/\r\n/g, "\n").split("\n");
+  const nextLines = next.replace(/\r\n/g, "\n").split("\n");
+  const maxOverlap = Math.min(previousLines.length, nextLines.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (previousLines.slice(-overlap).every((line, index) => line === nextLines[index])) {
+      return [...previousLines, ...nextLines.slice(overlap)].join("\n");
+    }
+  }
+  return [...previousLines, ...nextLines].join("\n");
+}
+
+export function updateMarkerOutput(previous: MarkerOutput, snapshot: string, markers: { start: string; end: string }): MarkerOutput {
+  const observed = extractMarkerOutput(snapshot, markers);
+  if (observed.mode === "marker-pair" || observed.mode === "marker-start") return observed;
+  if (previous.mode !== "marker-start") return previous;
+
+  const lines = snapshot.replace(/\r\n/g, "\n").split("\n");
+  const endLine = lines.findIndex(line => line.trim() === markers.end);
+  const continuation = (endLine >= 0 ? lines.slice(0, endLine) : lines).join("\n");
+  return {
+    text: mergeOverlappingText(previous.text, continuation).trim(),
+    mode: endLine >= 0 ? "marker-pair" : "marker-start",
+  };
+}
+
 export function compactRoleOutput(output: string, prompt: string, maxLines?: number): string {
   const normalized = output.replace(/\r\n/g, "\n");
   const promptIndex = normalized.lastIndexOf(prompt);
@@ -217,7 +250,7 @@ function normalizedAgentStatus(agent: AgentLike): string {
 
 export function scopedRoleName(role: string, workspaceId: string, tabId?: string): string {
   const tabSuffix = tabId?.includes(":") ? tabId.split(":").pop() : tabId;
-  const suffix = `${workspaceId}-${tabSuffix || "tab"}`.replace(/[^a-z0-9_-]/g, "-").toLowerCase();
+  const suffix = `${workspaceId}-${tabSuffix || "tab"}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^[-_]+|[-_]+$/g, "");
   const maxRoleLength = Math.max(1, 31 - suffix.length);
   const safeRole = role.slice(0, maxRoleLength).replace(/-+$/g, "") || "r";
   return `${safeRole}-${suffix}`.slice(0, 32).replace(/-+$/g, "");
@@ -352,14 +385,15 @@ async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: nu
   return { status: "timed_out", output: lastOutput || undefined };
 }
 
-type CrewStatus = "done" | "idle" | "blocked" | "timed_out" | "failed" | "unknown";
+type CrewStatus = "done" | "idle" | "working" | "blocked" | "timed_out" | "failed" | "unknown";
 export function classifyAgentStatus(value: unknown): CrewStatus {
   const status = String(value ?? "").toLowerCase().replace(/[- ]/g, "_");
   if (status.includes("block")) return "blocked";
   if (status.includes("timeout") || status.includes("timed_out")) return "timed_out";
   if (status.includes("fail") || status.includes("error")) return "failed";
-  if (status === "done" || status === "completed" || status === "complete" || /(?:^|[\\s\"'])status[\\s\"':=]+(?:done|completed|complete)/.test(status)) return "done";
-  if (status === "idle" || status === "ready" || /(?:^|[\\s\"'])status[\\s\"':=]+(?:idle|ready)/.test(status)) return "idle";
+  if (status === "working" || status === "busy" || /(?:^|[\\s"'])status[\\s"':=]+(?:working|busy)/.test(status)) return "working";
+  if (status === "done" || status === "completed" || status === "complete" || /(?:^|[\\s"'])status[\\s"':=]+(?:done|completed|complete)/.test(status)) return "done";
+  if (status === "idle" || status === "ready" || /(?:^|[\\s"'])status[\\s"':=]+(?:idle|ready)/.test(status)) return "idle";
   return "unknown";
 }
 
@@ -393,10 +427,20 @@ function positiveInteger(value: unknown, fallback: number, name: string): number
 export function normalizeTask(value: unknown, fields: DelegationFields = {}): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error("crew_launch requires a non-blank task string");
   const task = value.trim();
-  const combined = `${task} ${fields.context ?? ""}`;
-  const unresolved = /^(?:implement|fix|review|do|follow)\s+(?:it|that|the plan|the above|above)|\b(?:the plan|the above|above|earlier|previous(?:ly)?|as discussed)\b|\b(?:implement|fix|review)\s+(?:it|that)\b/i;
-  if (unresolved.test(combined)) throw new Error("Delegation contract is incomplete: replace unresolved references with explicit objective, context, paths, constraints, and output. Example: 'Update src/auth.ts to reject expired tokens; run the auth tests and report changed files and results.'");
-  return value;
+  const supplemental = [fields.context, fields.constraints, fields.acceptanceCriteria, fields.expectedOutput]
+    .filter(value => typeof value === "string" && value.trim().length >= 20)
+    .join(" ");
+  const unresolvedOnly = /^(?:please\s+)?(?:implement|fix|review|do|follow|continue)\s+(?:it|that|this|the plan(?: above)?|the above|above)(?:\s+(?:in|from|using)\b.*)?[.!]?$/i;
+  if (unresolvedOnly.test(task) && !supplemental) throw new Error("Delegation contract is incomplete: replace the unresolved task reference with an explicit objective, or supply concrete context, constraints, acceptance criteria, or expected output.");
+  return task;
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error("crew_launch was cancelled"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("crew_launch was cancelled")); }, { once: true });
+  });
 }
 
 type CrewLaunchParams = DelegationFields & {
@@ -425,7 +469,7 @@ export function modelMatch(requested: string, catalog: string[]): "exact" | "fuz
   }) ? "fuzzy" : "none";
 }
 
-async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams) {
+async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, signal?: AbortSignal, onUpdate?: ToolUpdate) {
   const roleName = params.role ?? "scout";
   assertValidRoleName(roleName);
   const task = normalizeTask(params.task, params);
@@ -498,29 +542,76 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams) {
     expectOk(rename, "herdr agent rename");
   }
 
-  const promptArgs = ["agent", "prompt", agentName, prompt, "--wait", "--timeout", String(timeoutMs)];
-  const promptResult = await herdr(pi, promptArgs, timeoutMs + 5_000);
-  const output = await readAgent(pi, agentName, promptResult.code === 0 ? readLines : FAILURE_READ_LINES);
-  const currentAgent = await maybeGetAgent(pi, agentName);
-  const agentEvidence = currentAgent?.agent_status || currentAgent?.status;
-  let status = classifyAgentStatus(agentEvidence);
-  const promptDiagnostic = `${promptResult.stderr} ${promptResult.stdout}`;
+  onUpdate?.({ content: [{ type: "text", text: `Starting ${roleName}…` }], details: { role: roleName, agentName, paneId, status: "starting" } });
+  const promptResult = await herdr(pi, ["agent", "prompt", agentName, prompt], 10_000);
   if (promptResult.code !== 0) {
-    if (promptResult.killed || /timed?[_ -]?out|timeout/i.test(promptDiagnostic)) status = "timed_out";
-    else if (status !== "blocked") status = "failed";
-  } else if (status === "unknown") {
-    status = "done";
+    const diagnostic = await readAgent(pi, agentName, FAILURE_READ_LINES);
+    throw new Error(`crew role prompt submission failed for ${agentName}: ${promptResult.stderr || promptResult.stdout}\n\n${diagnostic}`);
   }
-  if (promptResult.code !== 0 && status === "failed") {
-    throw new Error(`crew role prompt failed for ${agentName}: ${promptResult.stderr || promptResult.stdout}\n\n${output}`);
+
+  const submittedAt = Date.now();
+  let lastProgressAt = submittedAt;
+  let previousEvidence = "";
+  let observedWorking = false;
+  let heartbeatCount = 0;
+  let output = "";
+  let currentAgent: AgentLike | undefined;
+  let lastKnownAgent: AgentLike | undefined;
+  let agentExited = false;
+  let status: CrewStatus = "unknown";
+  let markerOutput = extractMarkerOutput("", markers);
+
+  while (true) {
+    if (signal?.aborted) throw new Error("crew_launch was cancelled");
+    currentAgent = await maybeGetAgent(pi, agentName);
+    if (currentAgent) lastKnownAgent = currentAgent;
+    status = classifyAgentStatus(currentAgent?.agent_status || currentAgent?.status);
+    output = currentAgent
+      ? await readAgent(pi, agentName, Math.max(readLines, MARKER_READ_LINES))
+      : await readPane(pi, paneId, Math.max(readLines, MARKER_READ_LINES));
+    markerOutput = updateMarkerOutput(markerOutput, output, markers);
+    const settled = status === "done" || status === "idle";
+    const evidence = `${status}\n${output}`;
+    if (evidence !== previousEvidence) {
+      previousEvidence = evidence;
+      lastProgressAt = Date.now();
+    }
+    if (status === "working") {
+      observedWorking = true;
+      // A positively working role is alive even when its visible output is unchanged.
+      lastProgressAt = Date.now();
+    }
+    if (!currentAgent && Date.now() - submittedAt >= PROMPT_START_GRACE_MS) {
+      agentExited = true;
+      status = markerOutput.mode === "marker-pair" ? "done" : "failed";
+      break;
+    }
+
+    if (markerOutput.mode === "marker-pair" && settled) break;
+    if (status === "blocked" || status === "failed") break;
+    if (observedWorking && settled) break;
+    if (!observedWorking && settled && Date.now() - submittedAt >= PROMPT_START_GRACE_MS) break;
+    if (Date.now() - lastProgressAt >= timeoutMs) {
+      status = "timed_out";
+      break;
+    }
+
+    heartbeatCount += 1;
+    const dots = ".".repeat((heartbeatCount - 1) % 3 + 1);
+    onUpdate?.({
+      content: [{ type: "text", text: `Processing ${roleName}${dots}` }],
+      details: { role: roleName, agentName, paneId, status, heartbeat: heartbeatCount, elapsedMs: Date.now() - submittedAt },
+    });
+    const pollMs = observedWorking ? ROLE_POLL_MS : Math.min(1_000, ROLE_POLL_MS);
+    await delay(pollMs, signal);
   }
-  const markerOutput = extractMarkerOutput(output, markers, readLines);
+
   const settled = status === "done" || status === "idle";
-  const complete = settled && promptResult.code === 0 && markerOutput.mode === "marker-pair";
-  const agentContinues = status === "timed_out" || status === "blocked" || status === "unknown";
+  const complete = settled && markerOutput.mode === "marker-pair";
+  const agentContinues = status === "working" || status === "timed_out" || status === "blocked" || status === "unknown";
 
   const compactOutput = complete && markerOutput.text
-    ? markerOutput.text
+    ? boundedLines(markerOutput.text, readLines)
     : `[CREW STATUS: ${status}; complete: false] ${settled ? "The role settled without a confirmed final marker pair; this is incomplete diagnostic output, not a final answer." : "The role did not complete. This is partial diagnostic output, not a final answer."}\n\n${compactRoleOutput(output, prompt, readLines)}`;
   return {
     content: [{ type: "text", text: compactOutput }],
@@ -536,12 +627,15 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams) {
       cwd: roleCwd,
       command: baseCommand,
       requestedModel: role.model ?? null,
-      actualModel: currentAgent?.model ?? currentAgent?.model_id ?? null,
-      actualModelKnown: !!(currentAgent?.model ?? currentAgent?.model_id),
-      modelWarning: role.model && currentAgent?.model && currentAgent.model !== role.model ? `Running model ${currentAgent.model} differs from requested ${role.model}.` : (!createdPane && role.model ? "Reused pane model was not queried." : null),
+      actualModel: lastKnownAgent?.model ?? lastKnownAgent?.model_id ?? null,
+      actualModelKnown: !!(lastKnownAgent?.model ?? lastKnownAgent?.model_id),
+      modelWarning: role.model && lastKnownAgent?.model && lastKnownAgent.model !== role.model ? `Running model ${lastKnownAgent.model} differs from requested ${role.model}.` : (!createdPane && role.model ? "Reused pane model was not queried." : null),
       status,
       complete,
       agentContinues,
+      agentExited,
+      heartbeatCount,
+      elapsedMs: Date.now() - submittedAt,
       authority: role.authority ?? null,
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
@@ -550,6 +644,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams) {
       extractionMode: markerOutput.mode === "missing" ? "prompt-fallback" : markerOutput.mode,
       extractionWarning: markerOutput.mode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null,
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
+      markerCaptureLines: Math.max(readLines, MARKER_READ_LINES),
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
     },
   };
@@ -592,16 +687,16 @@ async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) 
 export default function crewExtension(pi: ExtensionAPI) {
   const parameters = { type: "object", required: ["role", "task"], properties: {
     role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
-    task: { type: "string", description: "Self-contained delegation contract. The role cannot see the parent conversation. Include objective, context, paths, constraints, and desired output. Do not use unresolved references such as 'above', 'that', 'the plan', or 'implement it'." },
+    task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
     context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
     acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
-    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Prompt wait timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
+    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };
-  const execute = async (toolCallId: string, rawParams: unknown) => {
+  const execute = async (toolCallId: string, rawParams: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate) => {
     const params = { ...((rawParams ?? {}) as CrewLaunchParams), toolCallId };
     const authority = DEFAULT_ROLES[params.role ?? "scout"]?.authority ?? (params.configCwd ? resolveRole(params.role ?? "scout", loadCrewConfig(params.configCwd).config).authority : "can-edit");
     const key = authority === "read-only" ? `readonly:${normalizedCwd(params.configCwd ?? process.cwd())}:${Date.now()}:${Math.random()}` : `writer:${params.configCwd ? normalizedCwd(params.configCwd) : "pane"}`;
-    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params));
+    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate));
   };
   pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
 
