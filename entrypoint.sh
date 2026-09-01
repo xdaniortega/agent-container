@@ -47,7 +47,7 @@ case "${1:-}" in
       # patterns). When the runner passes PIC_EXCLUDE_AUTH=1 (an Anthropic key
       # env was provided), also drop auth.json so the env key wins over any
       # stored credential instead of being shadowed by it.
-      _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/skills --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
+      _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/skills --exclude=./agent/extensions --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
       if [ "${PIC_EXCLUDE_AUTH:-0}" = "1" ]; then
         _pi_excludes="$_pi_excludes --exclude=./agent/auth.json"
       fi
@@ -63,15 +63,25 @@ case "${1:-}" in
       ln -s /host-pi/agent/git /root/.pi/agent/git
     fi
 
-    if [ -d /host-pi/agent/extensions ]; then
-      mkdir -p /root/.pi/agent/extensions
-      for extension in /host-pi/agent/extensions/*; do
+    # Extensions are staged by pic-runner with host symlinks dereferenced.
+    # Never link /root/.pi to host-absolute extension paths.
+    mkdir -p /root/.pi/agent/extensions
+    if [ -d "$PWD/.pi/host-agent-extensions" ]; then
+      for extension in "$PWD"/.pi/host-agent-extensions/*; do
         [ -e "$extension" ] || continue
         target="/root/.pi/agent/extensions/$(basename "$extension")"
-        if [ ! -e "$target" ]; then
-          ln -s "$extension" "$target"
-        fi
+        rm -rf "$target"
+        cp -aL "$extension" "$target"
       done
+    fi
+    if [ -d /root/.pi/agent/extensions/crew ] && [ ! -f /root/.pi/agent/extensions/crew/index.ts ]; then
+      echo "[pi-container] fatal: crew extension is not a readable regular file" >&2
+      exit 1
+    fi
+    extension_names=$(find /root/.pi/agent/extensions -maxdepth 2 -type f -print 2>/dev/null | sort | tr '\n' ' ')
+    echo "[pi-container] staged extensions: ${extension_names:-none}" >&2
+    if [ -f /root/.pi/agent/extensions/crew/index.ts ]; then
+      echo "[pi-container] Crew diagnostic: crew_launch registration source is present" >&2
     fi
 
     # Pi skills may live in:

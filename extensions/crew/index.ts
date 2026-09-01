@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
 type ExtensionAPI = {
@@ -32,13 +32,17 @@ type AgentLike = {
   cwd?: string;
   agent_status?: string;
   status?: string;
+  model?: string;
+  model_id?: string;
 };
 
 const VERSION = "0.1.0";
-const DETECTION_TIMEOUT_MS = 120_000;
+const STARTUP_TIMEOUT_MS = 120_000;
 const PROMPT_TIMEOUT_MS = 120_000;
 const DEFAULT_READ_LINES = 200;
 const FAILURE_READ_LINES = 160;
+const STARTUP_READY_STABLE_MS = 3_000;
+const STARTUP_POLL_MS = 500;
 const KNOWN_ROLES = new Set(["scout", "oracle", "executor", "reviewer"]);
 
 const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authority">>> = {
@@ -64,22 +68,42 @@ export function selectLaunchCommand(env: NodeJS.ProcessEnv = process.env): "pic-
   return env.PIC_HERDR_BRIDGE === "1" || !!env.PIC_HERDR_BRIDGE_HOST ? "pic-proxy" : "pi";
 }
 
+export function selectDiscoveryCommand(): "pi" { return "pi"; }
+
+export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string): string {
+  return `${baseCommand} --approve${launchModel ? ` --model ${launchModel}` : ""}`;
+}
+
 export function parseCrewConfig(raw: string): CrewConfig {
   const parsed = JSON.parse(raw) as CrewConfig;
   return parsed && typeof parsed === "object" ? parsed : {};
 }
 
-export function configCandidates(cwd = process.cwd(), home = homedir()): string[] {
-  return [
-    join(cwd, ".pi", "crew.config.json"),
-    join(cwd, ".pi", "skills", "crew", "crew.config.json"),
-    resolve(cwd, "skills", "crew", "crew.config.json"),
-    join(home, ".pi", "crew.config.json"),
-  ];
+function normalizedCwd(cwd: string): string {
+  const absolute = resolve(cwd);
+  try { return realpathSync(absolute); } catch { return absolute.replace(/[\\\\/]+$/, "") || absolute; }
 }
 
-export function loadCrewConfig(cwd = process.cwd(), home = homedir()): { config: CrewConfig; path?: string } {
-  for (const path of configCandidates(cwd, home)) {
+export function configCandidates(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): string[] {
+  const candidates: string[] = [];
+  let current = normalizedCwd(cwd);
+  const selected = current;
+  while (true) {
+    candidates.push(join(current, ".pi", "crew.config.json"));
+    if (current === selected) {
+      candidates.push(join(current, ".pi", "skills", "crew", "crew.config.json"));
+      candidates.push(join(current, "skills", "crew", "crew.config.json"));
+    }
+    if (current === dirname(current)) break;
+    current = dirname(current);
+  }
+  candidates.push(join(agentDir, "skills", "crew", "crew.config.json"));
+  candidates.push(join(home, ".pi", "crew.config.json"));
+  return [...new Set(candidates)];
+}
+
+export function loadCrewConfig(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): { config: CrewConfig; path?: string } {
+  for (const path of configCandidates(cwd, home, agentDir)) {
     if (!existsSync(path)) continue;
     return { config: parseCrewConfig(readFileSync(path, "utf8")), path };
   }
@@ -125,11 +149,21 @@ export function resolveRole(roleName: string, config: CrewConfig): Role & { name
   };
 }
 
-export function buildRolePrompt(roleName: string, role: Role, task: string): string {
-  let prompt = `You are ${roleName}.`;
-  if (role.description) prompt += ` ${role.description}`;
-  if (role.authority) prompt += ` Authority: ${role.authority}.`;
-  return `${prompt} Task: ${task}`;
+export type DelegationFields = { context?: string; constraints?: string; acceptanceCriteria?: string; expectedOutput?: string };
+
+export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields = {}): string {
+  return [
+    `You are ${roleName}.${role.description ? ` ${role.description}` : ""} Authority: ${role.authority ?? "unspecified"}. Task: ${task}`,
+    `## Role\n${roleName}${role.description ? `\n${role.description}` : ""}`,
+    `## Authority\n${role.authority === "read-only" ? "read-only\nDo not create, modify, rename, or delete files, and do not run mutating commands." : role.authority === "can-edit" ? "can-edit\nModify only the requested scope; do not make unrelated changes." : "unspecified"}`, 
+    `## Working directory\n${cwd}`,
+    `## Objective\n${task}`,
+    `## Context\n${fields.context || "No additional context supplied."}`,
+    `## Constraints\n${fields.constraints || "Follow repository conventions and do not exceed the requested scope."}`,
+    `## Acceptance criteria\n${fields.acceptanceCriteria || "Explain what you checked and identify any remaining uncertainty."}`,
+    `## Required response\n${fields.expectedOutput || "Return a concise summary of findings or changes, validation performed, and remaining risks."}`,
+    "You do not have access to the parent agent's conversation. Treat only this contract and repository contents as context.",
+  ].join("\n\n");
 }
 
 export function buildCrewMarkers(toolCallId: string): { start: string; end: string } {
@@ -152,13 +186,17 @@ function boundedLines(text: string, maxLines?: number): string {
 }
 
 export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): { text: string; mode: "marker-pair" | "marker-start" | "missing" } {
-  const normalized = output.replace(/\r\n/g, "\n");
-  const startIndex = normalized.lastIndexOf(markers.start);
-  if (startIndex < 0) return { text: "", mode: "missing" };
-  const afterStart = normalized.slice(startIndex + markers.start.length);
-  const endIndex = afterStart.indexOf(markers.end);
-  if (endIndex >= 0) return { text: boundedLines(afterStart.slice(0, endIndex), maxLines), mode: "marker-pair" };
-  return { text: boundedLines(afterStart, maxLines), mode: "marker-start" };
+  const lines = output.replace(/\r\n/g, "\n").split("\n");
+  for (let startLine = lines.length - 1; startLine >= 0; startLine -= 1) {
+    if (lines[startLine].trim() !== markers.start) continue;
+    const endOffset = lines.slice(startLine + 1).findIndex(line => line.trim() === markers.end);
+    if (endOffset >= 0) {
+      const endLine = startLine + 1 + endOffset;
+      return { text: boundedLines(lines.slice(startLine + 1, endLine).join("\n"), maxLines), mode: "marker-pair" };
+    }
+    return { text: boundedLines(lines.slice(startLine + 1).join("\n"), maxLines), mode: "marker-start" };
+  }
+  return { text: "", mode: "missing" };
 }
 
 export function compactRoleOutput(output: string, prompt: string, maxLines?: number): string {
@@ -196,31 +234,32 @@ function isKnownCrewAgentName(name: string, roleNames: Set<string>): boolean {
   return false;
 }
 
-export function isReusableRoleAgent(agent: AgentLike, role: string, workspaceId: string, cwd: string, tabId?: string): boolean {
+export function isReusableRoleAgent(agent: AgentLike, role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string): boolean {
   const status = normalizedAgentStatus(agent);
   return (
     agent.name === role &&
     (status === "idle" || status === "done") &&
     agent.workspace_id === workspaceId &&
     (!tabId || !agent.tab_id || agent.tab_id === tabId) &&
-    (agent.foreground_cwd === cwd || agent.cwd === cwd) &&
+    (normalizedCwd(agent.foreground_cwd || agent.cwd || "") === normalizedCwd(cwd)) &&
+    (!requestedModel || agent.model === requestedModel || agent.model_id === requestedModel) &&
     typeof agent.pane_id === "string" &&
     agent.pane_id.length > 0
   );
 }
 
-export function findReusableRolePane(agent: AgentLike | undefined, role: string, workspaceId: string, cwd: string, tabId?: string): string | undefined {
-  return agent && isReusableRoleAgent(agent, role, workspaceId, cwd, tabId) ? agent.pane_id : undefined;
+export function findReusableRolePane(agent: AgentLike | undefined, role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string): string | undefined {
+  return agent && isReusableRoleAgent(agent, role, workspaceId, cwd, tabId, requestedModel) ? agent.pane_id : undefined;
 }
 
-export function findReusableRolePaneInList(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string): string | undefined {
-  return agents.find((agent) => isReusableRoleAgent(agent, role, workspaceId, cwd, tabId))?.pane_id;
+export function findReusableRolePaneInList(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string): string | undefined {
+  return agents.find((agent) => isReusableRoleAgent(agent, role, workspaceId, cwd, tabId, requestedModel))?.pane_id;
 }
 
-export function chooseAgentName(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string): string {
-  if (findReusableRolePaneInList(agents, role, workspaceId, cwd, tabId)) return role;
+export function chooseAgentName(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string): string {
+  if (findReusableRolePaneInList(agents, role, workspaceId, cwd, tabId, requestedModel)) return role;
   const baseName = roleNameInUse(agents, role) ? scopedRoleName(role, workspaceId, tabId) : role;
-  if (findReusableRolePaneInList(agents, baseName, workspaceId, cwd, tabId)) return baseName;
+  if (findReusableRolePaneInList(agents, baseName, workspaceId, cwd, tabId, requestedModel)) return baseName;
   if (!roleNameInUse(agents, baseName)) return baseName;
   for (let i = 2; i < 100; i += 1) {
     const candidate = `${baseName}-${i}`;
@@ -281,11 +320,47 @@ async function readPane(pi: ExtensionAPI, paneId: string, lines: number): Promis
   return result.stdout || result.stderr;
 }
 
-async function waitForAgent(pi: ExtensionAPI, paneId: string): Promise<ExecResult> {
-  const first = await herdr(pi, ["agent", "wait", paneId, "--timeout", String(DETECTION_TIMEOUT_MS)], DETECTION_TIMEOUT_MS + 5_000);
-  if (first.code === 0) return first;
-  await new Promise((resolve) => setTimeout(resolve, 3_000));
-  return herdr(pi, ["agent", "wait", paneId, "--timeout", String(DETECTION_TIMEOUT_MS)], DETECTION_TIMEOUT_MS + 5_000);
+type StartupState = { agent?: AgentLike; status: "ready" | "blocked" | "timed_out"; output?: string };
+
+export function isStartupBlockedOutput(output: string): boolean {
+  return /trust project folder\?|approval required|waiting for (?:user )?approval/i.test(output);
+}
+
+async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: number): Promise<StartupState> {
+  const deadline = Date.now() + timeoutMs;
+  let readySince: number | undefined;
+  let lastOutput = "";
+  while (Date.now() < deadline) {
+    const agents = await listAgents(pi);
+    const agent = agents.find(item => item.pane_id === paneId);
+    if (agent) {
+      const status = normalizedAgentStatus(agent);
+      if (status === "blocked") return { agent, status: "blocked" };
+      if (status === "idle" || status === "done") {
+        lastOutput = await readPane(pi, paneId, FAILURE_READ_LINES);
+        if (isStartupBlockedOutput(lastOutput)) return { agent, status: "blocked", output: lastOutput };
+        readySince ??= Date.now();
+        if (Date.now() - readySince >= STARTUP_READY_STABLE_MS) return { agent, status: "ready", output: lastOutput };
+      } else {
+        readySince = undefined;
+      }
+    } else {
+      readySince = undefined;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(STARTUP_POLL_MS, Math.max(50, deadline - Date.now()))));
+  }
+  return { status: "timed_out", output: lastOutput || undefined };
+}
+
+type CrewStatus = "done" | "idle" | "blocked" | "timed_out" | "failed" | "unknown";
+export function classifyAgentStatus(value: unknown): CrewStatus {
+  const status = String(value ?? "").toLowerCase().replace(/[- ]/g, "_");
+  if (status.includes("block")) return "blocked";
+  if (status.includes("timeout") || status.includes("timed_out")) return "timed_out";
+  if (status.includes("fail") || status.includes("error")) return "failed";
+  if (status === "done" || status === "completed" || status === "complete" || /(?:^|[\\s\"'])status[\\s\"':=]+(?:done|completed|complete)/.test(status)) return "done";
+  if (status === "idle" || status === "ready" || /(?:^|[\\s\"'])status[\\s\"':=]+(?:idle|ready)/.test(status)) return "idle";
+  return "unknown";
 }
 
 async function maybeGetAgent(pi: ExtensionAPI, role: string): Promise<AgentLike | undefined> {
@@ -300,11 +375,11 @@ async function listAgents(pi: ExtensionAPI): Promise<AgentLike[]> {
   return parseJson(result.stdout, "herdr agent list").result?.agents ?? [];
 }
 
-async function preflight(pi: ExtensionAPI): Promise<void> {
-  const result = await pi.exec("bash", ["-lc", 'test "${HERDR_ENV:-}" = 1 && command -v herdr >/dev/null 2>&1'], { timeout: 2_000 });
-  if (result.code !== 0) {
-    throw new Error("I am not currently able to control Herdr from this session. Start me inside Herdr with the Herdr CLI available, then retry.");
+export async function functionalPreflight(pi: ExtensionAPI): Promise<ExecResult> {
+  if (process.env.HERDR_ENV !== "1") {
+    throw new Error("I am not currently running inside Herdr (HERDR_ENV must equal 1).");
   }
+  return pi.exec("herdr", ["pane", "current", "--current"]);
 }
 
 function positiveInteger(value: unknown, fallback: number, name: string): number {
@@ -315,50 +390,77 @@ function positiveInteger(value: unknown, fallback: number, name: string): number
   return value;
 }
 
-function normalizeTask(value: unknown): string {
+export function normalizeTask(value: unknown, fields: DelegationFields = {}): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error("crew_launch requires a non-blank task string");
+  const task = value.trim();
+  const combined = `${task} ${fields.context ?? ""}`;
+  const unresolved = /^(?:implement|fix|review|do|follow)\s+(?:it|that|the plan|the above|above)|\b(?:the plan|the above|above|earlier|previous(?:ly)?|as discussed)\b|\b(?:implement|fix|review)\s+(?:it|that)\b/i;
+  if (unresolved.test(combined)) throw new Error("Delegation contract is incomplete: replace unresolved references with explicit objective, context, paths, constraints, and output. Example: 'Update src/auth.ts to reject expired tokens; run the auth tests and report changed files and results.'");
   return value;
 }
 
-type CrewRoleParams = {
-  role?: string;
-  task?: string;
-  timeoutMs?: number;
-  readLines?: number;
-  configCwd?: string;
-  toolCallId?: string;
+type CrewLaunchParams = DelegationFields & {
+  role?: string; task?: string; startupTimeoutMs?: number; timeoutMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
 };
 
-async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
+export function parseModelCatalog(output: string): string[] {
+  const models: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const slash = line.match(/\b([A-Za-z0-9._-]+)\/([A-Za-z0-9._:~-]+)\b/);
+    if (slash) { models.push(`${slash[1]}/${slash[2]}`); continue; }
+    // `pi --list-models` prints provider and model as separate whitespace columns.
+    const columns = line.trim().split(/\s{2,}|\t+/).map(x => x.trim()).filter(Boolean);
+    if (columns.length >= 2 && /^[A-Za-z][A-Za-z0-9._-]*$/.test(columns[0]) && /^[A-Za-z0-9._:~-]+$/.test(columns[1]) && !/^provider$/i.test(columns[0]) && !/^model$/i.test(columns[1])) {
+      models.push(`${columns[0]}/${columns[1]}`);
+    }
+  }
+  return [...new Set(models)];
+}
+export function modelMatch(requested: string, catalog: string[]): "exact" | "fuzzy" | "none" {
+  if (catalog.includes(requested)) return "exact";
+  const suffix = requested.split("/").pop()?.toLowerCase() ?? "";
+  return catalog.some(id => {
+    const candidate = id.split("/").pop()?.toLowerCase() ?? "";
+    return suffix === "ds4-flash" && candidate.includes("deepseek-v4-flash");
+  }) ? "fuzzy" : "none";
+}
+
+async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams) {
   const roleName = params.role ?? "scout";
   assertValidRoleName(roleName);
-  const task = normalizeTask(params.task);
+  const task = normalizeTask(params.task, params);
+  const startupTimeoutMs = positiveInteger(params.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const timeoutMs = positiveInteger(params.timeoutMs, PROMPT_TIMEOUT_MS, "timeoutMs");
   const readLines = positiveInteger(params.readLines, DEFAULT_READ_LINES, "readLines");
-  await preflight(pi);
-
-  const configCwd = params.configCwd ?? process.cwd();
-  const { config, path: configPath } = loadCrewConfig(configCwd);
+  const current = await functionalPreflight(pi);
+  expectOk(current, "herdr pane current");
+  const currentPane = parseJson(current.stdout, "herdr pane current").result?.pane;
+  const reportedCwd = currentPane?.foreground_cwd || currentPane?.cwd;
+  if (!reportedCwd) throw new Error("herdr pane current did not report a cwd");
+  const roleCwd = normalizedCwd(reportedCwd);
+  const workspaceId = currentPane?.workspace_id || "";
+  const tabId = currentPane?.tab_id || "";
+  const { config, path: configPath } = loadCrewConfig(params.configCwd ?? roleCwd);
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
-  const basePrompt = buildRolePrompt(roleName, role, task);
-  const markers = buildCrewMarkers(params.toolCallId ?? "crew-role");
+  const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, params);
+  const markers = buildCrewMarkers(params.toolCallId ?? "crew_launch");
   const prompt = appendMarkerInstruction(basePrompt, markers);
   const baseCommand = selectLaunchCommand();
   const launchModel = role.model;
-  const roleCommand = launchModel ? `${baseCommand} --model ${launchModel}` : baseCommand;
-
-  const current = await herdr(pi, ["pane", "current", "--current"]);
-  expectOk(current, "herdr pane current");
-  const currentPane = parseJson(current.stdout, "herdr pane current").result?.pane;
-  const roleCwd = currentPane?.foreground_cwd || currentPane?.cwd;
-  const workspaceId = currentPane?.workspace_id || "";
-  const tabId = currentPane?.tab_id || "";
-  if (!roleCwd) throw new Error("herdr pane current did not report a cwd");
+  if (launchModel) {
+    const catalogResult = await pi.exec(selectDiscoveryCommand(), ["--list-models"], { timeout: 10_000 });
+    const catalog = parseModelCatalog(catalogResult.stdout);
+    if (catalogResult.code !== 0 || modelMatch(launchModel, catalog) !== "exact") {
+      const nearby = catalog.filter(id => id.toLowerCase().includes(launchModel.toLowerCase().split("/").pop() ?? "")).slice(0, 5);
+      throw new Error(`Configured model ${launchModel} is not an exact match in the launch catalog.${nearby.length ? ` Nearby matches: ${nearby.join(", ")}` : " No nearby matches found."}`);
+    }
+  }
+  const roleCommand = buildRoleCommand(baseCommand, launchModel);
 
   let agents = await listAgents(pi);
-  let agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
-  let paneId = findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId);
+  let agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId, role.model);
+  let paneId = findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId, role.model);
   let createdPane: string | undefined;
   let splitPolicy: string | undefined;
   let renameConflictRecovered = false;
@@ -375,16 +477,21 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
     const runResult = await herdr(pi, ["pane", "run", paneId, roleCommand]);
     expectOk(runResult, "herdr pane run");
 
-    const waitResult = await waitForAgent(pi, paneId);
-    if (waitResult.code !== 0) {
-      const output = await readPane(pi, paneId, FAILURE_READ_LINES);
-      throw new Error(`agent detection failed for pane ${paneId}: ${waitResult.stderr || waitResult.stdout}\n\n${output}`);
+    const startup = await waitForAgentReady(pi, paneId, startupTimeoutMs);
+    if (startup.status !== "ready") {
+      const output = startup.output ?? await readPane(pi, paneId, FAILURE_READ_LINES);
+      const message = startup.status === "blocked"
+        ? `agent startup is blocked in pane ${paneId}; inspect the pane and resolve the interactive prompt before retrying.`
+        : `agent was not ready in pane ${paneId} within startupTimeoutMs=${startupTimeoutMs}; the process may still be loading.`;
+      const error = new Error(`${message}\n\n${output}`) as Error & { details?: unknown };
+      error.details = { paneId, status: startup.status === "blocked" ? "startup_blocked" : "startup_timeout", startupTimeoutMs, agentContinues: true, output };
+      throw error;
     }
 
     let rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
     if (rename.code !== 0 && /agent_name_taken/.test(rename.stderr || rename.stdout)) {
       agents = await listAgents(pi);
-      agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
+      agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId, role.model);
       rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
       renameConflictRecovered = rename.code === 0;
     }
@@ -393,14 +500,28 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
 
   const promptArgs = ["agent", "prompt", agentName, prompt, "--wait", "--timeout", String(timeoutMs)];
   const promptResult = await herdr(pi, promptArgs, timeoutMs + 5_000);
+  const output = await readAgent(pi, agentName, promptResult.code === 0 ? readLines : FAILURE_READ_LINES);
+  const currentAgent = await maybeGetAgent(pi, agentName);
+  const agentEvidence = currentAgent?.agent_status || currentAgent?.status;
+  let status = classifyAgentStatus(agentEvidence);
+  const promptDiagnostic = `${promptResult.stderr} ${promptResult.stdout}`;
   if (promptResult.code !== 0) {
-    const output = await readAgent(pi, agentName, FAILURE_READ_LINES);
+    if (promptResult.killed || /timed?[_ -]?out|timeout/i.test(promptDiagnostic)) status = "timed_out";
+    else if (status !== "blocked") status = "failed";
+  } else if (status === "unknown") {
+    status = "done";
+  }
+  if (promptResult.code !== 0 && status === "failed") {
     throw new Error(`crew role prompt failed for ${agentName}: ${promptResult.stderr || promptResult.stdout}\n\n${output}`);
   }
-
-  const output = await readAgent(pi, agentName, readLines);
   const markerOutput = extractMarkerOutput(output, markers, readLines);
-  const compactOutput = markerOutput.mode !== "missing" && markerOutput.text ? markerOutput.text : compactRoleOutput(output, basePrompt, readLines);
+  const settled = status === "done" || status === "idle";
+  const complete = settled && promptResult.code === 0 && markerOutput.mode === "marker-pair";
+  const agentContinues = status === "timed_out" || status === "blocked" || status === "unknown";
+
+  const compactOutput = complete && markerOutput.text
+    ? markerOutput.text
+    : `[CREW STATUS: ${status}; complete: false] ${settled ? "The role settled without a confirmed final marker pair; this is incomplete diagnostic output, not a final answer." : "The role did not complete. This is partial diagnostic output, not a final answer."}\n\n${compactRoleOutput(output, prompt, readLines)}`;
   return {
     content: [{ type: "text", text: compactOutput }],
     details: {
@@ -414,46 +535,53 @@ async function executeCrewRole(pi: ExtensionAPI, params: CrewRoleParams) {
       workspaceId,
       cwd: roleCwd,
       command: baseCommand,
-      configuredModel: role.model ?? null,
-      launchModel: createdPane ? launchModel ?? null : null,
-      actualModel: createdPane ? launchModel ?? null : null,
-      actualModelKnown: !!createdPane && !!launchModel,
+      requestedModel: role.model ?? null,
+      actualModel: currentAgent?.model ?? currentAgent?.model_id ?? null,
+      actualModelKnown: !!(currentAgent?.model ?? currentAgent?.model_id),
+      modelWarning: role.model && currentAgent?.model && currentAgent.model !== role.model ? `Running model ${currentAgent.model} differs from requested ${role.model}.` : (!createdPane && role.model ? "Reused pane model was not queried." : null),
+      status,
+      complete,
+      agentContinues,
       authority: role.authority ?? null,
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
       renameConflictRecovered,
       markerFound: markerOutput.mode !== "missing",
       extractionMode: markerOutput.mode === "missing" ? "prompt-fallback" : markerOutput.mode,
+      extractionWarning: markerOutput.mode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null,
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
     },
   };
 }
 
-let crewRoleQueue: Promise<void> = Promise.resolve();
-
-function enqueueCrewRole<T>(work: () => Promise<T>): Promise<T> {
-  const run = crewRoleQueue.then(work, work);
-  crewRoleQueue = run.then(
-    () => undefined,
-    () => undefined,
-  );
+const crewQueues = new Map<string, Promise<void>>();
+function enqueueCrewLaunch<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = crewQueues.get(key) ?? Promise.resolve();
+  const run = previous.then(work, work);
+  crewQueues.set(key, run.then(() => undefined, () => undefined));
   return run;
 }
 
 type CrewRulesParams = { configCwd?: string };
 
-function executeCrewRules(params: CrewRulesParams = {}) {
-  const configCwd = params.configCwd ?? process.cwd();
-  const { config, path: configPath } = loadCrewConfig(configCwd);
+async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) {
+  let configCwd = params.configCwd;
+  if (!configCwd) {
+    const current = await herdr(pi, ["pane", "current", "--current"]);
+    if (current.code === 0) configCwd = parseJson(current.stdout, "herdr pane current").result?.pane?.foreground_cwd || parseJson(current.stdout, "herdr pane current").result?.pane?.cwd;
+  }
+  const { config, path: configPath } = loadCrewConfig(configCwd ?? process.cwd());
   const roleNames = [...new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})])].sort();
+  const catalogResult = await pi.exec(selectDiscoveryCommand(), ["--list-models"], { timeout: 10_000 });
+  const catalog = parseModelCatalog(catalogResult.stdout);
   const roles = Object.fromEntries(roleNames.map((name) => {
     const role = resolveRole(name, config);
-    return [name, {
-      description: role.description ?? null,
-      authority: role.authority ?? null,
-      model: role.model ?? null,
-    }];
+    const modelState = role.model ? modelMatch(role.model, catalog) : "default";
+    const catalogPresent = role.model ? (catalogResult.code === 0 && modelState === "exact") : null;
+    return [name, { description: role.description ?? null, authority: role.authority ?? null, configured: role.model ?? null,
+      model: role.model ?? null, modelState, catalogPresent, authenticationUnknown: true,
+      launchable: role.model ? catalogPresent : true, currentlyUsed: null }];
   }));
   return {
     content: [{ type: "text", text: JSON.stringify({ configPath: configPath ?? null, roles }, null, 2) }],
@@ -462,31 +590,20 @@ function executeCrewRules(params: CrewRulesParams = {}) {
 }
 
 export default function crewExtension(pi: ExtensionAPI) {
-  pi.registerTool({
-    name: "crew_launch",
-    label: "Crew Launch",
-    description: "Run or reuse a visible Herdr role pane, prompt it, wait, read output, and return structured details.",
-    promptSnippet: "Delegate a focused task to a visible crew role pane.",
-    promptGuidelines: [
-      "Use this for crew delegation when Herdr is available.",
-      "Keep tasks short and focused. Reused panes keep their launch model.",
-    ],
-    parameters: {
-      type: "object",
-      required: ["role", "task"],
-      properties: {
-        role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
-        task: { type: "string", description: "Focused task for the role." },
-        timeoutMs: { type: "number", description: "Prompt wait timeout in milliseconds. Defaults to 120000." },
-        readLines: { type: "number", description: "Recent output lines to return. Defaults to 200." },
-        configCwd: { type: "string", description: "Directory for project .pi/crew.config.json lookup. Defaults to current process cwd." },
-      },
-      additionalProperties: false,
-    },
-    async execute(_toolCallId, rawParams) {
-      return enqueueCrewRole(() => executeCrewRole(pi, { ...((rawParams ?? {}) as CrewRoleParams), toolCallId: _toolCallId }));
-    },
-  });
+  const parameters = { type: "object", required: ["role", "task"], properties: {
+    role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
+    task: { type: "string", description: "Self-contained delegation contract. The role cannot see the parent conversation. Include objective, context, paths, constraints, and desired output. Do not use unresolved references such as 'above', 'that', 'the plan', or 'implement it'." },
+    context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
+    acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
+    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Prompt wait timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
+  }, additionalProperties: false };
+  const execute = async (toolCallId: string, rawParams: unknown) => {
+    const params = { ...((rawParams ?? {}) as CrewLaunchParams), toolCallId };
+    const authority = DEFAULT_ROLES[params.role ?? "scout"]?.authority ?? (params.configCwd ? resolveRole(params.role ?? "scout", loadCrewConfig(params.configCwd).config).authority : "can-edit");
+    const key = authority === "read-only" ? `readonly:${normalizedCwd(params.configCwd ?? process.cwd())}:${Date.now()}:${Math.random()}` : `writer:${params.configCwd ? normalizedCwd(params.configCwd) : "pane"}`;
+    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params));
+  };
+  pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
 
 
   pi.registerTool({
@@ -502,7 +619,7 @@ export default function crewExtension(pi: ExtensionAPI) {
       additionalProperties: false,
     },
     async execute(_toolCallId, rawParams) {
-      return executeCrewRules((rawParams ?? {}) as CrewRulesParams);
+      return executeCrewRules(pi, (rawParams ?? {}) as CrewRulesParams);
     },
   });
 }

@@ -4,6 +4,7 @@
   "type": "commonjs",
   "packageManager": "pnpm@11.5.2",
   "scripts": {
+    "test": "node --experimental-strip-types .pi/extensions/crew/index.test.ts",
     "pic": "node ./pic-runner.cjs",
     "proxy": "node ./pic-proxy-runner.cjs",
     "clc-proxy": "node ./clc-proxy-runner.cjs",

@@ -3,6 +3,7 @@ import {
   buildRolePrompt,
   appendMarkerInstruction,
   buildCrewMarkers,
+  buildRoleCommand,
   chooseSplitTarget,
   chooseAgentName,
   compactRoleOutput,
@@ -13,7 +14,33 @@ import {
   parseCrewConfig,
   resolveRole,
   selectLaunchCommand,
+  normalizeTask,
+  parseModelCatalog,
+  modelMatch,
+  classifyAgentStatus,
+  functionalPreflight,
+  isStartupBlockedOutput,
 } from "./index.ts";
+
+test("unresolved delegation references are rejected conservatively", () => {
+  assert.throws(() => normalizeTask("implement it"), /incomplete/i);
+  assert.throws(() => normalizeTask("implement the plan above"), /incomplete/i);
+  assert.throws(() => normalizeTask("fix it in auth.ts"), /incomplete/i);
+  assert.doesNotThrow(() => normalizeTask("Review the authentication parser and report whether it handles expired tokens."));
+});
+
+test("model catalog requires exact IDs", () => {
+  const catalog = parseModelCatalog("Provider          Model                 Context\nopenai-codex     gpt-5.6-luna          114k\nremote-ds4       deepseek-v4-flash     32k\nremote-ollama    qwen3.8:27b-mlx       32k");
+  assert.deepEqual(catalog, ["openai-codex/gpt-5.6-luna", "remote-ds4/deepseek-v4-flash", "remote-ollama/qwen3.8:27b-mlx"]);
+  assert.equal(modelMatch("openai-codex/gpt-5.6-luna", catalog), "exact");
+  assert.equal(modelMatch("ds4-flash", catalog), "fuzzy");
+  assert.equal(modelMatch("GML-5.3-flash", catalog), "none");
+});
+
+test("blocked and timeout statuses are not completion", () => {
+  assert.equal(classifyAgentStatus("blocked"), "blocked");
+  assert.equal(classifyAgentStatus("timed_out"), "timed_out");
+});
 
 function test(name: string, fn: () => void) {
   try {
@@ -34,6 +61,12 @@ test("selectLaunchCommand uses pic-proxy for bridge env", () => {
   assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE_HOST: "127.0.0.1" }), "pic-proxy");
 });
 
+test("role bootstrap approves the project before selecting the model", () => {
+  assert.equal(buildRoleCommand("pi", "provider/model"), "pi --approve --model provider/model");
+  assert.equal(buildRoleCommand("pic-proxy", "provider/model"), "pic-proxy --approve --model provider/model");
+  assert.equal(buildRoleCommand("pi"), "pi --approve");
+});
+
 test("role config parsing and defaults preserve configured fields", () => {
   const config = parseCrewConfig(JSON.stringify({
     roles: {
@@ -47,7 +80,10 @@ test("role config parsing and defaults preserve configured fields", () => {
     model: "provider/model",
     authority: "read-only",
   });
-  assert.match(buildRolePrompt("scout", role, "map files"), /You are scout\. Custom scout Authority: read-only\. Task: map files/);
+  const prompt = buildRolePrompt("scout", role, "map files", "/repo", { context: "source tree" });
+  assert.match(prompt, /You are scout\. Custom scout Authority: read-only\. Task: map files/);
+  assert.match(prompt, /## Working directory[\s\S]*\/repo/);
+  assert.match(prompt, /## Context[\s\S]*source tree/);
 });
 
 test("compactRoleOutput keeps output after the last prompt without extra truncation", () => {
@@ -69,6 +105,17 @@ test("marker helpers extract only the final answer between marker pair", () => {
   assert.deepEqual(extractMarkerOutput(output, markers), { text: "Final answer\nline 2", mode: "marker-pair" });
   assert.deepEqual(extractMarkerOutput(`${markers.start}\nFinal answer\nfooter`, markers), { text: "Final answer\nfooter", mode: "marker-start" });
   assert.deepEqual(extractMarkerOutput("missing", markers), { text: "", mode: "missing" });
+});
+
+test("marker text embedded in the echoed prompt is not treated as role output", () => {
+  const markers = buildCrewMarkers("embedded-marker");
+  const echoedPrompt = `For your final answer, print ${markers.start} on its own line, then your answer, then ${markers.end} on its own line.`;
+  assert.deepEqual(extractMarkerOutput(echoedPrompt, markers), { text: "", mode: "missing" });
+});
+
+test("interactive trust prompts are treated as blocked startup", () => {
+  assert.equal(isStartupBlockedOutput("Trust project folder?\n→ Trust"), true);
+  assert.equal(isStartupBlockedOutput("Pi can explain its own features."), false);
 });
 
 test("role defaults supply built-in description and authority", () => {
@@ -100,6 +147,8 @@ test("config candidates prefer project config before global config", () => {
     "/repo/.pi/crew.config.json",
     "/repo/.pi/skills/crew/crew.config.json",
     "/repo/skills/crew/crew.config.json",
+    "/.pi/crew.config.json",
+    "/home/me/.pi/agent/skills/crew/crew.config.json",
     "/home/me/.pi/crew.config.json",
   ]);
 });
@@ -135,6 +184,13 @@ test("agent naming keeps base role for same tab reuse", () => {
     { name: "scout", pane_id: "pane-scout", workspace_id: "w5", tab_id: "tab-test", cwd: "/repo", status: "Idle" },
   ];
   assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "tab-test"), "scout");
+});
+
+test("agent naming does not reuse an occupied name when its requested model is unknown", () => {
+  const agents = [
+    { name: "scout", pane_id: "pane-scout", workspace_id: "w5", tab_id: "tab-test", cwd: "/repo", status: "Idle" },
+  ];
+  assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "tab-test", "provider/model"), "scout-w5-tab-test");
 });
 
 test("agent naming reuses scoped same-tab role", () => {
@@ -187,4 +243,25 @@ test("split decision creates right of current when no crew pane matches", () => 
     { name: "scout-ws", pane_id: "pane-scout", workspace_id: "ws", tab_id: "other-tab", cwd: "/repo" },
   ], "ws", "/repo", "current-tab");
   assert.equal(crossTab.policy, "right-of-current");
+});
+
+async function regressionTest(name: string, fn: () => Promise<void>) {
+  try { await fn(); console.log(`ok - ${name}`); }
+  catch (error) { console.error(`not ok - ${name}`); process.exitCode = 1; throw error; }
+}
+
+void regressionTest("functional preflight uses direct Herdr despite login-shell PATH", async () => {
+  const oldEnv = process.env.HERDR_ENV;
+  const oldPath = process.env.PATH;
+  process.env.HERDR_ENV = "1";
+  process.env.PATH = "/usr/bin";
+  const calls: string[][] = [];
+  const result = await functionalPreflight({ exec: async (command, args = []) => {
+    calls.push([command, ...args]);
+    return { code: 0, stdout: '{"result":{"pane":{"cwd":"/repo"}}}', stderr: "" };
+  }, registerTool() {} });
+  assert.equal(result.code, 0);
+  assert.deepEqual(calls, [["herdr", "pane", "current", "--current"]]);
+  if (oldEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = oldEnv;
+  if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
 });

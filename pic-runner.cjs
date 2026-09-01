@@ -45,6 +45,7 @@ const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 // Two pi processes in the same container won't collide because session IDs are UUIDs.
 const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
 const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
+const stagedHostExtensionsDir = path.join(workdir, '.pi', 'host-agent-extensions');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
 const herdrSocketMountEnabled = process.env.PIC_HERDR_SOCKET_MOUNT === '1';
 const herdrSocketPath = process.env.HERDR_SOCKET_PATH || '';
@@ -184,6 +185,21 @@ function stageHostSkills() {
   }
 }
 
+function stageHostExtensions() {
+  const sourceDir = path.join(home, '.pi', 'agent', 'extensions');
+  fs.rmSync(stagedHostExtensionsDir, { recursive: true, force: true });
+  fs.mkdirSync(stagedHostExtensionsDir, { recursive: true });
+  if (!fs.existsSync(sourceDir)) return;
+  for (const name of fs.readdirSync(sourceDir)) {
+    const source = path.join(sourceDir, name);
+    try {
+      fs.cpSync(source, path.join(stagedHostExtensionsDir, name), { recursive: true, dereference: true, force: true });
+    } catch (error) {
+      log(`warning: failed to stage host extension "${name}": ${error.message}`);
+    }
+  }
+}
+
 function maybeRenameHerdrAgent() {
   if (process.env.PIC_HERDR_RENAME === '0') return;
   if (process.env.HERDR_ENV !== '1' || !process.env.HERDR_PANE_ID) return;
@@ -307,6 +323,19 @@ function containerExecPiCommand(piArgs) {
 function listContainersJson() {
   return listContainersJsonWithRecovery({ log });
 }
+
+function refreshContainerExtensions(containerId) {
+  const stagedCrew = path.join(stagedHostExtensionsDir, 'crew', 'index.ts');
+  if (!fs.existsSync(stagedCrew)) return true;
+  const command = `mkdir -p /root/.pi/agent/extensions && rm -rf /root/.pi/agent/extensions/crew && cp -aL ${workspaceTarget}/.pi/host-agent-extensions/crew /root/.pi/agent/extensions/crew && test -f /root/.pi/agent/extensions/crew/index.ts`;
+  const result = spawnSync('container', ['exec', containerId, 'sh', '-lc', command], { stdio: verbose ? 'inherit' : 'pipe', encoding: 'utf8' });
+  if (result.status !== 0) {
+    log(`container "${containerId}" has no usable staged Crew extension; it will not be reused`);
+    return false;
+  }
+  log(`verified Crew extension in reused container "${containerId}"`);
+  return true;
+}
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
   // Normalize the workdir path for comparison
@@ -384,6 +413,10 @@ function findContainerWithMount(workdirPath) {
           }
         }
         if (hasWorkdirMount && hasPiConfigMount && hasNodeModulesMount && hasHerdrSocketMount) {
+          if (!refreshContainerExtensions(containerId)) {
+            spawnSync('container', ['stop', containerId], { stdio: verbose ? 'inherit' : 'ignore' });
+            continue;
+          }
           log(`found compatible running container "${containerId}" with ${workspaceTarget} mounted`);
           return containerId;
         }
@@ -405,6 +438,7 @@ async function main() {
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
   stageHostSkills();
+  stageHostExtensions();
 
   maybeRenameHerdrAgent();
 

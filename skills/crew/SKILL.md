@@ -10,7 +10,7 @@ description: |
 
 Use this skill when the user wants the current Pi session to delegate work to visible role panes managed by Herdr.
 
-Use the project-local `crew_launch` tool for normal delegation.
+Use only the project-local `crew_launch` tool for normal delegation.
 
 ## Core model
 
@@ -38,10 +38,9 @@ Custom roles may be added in crew config. Unknown roles should not be invented; 
 
 Lookup order:
 
-1. `./.pi/crew.config.json`
-2. `./.pi/skills/crew/crew.config.json`
-3. `./skills/crew/crew.config.json`
-4. `~/.pi/crew.config.json`
+1. The nearest `./.pi/crew.config.json`, searching from the delegated pane working directory upward
+2. `<PI_CODING_AGENT_DIR ?? ~/.pi/agent>/skills/crew/crew.config.json`
+3. `~/.pi/crew.config.json`
 
 Config shape:
 
@@ -66,8 +65,11 @@ Use `crew_rules` to inspect the resolved role configuration and source path when
 For ordinary delegation, call `crew_launch` with:
 
 - `role`: role name, such as `scout`, `oracle`, `executor`, `reviewer`, or a configured custom role
-- `task`: the fully expanded task and relevant context
-- optional `timeoutMs` / `readLines` only when defaults are insufficient
+- `task`: a fully expanded, self-contained objective; the role cannot see the parent conversation
+- optional `context`, `constraints`, `acceptanceCriteria`, and `expectedOutput`
+- optional `startupTimeoutMs`, `timeoutMs`, and `readLines` only when defaults are insufficient
+
+Never send unresolved references such as "above", "that", "the plan", or "implement it". Expand paths, decisions, constraints, and desired output in the contract.
 
 `crew_launch` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, queuing, and reading output.
 
