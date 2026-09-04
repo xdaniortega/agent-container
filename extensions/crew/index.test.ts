@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildRolePrompt,
   appendMarkerInstruction,
   buildCrewMarkers,
   buildRoleCommand,
+  resolveQueueKey,
+  runCrewPollingLoop,
+  classifyDelegationResult,
+  getOrCorroborateAgent,
+  PROMPT_START_GRACE_MS,
+  REUSED_IDLE_GRACE_MS,
   chooseSplitTarget,
   chooseAgentName,
   compactRoleOutput,
@@ -66,10 +75,34 @@ test("selectLaunchCommand uses pic-proxy for bridge env", () => {
   assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE_HOST: "127.0.0.1" }), "pic-proxy");
 });
 
-test("role bootstrap approves the project before selecting the model", () => {
+test("role bootstrap approves the project before selecting the model and enforces read-only tools", () => {
   assert.equal(buildRoleCommand("pi", "provider/model"), "pi --approve --model provider/model");
   assert.equal(buildRoleCommand("pic-proxy", "provider/model"), "pic-proxy --approve --model provider/model");
   assert.equal(buildRoleCommand("pi"), "pi --approve");
+  assert.equal(buildRoleCommand("pi", "provider/model", "read-only"), "pi --approve --tools read,grep,find,ls --model provider/model");
+  assert.equal(buildRoleCommand("pi", undefined, "read-only"), "pi --approve --tools read,grep,find,ls");
+  assert.equal(buildRoleCommand("pi", "provider/model", "can-edit"), "pi --approve --model provider/model");
+});
+
+test("resolveQueueKey derives authority from resolved config so overrides serialize as writers", () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "crew-queue-test-"));
+  try {
+    mkdirSync(join(tempDir, ".pi"), { recursive: true });
+    writeFileSync(
+      join(tempDir, ".pi", "crew.config.json"),
+      JSON.stringify({ roles: { scout: { authority: "can-edit" } } })
+    );
+
+    const scoutDetails = resolveQueueKey("scout", tempDir);
+    assert.equal(scoutDetails.authority, "can-edit");
+    assert.ok(scoutDetails.key.startsWith("writer:"));
+
+    const reviewerDetails = resolveQueueKey("reviewer", tempDir);
+    assert.equal(reviewerDetails.authority, "read-only");
+    assert.ok(reviewerDetails.key.startsWith("readonly:"));
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("role config parsing and defaults preserve configured fields", () => {
@@ -118,6 +151,17 @@ test("marker capture survives the start marker scrolling out of later snapshots"
   capture = updateMarkerOutput(capture, `${markers.start}\nline 1\nline 2`, markers);
   capture = updateMarkerOutput(capture, `line 2\nline 3\n${markers.end}\nfooter`, markers);
   assert.deepEqual(capture, { text: "line 1\nline 2\nline 3", mode: "marker-pair" });
+});
+
+test("marker stitching rejects non-overlapping snapshots and flags extraction as unreliable", () => {
+  const markers = buildCrewMarkers("gap-marker");
+  let capture = extractMarkerOutput("", markers);
+  capture = updateMarkerOutput(capture, `${markers.start}\nline 1\nline 2`, markers);
+  capture = updateMarkerOutput(capture, `unrelated content A\nunrelated content B\n${markers.end}\nfooter`, markers);
+  assert.equal(capture.mode, "unreliable");
+  assert.equal(capture.text, "line 1\nline 2");
+  assert.doesNotMatch(capture.text, /unrelated/);
+  assert.ok(capture.warning?.includes("Discontinuity"));
 });
 
 test("marker text embedded in the echoed prompt is not treated as role output", () => {
@@ -281,4 +325,236 @@ void regressionTest("functional preflight uses direct Herdr despite login-shell 
   assert.deepEqual(calls, [["herdr", "pane", "current", "--current"]]);
   if (oldEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = oldEnv;
   if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+});
+
+await regressionTest("polling loop: inactivity timeout fires when output stops changing and status is not working", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-inactivity");
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "scout",
+      agentName: "scout-w",
+      paneId: "p1",
+      markers,
+      reusedPane: false,
+      submittedAt: virtualTime,
+      timeoutMs: 10_000,
+      hardCapMs: 50_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => ({ agent_status: "unknown" }),
+      readOutput: async () => "steady output without change",
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+
+  assert.equal(result.status, "timed_out");
+  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
+  assert.equal(classification.agentContinues, true);
+  assert.equal(classification.complete, false);
+});
+
+await regressionTest("polling loop: hard cap bounds runtime even when agent keeps reporting working", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-hard-cap");
+  let tick = 0;
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "executor",
+      agentName: "executor-w",
+      paneId: "p1",
+      markers,
+      reusedPane: false,
+      submittedAt: virtualTime,
+      timeoutMs: 10_000,
+      hardCapMs: 30_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => ({ agent_status: "working" }),
+      readOutput: async () => `progress ${tick++}`,
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+
+  assert.equal(result.status, "timed_out");
+  assert.equal(result.observedWorking, true);
+  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
+  assert.equal(classification.agentContinues, true);
+  assert.equal(classification.complete, false);
+});
+
+await regressionTest("polling loop: transient agent get failure with agent in list keeps polling", async () => {
+  let getCalls = 0;
+  const mockPi = {
+    async exec(_cmd: string, args: string[]) {
+      if (args[0] === "agent" && args[1] === "get") {
+        getCalls += 1;
+        return { code: 1, stdout: "", stderr: "lookup failed" };
+      }
+      if (args[0] === "agent" && args[1] === "list") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ result: { agents: [{ name: "scout-w", agent_status: "working" }] } }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    },
+  };
+  const agent = await getOrCorroborateAgent(mockPi as any, "scout-w");
+  assert.ok(agent);
+  assert.equal(agent?.name, "scout-w");
+  assert.equal(getCalls, 1);
+});
+
+await regressionTest("polling loop: corroborated real disappearance reports failed without false done", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-exit");
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "scout",
+      agentName: "scout-w",
+      paneId: "p1",
+      markers,
+      reusedPane: false,
+      submittedAt: virtualTime,
+      timeoutMs: 30_000,
+      hardCapMs: 60_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => undefined,
+      // Even if previous output contains markers, disappearance is NOT reported as done
+      readOutput: async () => `${markers.start}\nresult\n${markers.end}`,
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+
+  assert.equal(result.agentExited, true);
+  assert.equal(result.status, "failed");
+  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
+  assert.equal(classification.complete, false);
+});
+
+await regressionTest("polling loop: reused idle pane does not complete on stale output at 5s and times out at 15s", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-reuse-stale");
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "scout",
+      agentName: "scout-w",
+      paneId: "p1",
+      markers,
+      reusedPane: true,
+      submittedAt: virtualTime,
+      timeoutMs: 60_000,
+      hardCapMs: 120_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => "stale output from previous run without current markers",
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+
+  assert.equal(result.status, "timed_out");
+  assert.equal(result.observedWorking, false);
+  assert.ok(virtualTime - 1_000_000 >= REUSED_IDLE_GRACE_MS, "must not exit before REUSED_IDLE_GRACE_MS");
+  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
+  assert.equal(classification.complete, false);
+});
+
+await regressionTest("polling loop: reused idle pane completes when current markers appear", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-reuse-fresh");
+  let polled = 0;
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "scout",
+      agentName: "scout-w",
+      paneId: "p1",
+      markers,
+      reusedPane: true,
+      submittedAt: virtualTime,
+      timeoutMs: 60_000,
+      hardCapMs: 120_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => {
+        polled += 1;
+        if (polled >= 2) {
+          return `${markers.start}\nfresh answer\n${markers.end}`;
+        }
+        return "warming up";
+      },
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+
+  assert.equal(result.status, "idle");
+  assert.equal(result.markerOutput.mode, "marker-pair");
+  assert.equal(result.markerOutput.text, "fresh answer");
+  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
+  assert.equal(classification.complete, true);
+});
+
+await regressionTest("polling loop: heartbeats increment and emit onUpdate notifications", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("test-heartbeats");
+  const heartbeats: number[] = [];
+  let polled = 0;
+  const result = await runCrewPollingLoop(
+    {
+      roleName: "scout",
+      agentName: "scout-w",
+      paneId: "p1",
+      markers,
+      reusedPane: false,
+      submittedAt: virtualTime,
+      timeoutMs: 60_000,
+      hardCapMs: 120_000,
+      readLines: 200,
+    },
+    {
+      getAgent: async () => ({ agent_status: "working" }),
+      readOutput: async () => {
+        polled += 1;
+        if (polled >= 4) {
+          return `${markers.start}\ndone\n${markers.end}`;
+        }
+        return "working...";
+      },
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+      onUpdate: (update) => {
+        const hb = (update.details as any)?.heartbeat;
+        if (typeof hb === "number") heartbeats.push(hb);
+      },
+    }
+  );
+
+  assert.ok(result.heartbeatCount >= 3);
+  assert.deepEqual(heartbeats.slice(0, 3), [1, 2, 3]);
+});
+
+test("classifyDelegationResult maps statuses and marker modes accurately", () => {
+  assert.deepEqual(classifyDelegationResult("done", "marker-pair"), { settled: true, complete: true, agentContinues: false });
+  assert.deepEqual(classifyDelegationResult("idle", "marker-pair"), { settled: true, complete: true, agentContinues: false });
+  assert.deepEqual(classifyDelegationResult("idle", "marker-start"), { settled: true, complete: false, agentContinues: false });
+  assert.deepEqual(classifyDelegationResult("done", "missing"), { settled: true, complete: false, agentContinues: false });
+  assert.deepEqual(classifyDelegationResult("working", "marker-pair"), { settled: false, complete: false, agentContinues: true });
+  assert.deepEqual(classifyDelegationResult("timed_out", "marker-pair"), { settled: false, complete: false, agentContinues: true });
+  assert.deepEqual(classifyDelegationResult("blocked", "missing"), { settled: false, complete: false, agentContinues: true });
+  assert.deepEqual(classifyDelegationResult("unknown", "missing"), { settled: false, complete: false, agentContinues: true });
+  assert.deepEqual(classifyDelegationResult("failed", "marker-pair"), { settled: false, complete: false, agentContinues: false });
 });

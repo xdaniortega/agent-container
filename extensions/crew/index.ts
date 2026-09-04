@@ -18,10 +18,12 @@ type ExtensionAPI = {
   }): void;
 };
 
+export type RoleAuthority = "read-only" | "can-edit";
+
 type Role = {
   description?: string;
   model?: string;
-  authority?: "read-only" | "can-edit";
+  authority?: RoleAuthority;
 };
 
 type CrewConfig = { roles?: Record<string, Role> };
@@ -47,7 +49,8 @@ const STARTUP_READY_STABLE_MS = 3_000;
 const STARTUP_POLL_MS = 500;
 const MARKER_READ_LINES = 2_000;
 const ROLE_POLL_MS = 15_000;
-const PROMPT_START_GRACE_MS = 5_000;
+export const PROMPT_START_GRACE_MS = 5_000;
+export const REUSED_IDLE_GRACE_MS = 15_000;
 const KNOWN_ROLES = new Set(["scout", "oracle", "executor", "reviewer"]);
 
 const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authority">>> = {
@@ -75,8 +78,9 @@ export function selectLaunchCommand(env: NodeJS.ProcessEnv = process.env): "pic-
 
 export function selectDiscoveryCommand(): "pi" { return "pi"; }
 
-export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string): string {
-  return `${baseCommand} --approve${launchModel ? ` --model ${launchModel}` : ""}`;
+export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string, authority?: RoleAuthority): string {
+  const tools = authority === "read-only" ? " --tools read,grep,find,ls" : "";
+  return `${baseCommand} --approve${tools}${launchModel ? ` --model ${launchModel}` : ""}`;
 }
 
 export function parseCrewConfig(raw: string): CrewConfig {
@@ -87,6 +91,17 @@ export function parseCrewConfig(raw: string): CrewConfig {
 function normalizedCwd(cwd: string): string {
   const absolute = resolve(cwd);
   try { return realpathSync(absolute); } catch { return absolute.replace(/[\\\\/]+$/, "") || absolute; }
+}
+
+export function resolveQueueKey(roleName: string, cwd: string, explicitConfig?: CrewConfig): { authority: RoleAuthority; key: string } {
+  const normalized = normalizedCwd(cwd);
+  const config = explicitConfig ?? loadCrewConfig(normalized).config;
+  const role = resolveRole(roleName, config);
+  const authority = role.authority ?? "can-edit";
+  const key = authority === "read-only"
+    ? `readonly:${normalized}:${Date.now()}:${Math.random()}`
+    : `writer:${normalized}`;
+  return { authority, key };
 }
 
 export function configCandidates(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): string[] {
@@ -190,7 +205,13 @@ function boundedLines(text: string, maxLines?: number): string {
   return kept.join("\n").trim();
 }
 
-export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): { text: string; mode: "marker-pair" | "marker-start" | "missing" } {
+export type MarkerOutput = {
+  text: string;
+  mode: "marker-pair" | "marker-start" | "missing" | "unreliable";
+  warning?: string | null;
+};
+
+export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): MarkerOutput {
   const lines = output.replace(/\r\n/g, "\n").split("\n");
   for (let startLine = lines.length - 1; startLine >= 0; startLine -= 1) {
     if (lines[startLine].trim() !== markers.start) continue;
@@ -204,18 +225,16 @@ export function extractMarkerOutput(output: string, markers: { start: string; en
   return { text: "", mode: "missing" };
 }
 
-type MarkerOutput = ReturnType<typeof extractMarkerOutput>;
-
-function mergeOverlappingText(previous: string, next: string): string {
+function mergeOverlappingText(previous: string, next: string): { text: string; overlapped: boolean } {
   const previousLines = previous.replace(/\r\n/g, "\n").split("\n");
   const nextLines = next.replace(/\r\n/g, "\n").split("\n");
   const maxOverlap = Math.min(previousLines.length, nextLines.length);
   for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
     if (previousLines.slice(-overlap).every((line, index) => line === nextLines[index])) {
-      return [...previousLines, ...nextLines.slice(overlap)].join("\n");
+      return { text: [...previousLines, ...nextLines.slice(overlap)].join("\n"), overlapped: true };
     }
   }
-  return [...previousLines, ...nextLines].join("\n");
+  return { text: previous, overlapped: false };
 }
 
 export function updateMarkerOutput(previous: MarkerOutput, snapshot: string, markers: { start: string; end: string }): MarkerOutput {
@@ -226,8 +245,16 @@ export function updateMarkerOutput(previous: MarkerOutput, snapshot: string, mar
   const lines = snapshot.replace(/\r\n/g, "\n").split("\n");
   const endLine = lines.findIndex(line => line.trim() === markers.end);
   const continuation = (endLine >= 0 ? lines.slice(0, endLine) : lines).join("\n");
+  const merged = mergeOverlappingText(previous.text, continuation);
+  if (!merged.overlapped) {
+    return {
+      text: previous.text,
+      mode: "unreliable",
+      warning: "Discontinuity detected while stitching output: non-overlapping snapshot.",
+    };
+  }
   return {
-    text: mergeOverlappingText(previous.text, continuation).trim(),
+    text: merged.text.trim(),
     mode: endLine >= 0 ? "marker-pair" : "marker-start",
   };
 }
@@ -385,7 +412,7 @@ async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: nu
   return { status: "timed_out", output: lastOutput || undefined };
 }
 
-type CrewStatus = "done" | "idle" | "working" | "blocked" | "timed_out" | "failed" | "unknown";
+export type CrewStatus = "done" | "idle" | "working" | "blocked" | "timed_out" | "failed" | "unknown";
 export function classifyAgentStatus(value: unknown): CrewStatus {
   const status = String(value ?? "").toLowerCase().replace(/[- ]/g, "_");
   if (status.includes("block")) return "blocked";
@@ -407,6 +434,17 @@ async function listAgents(pi: ExtensionAPI): Promise<AgentLike[]> {
   const result = await herdr(pi, ["agent", "list"]);
   expectOk(result, "herdr agent list");
   return parseJson(result.stdout, "herdr agent list").result?.agents ?? [];
+}
+
+export async function getOrCorroborateAgent(pi: ExtensionAPI, agentName: string): Promise<AgentLike | undefined> {
+  const agent = await maybeGetAgent(pi, agentName);
+  if (agent) return agent;
+  try {
+    const agents = await listAgents(pi);
+    return agents.find(a => a.name === agentName);
+  } catch {
+    return undefined;
+  }
 }
 
 export async function functionalPreflight(pi: ExtensionAPI): Promise<ExecResult> {
@@ -443,8 +481,154 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+export function classifyDelegationResult(status: CrewStatus, markerMode: string): {
+  settled: boolean;
+  complete: boolean;
+  agentContinues: boolean;
+} {
+  const settled = status === "done" || status === "idle";
+  const complete = settled && markerMode === "marker-pair";
+  const agentContinues = status === "working" || status === "timed_out" || status === "blocked" || status === "unknown";
+  return { settled, complete, agentContinues };
+}
+
+export type PollingDependencies = {
+  getAgent: (agentName: string) => Promise<AgentLike | undefined>;
+  readOutput: (agentName: string, paneId: string, lines: number, currentAgent?: AgentLike) => Promise<string>;
+  now: () => number;
+  delay: (ms: number, signal?: AbortSignal) => Promise<void>;
+  onUpdate?: ToolUpdate;
+};
+
+export async function runCrewPollingLoop(
+  params: {
+    roleName: string;
+    agentName: string;
+    paneId: string;
+    markers: { start: string; end: string };
+    reusedPane: boolean;
+    submittedAt: number;
+    timeoutMs: number;
+    hardCapMs: number;
+    readLines: number;
+    signal?: AbortSignal;
+  },
+  deps: PollingDependencies
+): Promise<{
+  status: CrewStatus;
+  output: string;
+  markerOutput: MarkerOutput;
+  observedWorking: boolean;
+  heartbeatCount: number;
+  agentExited: boolean;
+  lastKnownAgent?: AgentLike;
+}> {
+  const {
+    roleName,
+    agentName,
+    paneId,
+    markers,
+    reusedPane,
+    submittedAt,
+    timeoutMs,
+    hardCapMs,
+    readLines,
+    signal,
+  } = params;
+  const { getAgent, readOutput, now, delay: delayFn, onUpdate } = deps;
+
+  let lastProgressAt = submittedAt;
+  let previousEvidence = "";
+  let observedWorking = false;
+  let heartbeatCount = 0;
+  let output = "";
+  let currentAgent: AgentLike | undefined;
+  let lastKnownAgent: AgentLike | undefined;
+  let missingAgentSince: number | undefined;
+  let consecutiveMissingCount = 0;
+  let agentExited = false;
+  let status: CrewStatus = "unknown";
+  let markerOutput = extractMarkerOutput("", markers);
+
+  while (true) {
+    if (signal?.aborted) throw new Error("crew_launch was cancelled");
+    currentAgent = await getAgent(agentName);
+    if (currentAgent) {
+      lastKnownAgent = currentAgent;
+      missingAgentSince = undefined;
+      consecutiveMissingCount = 0;
+    } else {
+      if (missingAgentSince === undefined) missingAgentSince = now();
+      consecutiveMissingCount += 1;
+    }
+    status = classifyAgentStatus(currentAgent?.agent_status || currentAgent?.status);
+    output = await readOutput(agentName, paneId, Math.max(readLines, MARKER_READ_LINES), currentAgent);
+    markerOutput = updateMarkerOutput(markerOutput, output, markers);
+    const settled = status === "done" || status === "idle";
+    const evidence = `${status}\n${output}`;
+    const currentTime = now();
+    if (evidence !== previousEvidence) {
+      previousEvidence = evidence;
+      lastProgressAt = currentTime;
+    }
+    if (status === "working") {
+      observedWorking = true;
+      // A positively working role is alive even when its visible output is unchanged.
+      lastProgressAt = currentTime;
+    }
+    if (!currentAgent && consecutiveMissingCount >= 2 && currentTime - (missingAgentSince ?? submittedAt) >= PROMPT_START_GRACE_MS) {
+      agentExited = true;
+      status = "failed";
+      break;
+    }
+
+    if (markerOutput.mode === "marker-pair" && settled) break;
+    if (status === "blocked" || status === "failed") break;
+    if (observedWorking && settled) break;
+    if (!reusedPane && !observedWorking && settled && currentTime - submittedAt >= PROMPT_START_GRACE_MS) break;
+    if (reusedPane && !observedWorking && settled && currentTime - submittedAt >= REUSED_IDLE_GRACE_MS) {
+      status = "timed_out";
+      break;
+    }
+    if (currentTime - submittedAt >= hardCapMs) {
+      status = "timed_out";
+      break;
+    }
+    if (currentTime - lastProgressAt >= timeoutMs) {
+      status = "timed_out";
+      break;
+    }
+
+    heartbeatCount += 1;
+    const dots = ".".repeat(((heartbeatCount - 1) % 3) + 1);
+    onUpdate?.({
+      content: [{ type: "text", text: `Processing ${roleName}${dots}` }],
+      details: {
+        role: roleName,
+        agentName,
+        paneId,
+        status,
+        heartbeat: heartbeatCount,
+        elapsedMs: currentTime - submittedAt,
+      },
+    });
+    const pollMs = observedWorking ? ROLE_POLL_MS : Math.min(1_000, ROLE_POLL_MS);
+    await delayFn(pollMs, signal);
+  }
+
+  return {
+    status,
+    output,
+    markerOutput,
+    observedWorking,
+    heartbeatCount,
+    agentExited,
+    lastKnownAgent,
+  };
+}
+
 type CrewLaunchParams = DelegationFields & {
-  role?: string; task?: string; startupTimeoutMs?: number; timeoutMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
+  role?: string; task?: string; startupTimeoutMs?: number; timeoutMs?: number; hardCapMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
 };
 
 export function parseModelCatalog(output: string): string[] {
@@ -475,6 +659,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   const task = normalizeTask(params.task, params);
   const startupTimeoutMs = positiveInteger(params.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const timeoutMs = positiveInteger(params.timeoutMs, PROMPT_TIMEOUT_MS, "timeoutMs");
+  const hardCapMs = params.hardCapMs !== undefined ? positiveInteger(params.hardCapMs, timeoutMs * 2, "hardCapMs") : timeoutMs * 2;
   const readLines = positiveInteger(params.readLines, DEFAULT_READ_LINES, "readLines");
   const current = await functionalPreflight(pi);
   expectOk(current, "herdr pane current");
@@ -500,7 +685,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
       throw new Error(`Configured model ${launchModel} is not an exact match in the launch catalog.${nearby.length ? ` Nearby matches: ${nearby.join(", ")}` : " No nearby matches found."}`);
     }
   }
-  const roleCommand = buildRoleCommand(baseCommand, launchModel);
+  const roleCommand = buildRoleCommand(baseCommand, launchModel, role.authority);
 
   let agents = await listAgents(pi);
   let agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId, role.model);
@@ -550,65 +735,40 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   }
 
   const submittedAt = Date.now();
-  let lastProgressAt = submittedAt;
-  let previousEvidence = "";
-  let observedWorking = false;
-  let heartbeatCount = 0;
-  let output = "";
-  let currentAgent: AgentLike | undefined;
-  let lastKnownAgent: AgentLike | undefined;
-  let agentExited = false;
-  let status: CrewStatus = "unknown";
-  let markerOutput = extractMarkerOutput("", markers);
-
-  while (true) {
-    if (signal?.aborted) throw new Error("crew_launch was cancelled");
-    currentAgent = await maybeGetAgent(pi, agentName);
-    if (currentAgent) lastKnownAgent = currentAgent;
-    status = classifyAgentStatus(currentAgent?.agent_status || currentAgent?.status);
-    output = currentAgent
-      ? await readAgent(pi, agentName, Math.max(readLines, MARKER_READ_LINES))
-      : await readPane(pi, paneId, Math.max(readLines, MARKER_READ_LINES));
-    markerOutput = updateMarkerOutput(markerOutput, output, markers);
-    const settled = status === "done" || status === "idle";
-    const evidence = `${status}\n${output}`;
-    if (evidence !== previousEvidence) {
-      previousEvidence = evidence;
-      lastProgressAt = Date.now();
+  const pollingResult = await runCrewPollingLoop(
+    {
+      roleName,
+      agentName,
+      paneId,
+      markers,
+      reusedPane: !createdPane,
+      submittedAt,
+      timeoutMs,
+      hardCapMs,
+      readLines,
+      signal,
+    },
+    {
+      getAgent: (name) => getOrCorroborateAgent(pi, name),
+      readOutput: (name, pId, lines, curAgent) =>
+        curAgent ? readAgent(pi, name, lines) : readPane(pi, pId, lines),
+      now: () => Date.now(),
+      delay: (ms, sig) => delay(ms, sig),
+      onUpdate,
     }
-    if (status === "working") {
-      observedWorking = true;
-      // A positively working role is alive even when its visible output is unchanged.
-      lastProgressAt = Date.now();
-    }
-    if (!currentAgent && Date.now() - submittedAt >= PROMPT_START_GRACE_MS) {
-      agentExited = true;
-      status = markerOutput.mode === "marker-pair" ? "done" : "failed";
-      break;
-    }
+  );
 
-    if (markerOutput.mode === "marker-pair" && settled) break;
-    if (status === "blocked" || status === "failed") break;
-    if (observedWorking && settled) break;
-    if (!observedWorking && settled && Date.now() - submittedAt >= PROMPT_START_GRACE_MS) break;
-    if (Date.now() - lastProgressAt >= timeoutMs) {
-      status = "timed_out";
-      break;
-    }
+  const {
+    status,
+    output,
+    markerOutput,
+    observedWorking,
+    heartbeatCount,
+    agentExited,
+    lastKnownAgent,
+  } = pollingResult;
 
-    heartbeatCount += 1;
-    const dots = ".".repeat((heartbeatCount - 1) % 3 + 1);
-    onUpdate?.({
-      content: [{ type: "text", text: `Processing ${roleName}${dots}` }],
-      details: { role: roleName, agentName, paneId, status, heartbeat: heartbeatCount, elapsedMs: Date.now() - submittedAt },
-    });
-    const pollMs = observedWorking ? ROLE_POLL_MS : Math.min(1_000, ROLE_POLL_MS);
-    await delay(pollMs, signal);
-  }
-
-  const settled = status === "done" || status === "idle";
-  const complete = settled && markerOutput.mode === "marker-pair";
-  const agentContinues = status === "working" || status === "timed_out" || status === "blocked" || status === "unknown";
+  const { settled, complete, agentContinues } = classifyDelegationResult(status, markerOutput.mode);
 
   const compactOutput = complete && markerOutput.text
     ? boundedLines(markerOutput.text, readLines)
@@ -642,7 +802,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
       renameConflictRecovered,
       markerFound: markerOutput.mode !== "missing",
       extractionMode: markerOutput.mode === "missing" ? "prompt-fallback" : markerOutput.mode,
-      extractionWarning: markerOutput.mode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null,
+      extractionWarning: markerOutput.warning ?? (markerOutput.mode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null),
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       markerCaptureLines: Math.max(readLines, MARKER_READ_LINES),
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
@@ -690,12 +850,23 @@ export default function crewExtension(pi: ExtensionAPI) {
     task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
     context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
     acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
-    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
+    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout up to a hard ceiling (default 2x timeoutMs). Defaults to 120000." }, hardCapMs: { type: "number", description: "Hard maximum total runtime ceiling after prompt submission that cannot be refreshed by activity. Defaults to 2x timeoutMs." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };
   const execute = async (toolCallId: string, rawParams: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate) => {
     const params = { ...((rawParams ?? {}) as CrewLaunchParams), toolCallId };
-    const authority = DEFAULT_ROLES[params.role ?? "scout"]?.authority ?? (params.configCwd ? resolveRole(params.role ?? "scout", loadCrewConfig(params.configCwd).config).authority : "can-edit");
-    const key = authority === "read-only" ? `readonly:${normalizedCwd(params.configCwd ?? process.cwd())}:${Date.now()}:${Math.random()}` : `writer:${params.configCwd ? normalizedCwd(params.configCwd) : "pane"}`;
+    let cwd = params.configCwd;
+    if (!cwd) {
+      try {
+        const currentResult = await herdr(pi, ["pane", "current", "--current"]);
+        if (currentResult.code === 0) {
+          const currentPane = parseJson(currentResult.stdout, "herdr pane current").result?.pane;
+          cwd = currentPane?.foreground_cwd || currentPane?.cwd;
+        }
+      } catch {
+        // herdr query is best-effort
+      }
+    }
+    const { key } = resolveQueueKey(params.role ?? "scout", cwd || process.cwd());
     return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate));
   };
   pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });

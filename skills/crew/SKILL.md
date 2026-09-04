@@ -67,7 +67,7 @@ For ordinary delegation, call `crew_launch` with:
 - `role`: role name, such as `scout`, `oracle`, `executor`, `reviewer`, or a configured custom role
 - `task`: a fully expanded, self-contained objective; the role cannot see the parent conversation
 - optional `context`, `constraints`, `acceptanceCriteria`, and `expectedOutput`
-- optional `startupTimeoutMs`, `timeoutMs`, and `readLines` only when defaults are insufficient
+- optional `startupTimeoutMs`, `timeoutMs` (inactivity wait bounded by a hard ceiling), `hardCapMs`, and `readLines` only when defaults are insufficient
 
 Never send unresolved references such as "above", "that", "the plan", or "implement it". Expand paths, decisions, constraints, and desired output in the contract.
 
