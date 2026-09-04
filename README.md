@@ -151,9 +151,27 @@ clc-proxy -p 5173:5173 -p 3000:3000
 
 ### Session Isolation
 
-Pi stores UUID-named sessions under `./.pi/agent/sessions/`; concurrent Pi
-processes can safely share that directory. Claude Code stores project history
-under its normal `projects/` layout, but `clc-proxy` bind-mounts that directory outside the container at:
+Pi sessions are persisted outside the container and workspace tree. `pic` and
+`pic-proxy` bind-mount the host project-scoped session directory directly from:
+
+```text
+~/.pi/agent/sessions/<project-namespace>/
+```
+
+into `/pi-sessions` in the container, where Pi writes flat UUID-named `.jsonl` session files.
+This enables host-side inspection tools like **agentsview** to track token and agent usage
+automatically across runs and container reuse with zero manual steps. Read and write access
+is limited strictly to the spawning project's session directory: other projects' session
+transcripts and namespace directories are excluded from `/host-pi` by construction and remain
+inaccessible from inside the container. Concurrent Pi processes within the same project safely
+share the directory because session IDs are unique UUIDs.
+
+*Integrity caveat:* Session transcripts are agent-authored, attacker-influenceable data,
+not tamper-proof audit logs; any editing role within the project container can write to its
+project session directory, and agentsview renders untrusted session content.
+
+Claude Code stores project history under its normal `projects/` layout, but `clc-proxy`
+bind-mounts that directory outside the container at:
 
 ```text
 ~/.clc-container/claude-projects/<project>/
@@ -175,9 +193,19 @@ clc-proxy --volume "../web:/workspace/web"
 
 ### Config Handling
 
-- **Pi**: host `~/.pi` is mounted at `/host-pi` (read-only). The entrypoint copies
-  safe config files into `/root/.pi`, excludes lock/session files, and symlinks
-  large directories.
+- **Pi**: a pruned host Pi config tree is staged outside the workspace at
+  `~/.pic-container/pi-config/<project>/<launch-instance>/` and mounted at `/host-pi`
+  (read-only). Sessions are excluded from the staged tree by construction. The
+  entrypoint copies safe config files into `/root/.pi`, while any present `npm`/`git`
+  caches are mounted separately to `/host-pi-npm` and `/host-pi-git`.
+- **Per-launch staging isolation**: each launch that starts a new container stages into
+  its own instance directory under the project staging root, so a second session in the
+  same folder can never rewrite a directory that a running container has bind-mounted at
+  `/host-pi`. Sharing one staged directory previously caused a concurrent launch to empty
+  it, which wiped model and API configuration in the other session. Container reuse
+  accepts any instance directory under the project staging root, and stale instances are
+  garbage-collected on launch (directories still mounted by a live container, or younger
+  than one hour, are always kept).
 
 ### Ignoring local auth with an Anthropic key
 

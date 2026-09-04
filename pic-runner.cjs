@@ -6,9 +6,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 const {
+  buildPicMountArgs,
+  createStagedPiConfigInstanceDir,
+  getProjectSessionsNamespace,
   parseContainerRunnerArgs,
   proxyEnvironmentArgs: buildProxyEnvironmentArgs,
+  pruneStagedPiConfigDirs,
   runChildProcess,
+  stageHostPiConfig,
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
 
@@ -41,9 +46,21 @@ const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').sli
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
 const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 
-// Session directory — pi writes UUID-named session files, no hash needed for isolation
-// Two pi processes in the same container won't collide because session IDs are UUIDs.
-const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
+// Session directory — persist in host project-scoped namespace (~/.pi/agent/sessions/<namespace>)
+// so host-side tools like agentsview can read session transcripts directly.
+// Pi writes UUID-named session files, so concurrent processes within the project will not collide.
+const projectSessionsNamespace = getProjectSessionsNamespace(workdir);
+const hostSessionsDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'sessions', projectSessionsNamespace);
+const containerSessionsDir = '/pi-sessions';
+const sessionDir = containerSessionsDir;
+// Project staging root for host Pi config. Each launch stages into its own
+// instance directory underneath it (see createStagedPiConfigInstanceDir) so that
+// concurrent sessions in the same folder never rewrite a directory that another
+// running container has bind-mounted at /host-pi.
+const stagedPiConfigRoot = path.join(home || process.env.USERPROFILE || '.', '.pic-container', 'pi-config', `${volumeBasename}-${volumeSuffix}`);
+let stagedPiHostDir = null;
+const hostNpmDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'npm');
+const hostGitDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'git');
 const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
 const stagedHostExtensionsDir = path.join(workdir, '.pi', 'host-agent-extensions');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
@@ -123,6 +140,41 @@ function anthropicEnvironmentArgs({ useAnthropic } = {}) {
   return args;
 }
 
+// Forward the host's git identity so commits made inside the container are
+// attributed correctly. We read name/email from the host git config and pass
+// them as the standard GIT_AUTHOR_*/GIT_COMMITTER_* env vars, which git honors
+// natively without needing a mounted ~/.gitconfig. Explicit PIC_GIT_* env vars
+// win; set PIC_GIT_IDENTITY=0 to opt out entirely.
+function gitIdentityEnvironmentArgs() {
+  if (process.env.PIC_GIT_IDENTITY === '0') return [];
+
+  // Read from the host's *global* git config (~/.gitconfig) so the container
+  // always uses the machine-wide identity, not a per-repo override that may be
+  // set in whatever project directory the runner happens to launch from.
+  const readHostGitConfig = (key) => {
+    try {
+      const result = spawnSync('git', ['config', '--global', '--get', key], { encoding: 'utf8' });
+      if (result.status === 0) return (result.stdout || '').trim();
+    } catch {}
+    return '';
+  };
+
+  const name = process.env.PIC_GIT_NAME || process.env.GIT_AUTHOR_NAME || readHostGitConfig('user.name');
+  const email = process.env.PIC_GIT_EMAIL || process.env.GIT_AUTHOR_EMAIL || readHostGitConfig('user.email');
+
+  const args = [];
+  if (name) {
+    args.push('-e', `GIT_AUTHOR_NAME=${name}`, '-e', `GIT_COMMITTER_NAME=${name}`);
+  }
+  if (email) {
+    args.push('-e', `GIT_AUTHOR_EMAIL=${email}`, '-e', `GIT_COMMITTER_EMAIL=${email}`);
+  }
+  if (!name || !email) {
+    log('warning: host git user.name/user.email not fully set; commits inside the container may be misattributed');
+  }
+  return args;
+}
+
 function herdrEnvironmentArgs() {
   const args = [];
   for (const name of herdrEnvironmentNames) {
@@ -158,29 +210,41 @@ function log(message) {
 }
 
 function stageHostSkills() {
-  const sourceDir = path.join(home, '.pi', 'agent', 'skills');
   fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
   fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
 
-  if (!fs.existsSync(sourceDir)) return;
+  // Skills can live under both host roots that the desktop agent reads from.
+  // Earlier entries win on name collisions, so `~/.pi/agent/skills` takes
+  // precedence over `~/.agents/skills`.
+  const sourceDirs = [
+    path.join(home, '.pi', 'agent', 'skills'),
+    path.join(home, '.agents', 'skills'),
+  ];
 
-  for (const name of fs.readdirSync(sourceDir)) {
-    const source = path.join(sourceDir, name);
-    const skillFile = path.join(source, 'SKILL.md');
-    if (!fs.existsSync(skillFile)) {
-      const stat = fs.lstatSync(source);
-      if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
-      continue;
-    }
+  const staged = new Set();
+  for (const sourceDir of sourceDirs) {
+    if (!fs.existsSync(sourceDir)) continue;
 
-    try {
-      fs.cpSync(source, path.join(stagedHostSkillsDir, name), {
-        recursive: true,
-        dereference: true,
-        force: true,
-      });
-    } catch (error) {
-      log(`warning: failed to stage host skill "${name}": ${error.message}`);
+    for (const name of fs.readdirSync(sourceDir)) {
+      if (staged.has(name)) continue;
+      const source = path.join(sourceDir, name);
+      const skillFile = path.join(source, 'SKILL.md');
+      if (!fs.existsSync(skillFile)) {
+        const stat = fs.lstatSync(source);
+        if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
+        continue;
+      }
+
+      try {
+        fs.cpSync(source, path.join(stagedHostSkillsDir, name), {
+          recursive: true,
+          dereference: true,
+          force: true,
+        });
+        staged.add(name);
+      } catch (error) {
+        log(`warning: failed to stage host skill "${name}": ${error.message}`);
+      }
     }
   }
 }
@@ -296,14 +360,27 @@ function containerExecArgs(containerId, commandArgs, { envArgs = [] } = {}) {
 }
 
 function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = false } = {}) {
+  if (!stagedPiHostDir) {
+    throw new Error('internal error: host Pi config was not staged before starting a container');
+  }
+  const mountArgs = buildPicMountArgs({
+    workdir,
+    workspaceTarget,
+    nodeModulesVolume,
+    stagedPiHostDir,
+    hostSessionsDir,
+    containerSessionsDir,
+    extraVolumes,
+    includeHerdrSocket,
+    herdrSocketVolumeArgs: herdrSocketVolumeArgs(),
+    extraPublish,
+    hostNpmDir,
+    hostGitDir,
+  });
+
   return [
     'run', '--rm', ...interactiveContainerArgs(), '--memory', '4g',
-    '--volume', `${workdir}:${workspaceTarget}`,
-    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
-    ...extraVolumes.flatMap(v => ['--volume', v]),
-    ...(includeHerdrSocket ? herdrSocketVolumeArgs() : []),
-    ...extraPublish.flatMap(p => ['--publish', p]),
-    '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+    ...mountArgs,
     '--dns', '1.1.1.1',
     ...envArgs,
     '-w', workspaceTarget,
@@ -336,6 +413,57 @@ function refreshContainerExtensions(containerId) {
   log(`verified Crew extension in reused container "${containerId}"`);
   return true;
 }
+// True when `mountSourcePath` is a per-launch staged config instance belonging to
+// this project's staging root (never the wide host ~/.pi directory).
+function isStagedInstanceOfThisProject(mountSourcePath) {
+  if (!mountSourcePath) return false;
+  const root = path.resolve(stagedPiConfigRoot);
+  const resolved = path.resolve(mountSourcePath);
+  if (resolved === root || !resolved.startsWith(root + path.sep)) return false;
+  return path.dirname(resolved) === root;
+}
+
+// Staged config directories currently bind-mounted at /host-pi by live containers.
+// These must survive garbage collection while their container is running.
+function collectMountedStagedPiConfigDirs() {
+  const inUse = [];
+  const listResult = listContainersJson();
+  if (listResult.status !== 0) return inUse;
+
+  let containers;
+  try {
+    containers = JSON.parse(listResult.stdout);
+    if (!Array.isArray(containers)) containers = [containers];
+  } catch {
+    return inUse;
+  }
+
+  for (const container of containers) {
+    const containerId = container.configuration?.id;
+    if (!containerId) continue;
+    const inspectResult = spawnSync('container', ['inspect', containerId], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      encoding: 'utf-8',
+    });
+    if (inspectResult.status !== 0) continue;
+    try {
+      const detail = JSON.parse(inspectResult.stdout);
+      const items = Array.isArray(detail) ? detail : [detail];
+      for (const item of items) {
+        for (const mount of item.configuration?.mounts || []) {
+          const mountTarget = mount.target || mount.destination || mount.mountpoint || mount.mountPoint;
+          if (mountTarget === '/host-pi' && mount.source) {
+            inUse.push(path.resolve(mount.source));
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  return inUse;
+}
+
 // Check if a running container already has workdir mounted as a virtiofs share
 function findContainerWithMount(workdirPath) {
   // Normalize the workdir path for comparison
@@ -391,8 +519,11 @@ function findContainerWithMount(workdirPath) {
         }
         let hasWorkdirMount = false;
         let hasPiConfigMount = false;
+        let hasSessionsMount = false;
         let hasNodeModulesMount = false;
         let hasHerdrSocketMount = !herdrSocketDir;
+        let hasNpmMount = !fs.existsSync(hostNpmDir);
+        let hasGitMount = !fs.existsSync(hostGitDir);
         for (const mount of item.configuration.mounts || []) {
           const mountTarget = mount.target || mount.destination || mount.mountpoint || mount.mountPoint;
           const mountSourcePath = mount.source ? path.resolve(mount.source) : '';
@@ -401,18 +532,29 @@ function findContainerWithMount(workdirPath) {
             if (mountSourcePath === normalizedWorkdir && mountTarget === workspaceTarget) {
               hasWorkdirMount = true;
             }
-            if (mountSourcePath === path.resolve(home, '.pi') && mountTarget === '/host-pi') {
-              hasPiConfigMount = true;
-            }
           }
-            if (herdrSocketDir && mountSourcePath === path.resolve(herdrSocketDir) && mountTarget === herdrSocketMountTarget) {
-              hasHerdrSocketMount = true;
-            }
+          // Accept any per-launch staged instance under this project's staging
+          // root; older containers with a wide ~/.pi mount still get rejected.
+          if (mountTarget === '/host-pi' && isStagedInstanceOfThisProject(mountSourcePath)) {
+            hasPiConfigMount = true;
+          }
+          if (mountTarget === containerSessionsDir && mountSourcePath === path.resolve(hostSessionsDir)) {
+            hasSessionsMount = true;
+          }
+          if (mountTarget === '/host-pi-npm' && mountSourcePath === path.resolve(hostNpmDir)) {
+            hasNpmMount = true;
+          }
+          if (mountTarget === '/host-pi-git' && mountSourcePath === path.resolve(hostGitDir)) {
+            hasGitMount = true;
+          }
+          if (herdrSocketDir && mountSourcePath === path.resolve(herdrSocketDir) && mountTarget === herdrSocketMountTarget) {
+            hasHerdrSocketMount = true;
+          }
           if (mountTarget === `${workspaceTarget}/node_modules` && mountSourceName.includes(nodeModulesVolume)) {
             hasNodeModulesMount = true;
           }
         }
-        if (hasWorkdirMount && hasPiConfigMount && hasNodeModulesMount && hasHerdrSocketMount) {
+        if (hasWorkdirMount && hasPiConfigMount && hasSessionsMount && hasNodeModulesMount && hasHerdrSocketMount && hasNpmMount && hasGitMount) {
           if (!refreshContainerExtensions(containerId)) {
             spawnSync('container', ['stop', containerId], { stdio: verbose ? 'inherit' : 'ignore' });
             continue;
@@ -421,7 +563,7 @@ function findContainerWithMount(workdirPath) {
           return containerId;
         }
         if (hasWorkdirMount) {
-          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/node_modules/Herdr socket mounts; will not reuse`);
+          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/sessions/node_modules/Herdr socket mounts; will not reuse`);
         }
       }
     } catch (error) {
@@ -436,7 +578,7 @@ function findContainerWithMount(workdirPath) {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
-  fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+  fs.mkdirSync(hostSessionsDir, { recursive: true });
   stageHostSkills();
   stageHostExtensions();
 
@@ -444,6 +586,19 @@ async function main() {
 
   // Check if a container is already running with our workdir mounted
   const existingContainerId = findContainerWithMount(workdir);
+
+  // Only a fresh container needs staged host config; reusing a container must not
+  // touch the staged directory it already has mounted.
+  if (!existingContainerId) {
+    pruneStagedPiConfigDirs({
+      rootDir: stagedPiConfigRoot,
+      keepDirs: collectMountedStagedPiConfigDirs(),
+      log,
+    });
+    stagedPiHostDir = createStagedPiConfigInstanceDir(stagedPiConfigRoot);
+    stageHostPiConfig({ homeDir: home, targetDir: stagedPiHostDir, log });
+    log(`staged host Pi config at "${stagedPiHostDir}"`);
+  }
 
   if (existingContainerId) {
     // Volume is already created by the existing container — skip creation
@@ -472,9 +627,16 @@ async function main() {
     }
   }
 
+  const sessionEnvArgs = ['-e', `PI_CODING_AGENT_SESSION_DIR=${containerSessionsDir}`];
+
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled })];
+    const envArgs = [
+      ...proxyEnvironmentArgs(),
+      ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+      ...gitIdentityEnvironmentArgs(),
+      ...sessionEnvArgs,
+    ];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -507,6 +669,8 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...gitIdentityEnvironmentArgs(),
+        ...sessionEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
@@ -520,6 +684,8 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...gitIdentityEnvironmentArgs(),
+        ...sessionEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
