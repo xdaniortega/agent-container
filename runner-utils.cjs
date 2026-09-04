@@ -1,5 +1,6 @@
 const { spawn } = require('node:child_process');
-const ProxyChain = require('proxy-chain');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const proxyEnvironmentNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
 
@@ -55,6 +56,7 @@ function proxyEnvironmentArgs(proxyUrl, { enabled = true } = {}) {
 }
 
 async function startProxy({ host, port, proxyUrl = `http://${host}:${port}`, verbose = false, log, logPrefix = 'proxy' }) {
+  const ProxyChain = require('proxy-chain');
   const attachRequestFailedLogger = (server) => {
     server.on('requestFailed', ({ request, error }) => {
       console.error(`[${logPrefix}] request failed ${request?.url || ''}: ${error?.message || error}`);
@@ -104,11 +106,108 @@ function runChildProcess(command, args, { cleanup } = {}) {
   return child;
 }
 
+const PI_CONFIG_PRUNE_PATHS = [
+  'agent/bin',
+  'agent/sessions',
+  'agent/npm',
+  'agent/git',
+  'agent/skills',
+  'agent/extensions',
+  'agent/settings.json.lock',
+  'agent/auth.json.lock',
+  'settings.json.lock',
+  'auth.json.lock',
+];
+
+function shouldPrunePiConfigPath(relPath) {
+  const norm = relPath.split(path.sep).join('/').replace(/^\.\//, '');
+  if (!norm || norm === '.') return false;
+  const parts = norm.split('/');
+  if (parts.includes('sessions')) return true;
+  return PI_CONFIG_PRUNE_PATHS.some(p => norm === p || norm.startsWith(p + '/'));
+}
+
+function getProjectSessionsNamespace(workdir) {
+  const normalized = path.resolve(workdir);
+  return `--${normalized.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+}
+
+function stageHostPiConfig({ homeDir, targetDir, log = () => {} }) {
+  const sourceDir = path.join(homeDir, '.pi');
+  if (!fs.existsSync(sourceDir)) {
+    fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+    return false;
+  }
+
+  const parentDir = path.dirname(targetDir);
+  fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+
+  const tmpDir = `${targetDir}.tmp.${process.pid}.${Date.now()}`;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
+
+  try {
+    fs.cpSync(sourceDir, tmpDir, {
+      recursive: true,
+      dereference: true,
+      force: true,
+      filter: (srcPath) => {
+        const relPath = path.relative(sourceDir, srcPath);
+        return !shouldPrunePiConfigPath(relPath);
+      },
+    });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+    fs.renameSync(tmpDir, targetDir);
+    return true;
+  } catch (err) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    log(`warning: failed to stage host pi config: ${err.message}`);
+    return fs.existsSync(targetDir);
+  }
+}
+
+function buildPicMountArgs({
+  workdir,
+  workspaceTarget,
+  nodeModulesVolume,
+  stagedPiHostDir,
+  hostSessionsDir,
+  containerSessionsDir = '/pi-sessions',
+  extraVolumes = [],
+  includeHerdrSocket = false,
+  herdrSocketVolumeArgs = [],
+  extraPublish = [],
+  hostNpmDir,
+  hostGitDir,
+}) {
+  const args = [
+    '--volume', `${workdir}:${workspaceTarget}`,
+    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
+    ...extraVolumes.flatMap(v => ['--volume', v]),
+    ...(includeHerdrSocket ? herdrSocketVolumeArgs : []),
+    ...extraPublish.flatMap(p => ['--publish', p]),
+    '--mount', `type=bind,source=${stagedPiHostDir},target=/host-pi,readonly`,
+    '--mount', `type=bind,source=${hostSessionsDir},target=${containerSessionsDir}`,
+  ];
+  if (hostNpmDir && fs.existsSync(hostNpmDir)) {
+    args.push('--mount', `type=bind,source=${hostNpmDir},target=/host-pi-npm,readonly`);
+  }
+  if (hostGitDir && fs.existsSync(hostGitDir)) {
+    args.push('--mount', `type=bind,source=${hostGitDir},target=/host-pi-git,readonly`);
+  }
+  return args;
+}
+
 module.exports = {
+  PI_CONFIG_PRUNE_PATHS,
+  buildPicMountArgs,
+  getProjectSessionsNamespace,
   nodeProxyPreloadImport,
   parseContainerRunnerArgs,
   proxyEnvironmentArgs,
   proxyEnvironmentNames,
   runChildProcess,
+  shouldPrunePiConfigPath,
+  stageHostPiConfig,
   startProxy,
 };

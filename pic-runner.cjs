@@ -6,9 +6,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 const {
+  buildPicMountArgs,
+  getProjectSessionsNamespace,
   parseContainerRunnerArgs,
   proxyEnvironmentArgs: buildProxyEnvironmentArgs,
   runChildProcess,
+  stageHostPiConfig,
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
 
@@ -41,9 +44,16 @@ const volumeSuffix = crypto.createHash('sha1').update(workdir).digest('hex').sli
 const volumeBasename = dirBasename.replace(/[^a-zA-Z0-9_.-]/g, '-');
 const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 
-// Session directory — pi writes UUID-named session files, no hash needed for isolation
-// Two pi processes in the same container won't collide because session IDs are UUIDs.
-const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
+// Session directory — persist in host project-scoped namespace (~/.pi/agent/sessions/<namespace>)
+// so host-side tools like agentsview can read session transcripts directly.
+// Pi writes UUID-named session files, so concurrent processes within the project will not collide.
+const projectSessionsNamespace = getProjectSessionsNamespace(workdir);
+const hostSessionsDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'sessions', projectSessionsNamespace);
+const containerSessionsDir = '/pi-sessions';
+const sessionDir = containerSessionsDir;
+const stagedPiHostDir = path.join(home || process.env.USERPROFILE || '.', '.pic-container', 'pi-config', `${volumeBasename}-${volumeSuffix}`);
+const hostNpmDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'npm');
+const hostGitDir = path.join(home || process.env.USERPROFILE || '.', '.pi', 'agent', 'git');
 const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
 const stagedHostExtensionsDir = path.join(workdir, '.pi', 'host-agent-extensions');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
@@ -296,14 +306,24 @@ function containerExecArgs(containerId, commandArgs, { envArgs = [] } = {}) {
 }
 
 function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = false } = {}) {
+  const mountArgs = buildPicMountArgs({
+    workdir,
+    workspaceTarget,
+    nodeModulesVolume,
+    stagedPiHostDir,
+    hostSessionsDir,
+    containerSessionsDir,
+    extraVolumes,
+    includeHerdrSocket,
+    herdrSocketVolumeArgs: herdrSocketVolumeArgs(),
+    extraPublish,
+    hostNpmDir,
+    hostGitDir,
+  });
+
   return [
     'run', '--rm', ...interactiveContainerArgs(), '--memory', '4g',
-    '--volume', `${workdir}:${workspaceTarget}`,
-    '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
-    ...extraVolumes.flatMap(v => ['--volume', v]),
-    ...(includeHerdrSocket ? herdrSocketVolumeArgs() : []),
-    ...extraPublish.flatMap(p => ['--publish', p]),
-    '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+    ...mountArgs,
     '--dns', '1.1.1.1',
     ...envArgs,
     '-w', workspaceTarget,
@@ -391,8 +411,11 @@ function findContainerWithMount(workdirPath) {
         }
         let hasWorkdirMount = false;
         let hasPiConfigMount = false;
+        let hasSessionsMount = false;
         let hasNodeModulesMount = false;
         let hasHerdrSocketMount = !herdrSocketDir;
+        let hasNpmMount = !fs.existsSync(hostNpmDir);
+        let hasGitMount = !fs.existsSync(hostGitDir);
         for (const mount of item.configuration.mounts || []) {
           const mountTarget = mount.target || mount.destination || mount.mountpoint || mount.mountPoint;
           const mountSourcePath = mount.source ? path.resolve(mount.source) : '';
@@ -401,18 +424,27 @@ function findContainerWithMount(workdirPath) {
             if (mountSourcePath === normalizedWorkdir && mountTarget === workspaceTarget) {
               hasWorkdirMount = true;
             }
-            if (mountSourcePath === path.resolve(home, '.pi') && mountTarget === '/host-pi') {
-              hasPiConfigMount = true;
-            }
           }
-            if (herdrSocketDir && mountSourcePath === path.resolve(herdrSocketDir) && mountTarget === herdrSocketMountTarget) {
-              hasHerdrSocketMount = true;
-            }
+          if (mountTarget === '/host-pi' && mountSourcePath === path.resolve(stagedPiHostDir)) {
+            hasPiConfigMount = true;
+          }
+          if (mountTarget === containerSessionsDir && mountSourcePath === path.resolve(hostSessionsDir)) {
+            hasSessionsMount = true;
+          }
+          if (mountTarget === '/host-pi-npm' && mountSourcePath === path.resolve(hostNpmDir)) {
+            hasNpmMount = true;
+          }
+          if (mountTarget === '/host-pi-git' && mountSourcePath === path.resolve(hostGitDir)) {
+            hasGitMount = true;
+          }
+          if (herdrSocketDir && mountSourcePath === path.resolve(herdrSocketDir) && mountTarget === herdrSocketMountTarget) {
+            hasHerdrSocketMount = true;
+          }
           if (mountTarget === `${workspaceTarget}/node_modules` && mountSourceName.includes(nodeModulesVolume)) {
             hasNodeModulesMount = true;
           }
         }
-        if (hasWorkdirMount && hasPiConfigMount && hasNodeModulesMount && hasHerdrSocketMount) {
+        if (hasWorkdirMount && hasPiConfigMount && hasSessionsMount && hasNodeModulesMount && hasHerdrSocketMount && hasNpmMount && hasGitMount) {
           if (!refreshContainerExtensions(containerId)) {
             spawnSync('container', ['stop', containerId], { stdio: verbose ? 'inherit' : 'ignore' });
             continue;
@@ -421,7 +453,7 @@ function findContainerWithMount(workdirPath) {
           return containerId;
         }
         if (hasWorkdirMount) {
-          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/node_modules/Herdr socket mounts; will not reuse`);
+          log(`container "${containerId}" has the workdir mounted but is missing current Pi config/sessions/node_modules/Herdr socket mounts; will not reuse`);
         }
       }
     } catch (error) {
@@ -436,7 +468,8 @@ function findContainerWithMount(workdirPath) {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
-  fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+  stageHostPiConfig({ homeDir: home, targetDir: stagedPiHostDir, log });
+  fs.mkdirSync(hostSessionsDir, { recursive: true });
   stageHostSkills();
   stageHostExtensions();
 
@@ -472,9 +505,15 @@ async function main() {
     }
   }
 
+  const sessionEnvArgs = ['-e', `PI_CODING_AGENT_SESSION_DIR=${containerSessionsDir}`];
+
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled })];
+    const envArgs = [
+      ...proxyEnvironmentArgs(),
+      ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+      ...sessionEnvArgs,
+    ];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -507,6 +546,7 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...sessionEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
@@ -520,6 +560,7 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...sessionEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],

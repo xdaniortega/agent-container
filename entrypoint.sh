@@ -56,10 +56,14 @@ case "${1:-}" in
     fi
 
     mkdir -p /root/.pi/agent
-    if [ -d /host-pi/agent/npm ]; then
+    if [ -d /host-pi-npm ]; then
+      ln -s /host-pi-npm /root/.pi/agent/npm
+    elif [ -d /host-pi/agent/npm ]; then
       ln -s /host-pi/agent/npm /root/.pi/agent/npm
     fi
-    if [ -d /host-pi/agent/git ]; then
+    if [ -d /host-pi-git ]; then
+      ln -s /host-pi-git /root/.pi/agent/git
+    elif [ -d /host-pi/agent/git ]; then
       ln -s /host-pi/agent/git /root/.pi/agent/git
     fi
 
@@ -206,6 +210,10 @@ EOF
         [ -f "$extension" ] || continue
         set -- -e "$extension" "$@"
       done
+    fi
+
+    if [ -d /pi-sessions ]; then
+      export PI_CODING_AGENT_SESSION_DIR="${PI_CODING_AGENT_SESSION_DIR:-/pi-sessions}"
     fi
 
     exec pi "$@"
