@@ -49,7 +49,7 @@ Config shape:
   "roles": {
     "scout": {
       "description": "Finds local and online context...",
-      "model": "openai-codex/gpt-5.4-mini",
+      "model": "google/gemini-3.8-flash",
       "authority": "read-only"
     }
   }
