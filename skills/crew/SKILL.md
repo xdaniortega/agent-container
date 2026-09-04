@@ -60,6 +60,23 @@ Use `description` as the role's standing behavior, `model` as an exact provider/
 
 Use `crew_rules` to inspect the resolved role configuration and source path when needed.
 
+## Model & effort assignments
+
+Resolved model and effort per role for this environment. Effort is the reasoning/thinking level.
+
+| Layer / role | Model | Effort |
+|---|---|---|
+| brain (session) | `anthropic/claude-opus-5` | `xhigh` |
+| `scout` | `google/gemini-3.8-flash` | `medium` |
+| `oracle` | `anthropic/claude-fable-5-1` | `xhigh` |
+| `executor` | `anthropic/claude-opus-5` | `medium` |
+| `reviewer` | `anthropic/claude-opus-5` | `xhigh` |
+
+Notes:
+
+- The `model` field in crew config must be a plain `provider/id`. Do not append a `:<thinking>` suffix — it breaks catalog resolution and makes the role unlaunchable. Effort is applied via the role `description` and per-task `crew_launch` prompt instead.
+- The brain's model/effort is fixed at session launch (`pi --model anthropic/claude-opus-5 --thinking xhigh`), not by crew config; it cannot be hot-swapped mid-session.
+
 ## Using `crew_launch`
 
 For ordinary delegation, call `crew_launch` with:
