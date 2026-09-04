@@ -1,4 +1,5 @@
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -132,6 +133,21 @@ function getProjectSessionsNamespace(workdir) {
   return `--${normalized.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
 }
 
+// Per-launch staged config instances live under the project staging root as
+// `<root>/<timestamp>-<pid>-<rand>`. Every launch stages into a *fresh* directory
+// so a concurrent session never rewrites a directory that a running container has
+// bind-mounted at /host-pi (that clobbering emptied model/auth config).
+const STAGED_PI_CONFIG_INSTANCE_RE = /^\d{13,}-\d+-[a-f0-9]{6}$/;
+
+function isStagedPiConfigInstanceName(name) {
+  return STAGED_PI_CONFIG_INSTANCE_RE.test(String(name || ''));
+}
+
+function createStagedPiConfigInstanceDir(rootDir) {
+  const suffix = crypto.randomBytes(3).toString('hex');
+  return path.join(rootDir, `${Date.now()}-${process.pid}-${suffix}`);
+}
+
 function stageHostPiConfig({ homeDir, targetDir, log = () => {} }) {
   const sourceDir = path.join(homeDir, '.pi');
   if (!fs.existsSync(sourceDir)) {
@@ -146,6 +162,7 @@ function stageHostPiConfig({ homeDir, targetDir, log = () => {} }) {
   fs.rmSync(tmpDir, { recursive: true, force: true });
   fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
 
+  let trashDir = null;
   try {
     fs.cpSync(sourceDir, tmpDir, {
       recursive: true,
@@ -156,14 +173,56 @@ function stageHostPiConfig({ homeDir, targetDir, log = () => {} }) {
         return !shouldPrunePiConfigPath(relPath);
       },
     });
-    fs.rmSync(targetDir, { recursive: true, force: true });
+    // Never destroy an existing target before the replacement is in place: move it
+    // aside first so a failed swap cannot leave an empty /host-pi mount behind.
+    if (fs.existsSync(targetDir)) {
+      trashDir = `${targetDir}.trash.${process.pid}.${Date.now()}`;
+      fs.renameSync(targetDir, trashDir);
+    }
     fs.renameSync(tmpDir, targetDir);
+    if (trashDir) {
+      try { fs.rmSync(trashDir, { recursive: true, force: true }); } catch {}
+    }
     return true;
   } catch (err) {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    if (trashDir && fs.existsSync(trashDir) && !fs.existsSync(targetDir)) {
+      try { fs.renameSync(trashDir, targetDir); } catch {}
+    }
     log(`warning: failed to stage host pi config: ${err.message}`);
     return fs.existsSync(targetDir);
   }
+}
+
+// Garbage-collect staged config instances from earlier launches. Directories that
+// are still bind-mounted by a live container (keepDirs) and very recent ones
+// (younger than minAgeMs, possibly mid-startup) are always preserved.
+function pruneStagedPiConfigDirs({ rootDir, keepDirs = [], minAgeMs = 60 * 60 * 1000, now = Date.now(), log = () => {} }) {
+  const removed = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch {
+    return removed;
+  }
+
+  const keep = new Set(keepDirs.filter(Boolean).map(dir => path.resolve(dir)));
+  for (const entry of entries) {
+    const fullPath = path.join(rootDir, entry.name);
+    const isInstance = entry.isDirectory() && isStagedPiConfigInstanceName(entry.name);
+    const isLeftoverTmp = /\.(tmp|trash)\.\d+\.\d+$/.test(entry.name);
+    if (!isInstance && !isLeftoverTmp) continue;
+    if (keep.has(path.resolve(fullPath))) continue;
+    try {
+      const age = now - fs.statSync(fullPath).mtimeMs;
+      if (age < minAgeMs) continue;
+      fs.rmSync(fullPath, { recursive: true, force: true });
+      removed.push(fullPath);
+    } catch (err) {
+      log(`warning: failed to prune staged pi config "${fullPath}": ${err.message}`);
+    }
+  }
+  return removed;
 }
 
 function buildPicMountArgs({
@@ -201,8 +260,11 @@ function buildPicMountArgs({
 module.exports = {
   PI_CONFIG_PRUNE_PATHS,
   buildPicMountArgs,
+  createStagedPiConfigInstanceDir,
   getProjectSessionsNamespace,
+  isStagedPiConfigInstanceName,
   nodeProxyPreloadImport,
+  pruneStagedPiConfigDirs,
   parseContainerRunnerArgs,
   proxyEnvironmentArgs,
   proxyEnvironmentNames,

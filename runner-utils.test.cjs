@@ -4,9 +4,22 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   buildPicMountArgs,
+  createStagedPiConfigInstanceDir,
   getProjectSessionsNamespace,
+  isStagedPiConfigInstanceName,
+  pruneStagedPiConfigDirs,
   stageHostPiConfig,
 } = require('./runner-utils.cjs');
+
+function makeFakePiHome(root) {
+  const fakeHome = path.join(root, 'home');
+  const fakePi = path.join(fakeHome, '.pi');
+  fs.mkdirSync(path.join(fakePi, 'agent'), { recursive: true });
+  fs.writeFileSync(path.join(fakePi, 'agent', 'settings.json'), '{"theme":"dark"}');
+  fs.writeFileSync(path.join(fakePi, 'agent', 'auth.json'), '{"key":"secret"}');
+  fs.writeFileSync(path.join(fakePi, 'agent', 'models-store.json'), '{"models":[]}');
+  return fakeHome;
+}
 
 function test(name, fn) {
   try {
@@ -136,6 +149,115 @@ test('staging regression guard: staged tree contains no sessions path at any dep
       }
     }
     assertNoSessions(fakeTarget);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// 5. Concurrency regression: a second launch must not touch the first launch's staged dir
+test('concurrent launches stage into isolated dirs and never clobber a live mount', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-concurrent-'));
+  try {
+    const fakeHome = makeFakePiHome(tmpRoot);
+    const stagingRoot = path.join(tmpRoot, 'pi-config', 'proj-abc123');
+
+    // Session 1 stages and "mounts" its instance dir.
+    const first = createStagedPiConfigInstanceDir(stagingRoot);
+    assert.equal(stageHostPiConfig({ homeDir: fakeHome, targetDir: first }), true);
+
+    // Session 2 stages while session 1 is still running.
+    const second = createStagedPiConfigInstanceDir(stagingRoot);
+    assert.notEqual(first, second, 'each launch must get its own staged directory');
+    assert.equal(stageHostPiConfig({ homeDir: fakeHome, targetDir: second }), true);
+
+    // Session 1's config must still be fully intact — this is the exact regression
+    // where the second session emptied /host-pi and wiped model/api configuration.
+    for (const file of ['settings.json', 'auth.json', 'models-store.json']) {
+      assert.ok(
+        fs.existsSync(path.join(first, 'agent', file)),
+        `session 1 lost ${file} when session 2 staged config`,
+      );
+      assert.ok(fs.existsSync(path.join(second, 'agent', file)), `session 2 missing ${file}`);
+    }
+    assert.equal(fs.readFileSync(path.join(first, 'agent', 'auth.json'), 'utf8'), '{"key":"secret"}');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// 6. GC keeps mounted/recent instances and reclaims stale ones
+test('staged config GC preserves in-use and recent dirs, removes stale ones', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-gc-'));
+  try {
+    const fakeHome = makeFakePiHome(tmpRoot);
+    const stagingRoot = path.join(tmpRoot, 'pi-config', 'proj-abc123');
+
+    const mounted = createStagedPiConfigInstanceDir(stagingRoot);
+    stageHostPiConfig({ homeDir: fakeHome, targetDir: mounted });
+    const stale = path.join(stagingRoot, `${Date.now() - 999}-4242-aaaaaa`);
+    stageHostPiConfig({ homeDir: fakeHome, targetDir: stale });
+    const recent = createStagedPiConfigInstanceDir(stagingRoot);
+    stageHostPiConfig({ homeDir: fakeHome, targetDir: recent });
+
+    // Age `mounted` and `stale` well past the retention window; `mounted` is still
+    // bind-mounted by a live container so it must survive anyway.
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    fs.utimesSync(mounted, old, old);
+    fs.utimesSync(stale, old, old);
+
+    const removed = pruneStagedPiConfigDirs({
+      rootDir: stagingRoot,
+      keepDirs: [mounted],
+      minAgeMs: 60 * 60 * 1000,
+    });
+
+    assert.ok(fs.existsSync(mounted), 'must not remove a directory mounted by a live container');
+    assert.ok(fs.existsSync(recent), 'must not remove a freshly staged directory');
+    assert.ok(!fs.existsSync(stale), 'stale unused directory should be reclaimed');
+    assert.deepEqual(removed, [stale]);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// 7. Instance-name recognition (drives GC eligibility and container-reuse matching)
+test('staged config instance names are recognized, unrelated names are not', () => {
+  const instance = path.basename(createStagedPiConfigInstanceDir('/tmp/root'));
+  assert.ok(isStagedPiConfigInstanceName(instance));
+  for (const name of ['agent', 'proj-abc123', '', 'settings.json', '123-abc']) {
+    assert.ok(!isStagedPiConfigInstanceName(name), `${name} must not look like an instance dir`);
+  }
+});
+
+// 8. A failed swap must never leave an existing staged config empty
+test('failed staging preserves the previous staged config', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-failstage-'));
+  try {
+    const fakeHome = makeFakePiHome(tmpRoot);
+    const target = path.join(tmpRoot, 'pi-config', 'proj', 'staged');
+    assert.equal(stageHostPiConfig({ homeDir: fakeHome, targetDir: target }), true);
+
+    // Fail the swap-in of the freshly copied tree (the busy-mount EBUSY/ENOTEMPTY
+    // case). The old implementation deleted the target *before* this rename, so a
+    // failure here left /host-pi empty and wiped model/api config.
+    const realRenameSync = fs.renameSync;
+    fs.renameSync = (src, dest) => {
+      if (String(src).includes('.tmp.')) throw new Error('simulated swap failure');
+      return realRenameSync(src, dest);
+    };
+    let result;
+    try {
+      result = stageHostPiConfig({ homeDir: fakeHome, targetDir: target, log: () => {} });
+    } finally {
+      fs.renameSync = realRenameSync;
+    }
+
+    assert.equal(result, true, 'should report the surviving previous staging');
+    assert.ok(
+      fs.existsSync(path.join(target, 'agent', 'auth.json')),
+      'previous staged config must survive a failed re-stage',
+    );
+    assert.equal(fs.readFileSync(path.join(target, 'agent', 'settings.json'), 'utf8'), '{"theme":"dark"}');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

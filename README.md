@@ -194,10 +194,18 @@ clc-proxy --volume "../web:/workspace/web"
 ### Config Handling
 
 - **Pi**: a pruned host Pi config tree is staged outside the workspace at
-  `~/.pic-container/pi-config/<project>/` and mounted at `/host-pi` (read-only).
-  Sessions are excluded from the staged tree by construction. The entrypoint copies
-  safe config files into `/root/.pi`, while any present `npm`/`git` caches are mounted
-  separately to `/host-pi-npm` and `/host-pi-git`.
+  `~/.pic-container/pi-config/<project>/<launch-instance>/` and mounted at `/host-pi`
+  (read-only). Sessions are excluded from the staged tree by construction. The
+  entrypoint copies safe config files into `/root/.pi`, while any present `npm`/`git`
+  caches are mounted separately to `/host-pi-npm` and `/host-pi-git`.
+- **Per-launch staging isolation**: each launch that starts a new container stages into
+  its own instance directory under the project staging root, so a second session in the
+  same folder can never rewrite a directory that a running container has bind-mounted at
+  `/host-pi`. Sharing one staged directory previously caused a concurrent launch to empty
+  it, which wiped model and API configuration in the other session. Container reuse
+  accepts any instance directory under the project staging root, and stale instances are
+  garbage-collected on launch (directories still mounted by a live container, or younger
+  than one hour, are always kept).
 
 ### Ignoring local auth with an Anthropic key
 
