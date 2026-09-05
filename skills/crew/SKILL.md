@@ -68,9 +68,9 @@ Resolved model and effort per role for this environment. Effort is the reasoning
 |---|---|---|
 | brain (session) | `anthropic/claude-opus-5` | `xhigh` |
 | `scout` | `google/gemini-3.8-flash` | `medium` |
-| `oracle` | `anthropic/claude-fable-5-1` | `xhigh` |
-| `executor` | `anthropic/claude-opus-5` | `medium` |
-| `reviewer` | `anthropic/claude-opus-5` | `xhigh` |
+| `oracle` | `anthropic/claude-opus-5` | `xhigh` |
+| `executor` | `google/gemini-3.8-flash` | `medium` |
+| `reviewer` | `anthropic/claude-fable-5-1` | `xhigh` |
 
 Notes:
 

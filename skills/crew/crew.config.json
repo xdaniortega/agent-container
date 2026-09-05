@@ -7,17 +7,17 @@
     },
     "oracle": {
       "description": "Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks.",
-      "model": "anthropic/claude-fable-5-1",
+      "model": "anthropic/claude-opus-5",
       "authority": "read-only"
     },
     "executor": {
       "description": "Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks.",
-      "model": "anthropic/claude-opus-5",
+      "model": "google/gemini-3.8-flash",
       "authority": "can-edit"
     },
     "reviewer": {
       "description": "Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings.",
-      "model": "anthropic/claude-opus-5",
+      "model": "anthropic/claude-fable-5-1",
       "authority": "read-only"
     }
   }
