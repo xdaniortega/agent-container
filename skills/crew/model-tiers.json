@@ -1,0 +1,8 @@
+{
+  "parallelCodeReview": {
+    "frontier": { "model": "anthropic/claude-opus-4-8", "effort": "medium" },
+    "mid": { "model": "google/gemini-3.8-flash", "effort": "medium" },
+    "small": { "model": "google/gemini-3.8-flash", "effort": "low" },
+    "synthesis": { "model": "anthropic/claude-opus-4-8", "effort": "medium" }
+  }
+}

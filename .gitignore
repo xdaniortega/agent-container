@@ -8,3 +8,7 @@ npm-debug.log*
 Mullvad.local.md
 *.local.md
 .pi/*
+.env
+.env.*
+*.pem
+*.key

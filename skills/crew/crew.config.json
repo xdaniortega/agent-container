@@ -1,23 +1,27 @@
 {
   "roles": {
     "scout": {
-      "description": "Finds local and online context. Reports relevant facts, files, sources, risks, and suggested next steps.",
+      "description": "Finds targeted local and online context. Read only the current phase contract and explicitly required evidence; return a bounded context map with references, facts, risks, and suggested next steps.",
       "model": "google/gemini-3.8-flash",
+      "effort": "medium",
       "authority": "read-only"
     },
     "oracle": {
-      "description": "Advises on plans, architecture, sequencing, tradeoffs, alternatives, and risks.",
+      "description": "Advises on the current decision, architecture, sequencing, tradeoffs, alternatives, and risks without re-planning completed phases or loading optional history.",
       "model": "anthropic/claude-opus-5",
+      "effort": "xhigh",
       "authority": "read-only"
     },
     "executor": {
-      "description": "Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks.",
+      "description": "Implements one approved phase from its current contract in a fresh task context. Publish factual validation and risks, reference full evidence, and keep returned prose concise.",
       "model": "google/gemini-3.8-flash",
+      "effort": "medium",
       "authority": "can-edit"
     },
     "reviewer": {
-      "description": "Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings.",
-      "model": "anthropic/claude-fable-5-1",
+      "description": "Independently reviews the exact source snapshot and current contract without inheriting executor reasoning. Verify evidence selectively, publish a structured verdict, and keep all blocking findings distinct.",
+      "model": "anthropic/claude-opus-5",
+      "effort": "xhigh",
       "authority": "read-only"
     }
   }
