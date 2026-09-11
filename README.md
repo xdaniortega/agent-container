@@ -124,6 +124,15 @@ The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets 
 npm run install-crew
 ```
 
+### Choosing / changing models
+
+Crew roles and review agents never hardcode a provider or model. Each names an abstract **model tier** (`frontier` / `medium` / `small`) plus a concrete **reasoning** level (`xhigh` / `medium` / `low`). Everything lives in the single **`model-tiers.json`**:
+- `models.frontier|medium|small` → the provider/model each tier means for us (e.g. `frontier` = Opus 5, `medium` = Opus 4.8, `small` = Gemini 3.8 Flash). **Change which model a crew member uses by editing these three values.**
+- `crewRoles.<role>` → the `{ model: <tier>, reasoning: <level>, authority, description }` per crew member (scout, oracle, executor, executor-escalation, reviewer).
+- `parallelCodeReview.<agent>` → the model tier + reasoning per review agent.
+
+Example: to run everything on your own provider, change only the three `models.*` values. To make the reviewer cheaper, set `crewRoles.reviewer.model` to `medium`; to make it think harder, raise `crewRoles.reviewer.reasoning`. An inline concrete `"model": "provider/x"` override is still honored as an escape hatch.
+
 ### Herdr integration
 
 When `pic` or `pic-proxy` is launched inside a Herdr pane, the runner auto-enables Pi status reporting through a host/container socket bridge. No Herdr socket is bind-mounted into the Apple container.

@@ -1,0 +1,76 @@
+{
+  "models": {
+    "frontier": "anthropic/claude-opus-5",
+    "medium": "anthropic/claude-opus-4-8",
+    "small": "google/gemini-3.8-flash"
+  },
+  "crewRoles": {
+    "scout": {
+      "model": "medium",
+      "reasoning": "medium",
+      "authority": "read-only"
+    },
+    "oracle": {
+      "model": "frontier",
+      "reasoning": "xhigh",
+      "authority": "read-only"
+    },
+    "executor": {
+      "model": "small",
+      "reasoning": "medium",
+      "authority": "can-edit"
+    },
+    "executor-escalation": {
+      "model": "medium",
+      "reasoning": "medium",
+      "authority": "can-edit"
+    },
+    "reviewer": {
+      "model": "frontier",
+      "reasoning": "xhigh",
+      "authority": "read-only"
+    }
+  },
+  "parallelCodeReview": {
+    "testRunner": {
+      "model": "small",
+      "reasoning": "low"
+    },
+    "linter": {
+      "model": "small",
+      "reasoning": "low"
+    },
+    "codeReviewer": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "security": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "qualityStyle": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "testQuality": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "performance": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "dependency": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "simplification": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "synthesis": {
+      "model": "medium",
+      "reasoning": "medium"
+    }
+  }
+}
