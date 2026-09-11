@@ -87,11 +87,17 @@ export type ParallelReviewAgentConfig = {
   effort?: ThinkingLevel;
 };
 
+export type LifecycleConfig = {
+  ephemeral?: boolean;
+  teardownGraceMs?: number;
+};
+
 export type ModelTiers = {
   models?: Record<string, string>;
   crewRoles?: Record<string, CrewRoleConfig>;
   roles?: Record<string, CrewRoleConfig>;
   parallelCodeReview?: Record<string, ParallelReviewAgentConfig>;
+  lifecycle?: LifecycleConfig;
 };
 
 export type CrewConfig = ModelTiers;
@@ -906,6 +912,23 @@ function expectOk(result: ExecResult, context: string): void {
   }
 }
 
+function logLifecycle(
+  pi: ExtensionAPI,
+  onUpdate: ToolUpdate | undefined,
+  action: string,
+  message: string,
+  details: Record<string, unknown> = {}
+): void {
+  onUpdate?.({
+    content: [{ type: "text", text: message }],
+    details: { ...details, status: (details.status as string) ?? action },
+  });
+  pi.appendEntry?.("crew-lifecycle", {
+    action,
+    ...details,
+  });
+}
+
 async function herdr(pi: ExtensionAPI, args: string[], timeout = PROMPT_TIMEOUT_MS): Promise<ExecResult> {
   return pi.exec("herdr", args, { timeout });
 }
@@ -928,7 +951,7 @@ export function isStartupBlockedOutput(output: string): boolean {
   return /trust project folder\?|approval required|waiting for (?:user )?approval/i.test(output);
 }
 
-async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: number): Promise<StartupState> {
+async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: number, stableMs = STARTUP_READY_STABLE_MS): Promise<StartupState> {
   const deadline = Date.now() + timeoutMs;
   let readySince: number | undefined;
   let lastOutput = "";
@@ -942,7 +965,7 @@ async function waitForAgentReady(pi: ExtensionAPI, paneId: string, timeoutMs: nu
         lastOutput = await readPane(pi, paneId, FAILURE_READ_LINES);
         if (isStartupBlockedOutput(lastOutput)) return { agent, status: "blocked", output: lastOutput };
         readySince ??= Date.now();
-        if (Date.now() - readySince >= STARTUP_READY_STABLE_MS) return { agent, status: "ready", output: lastOutput };
+        if (Date.now() - readySince >= stableMs) return { agent, status: "ready", output: lastOutput };
       } else {
         readySince = undefined;
       }
@@ -1176,6 +1199,7 @@ type CrewLaunchParams = DelegationFields & {
   allowContextLookup?: boolean; contextSource?: ParentContextSource; parentSessionDir?: string;
   contextMode?: ContextMode; checkpointFallback?: CheckpointFallback; recentTurns?: number; maxHandoffChars?: number;
   handoffText?: string; branch?: SessionEntryLike[];
+  ephemeral?: boolean; teardownGraceMs?: number;
   startupTimeoutMs?: number; timeoutMs?: number; hardCapMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
 };
 
@@ -1356,7 +1380,14 @@ export function modelMatch(requested: string, catalog: string[]): "exact" | "fuz
  * @param ownerSessionId Originating native session used for managed owner access.
  * @returns The crew tool result and structured lifecycle details.
  */
-export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, signal?: AbortSignal, onUpdate?: ToolUpdate, ownerSessionId?: string) {
+export async function executeCrewLaunch(
+  pi: ExtensionAPI,
+  params: CrewLaunchParams,
+  signal?: AbortSignal,
+  onUpdate?: ToolUpdate,
+  ownerSessionId?: string,
+  delayFn: (ms: number, signal?: AbortSignal) => Promise<void> = delay
+) {
   const roleName = params.role ?? "scout";
   assertValidRoleName(roleName);
   const task = normalizeTask(params.task, params);
@@ -1374,6 +1405,9 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
   }
   const recentTurns = params.recentTurns !== undefined ? positiveInteger(params.recentTurns, 6, "recentTurns") : 6;
   const maxHandoffChars = params.maxHandoffChars !== undefined ? positiveInteger(params.maxHandoffChars, CONTEXT_MAX_CHARS, "maxHandoffChars") : CONTEXT_MAX_CHARS;
+  if (params.teardownGraceMs !== undefined) {
+    positiveInteger(params.teardownGraceMs, 5_000, "teardownGraceMs");
+  }
 
   if (contextMode === "since-last-crew" && !params.handoffText && params.branch) {
     const handoff = buildHandoff(params.branch, params.toolCallId, contextMode, checkpointFallback, recentTurns, maxHandoffChars, params.context);
@@ -1419,6 +1453,12 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
     return { content: [{ type: "text", text: JSON.stringify(recovered) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: recovered.status, recovered: true, writerLiveness: agent ? liveness : "absent" } };
   }
   const { config, path: configPath } = loadModelTiers(params.configCwd ?? roleCwd);
+  const ephemeral = params.ephemeral ?? config.lifecycle?.ephemeral ?? false;
+  const teardownGraceMs = positiveInteger(
+    params.teardownGraceMs ?? config.lifecycle?.teardownGraceMs,
+    5_000,
+    "teardownGraceMs"
+  );
   const configuredRoles = { ...config.roles, ...config.crewRoles };
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(configuredRoles)]);
   const role = resolveRole(roleName, config);
@@ -1468,11 +1508,10 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
   const roleCommand = buildRoleCommand(baseCommand, launchModel, role.authority, durable?.access.stateRoot, role.effort, params.parentSessionDir);
 
   let agents = await listAgents(pi);
-  // Managed panes must be freshly bootstrapped with the resolved state-root
-  // environment; an older reusable pane may not share that root.
-  const namingAgents = durable ? agents.map(agent => ({ ...agent, agent_status: "working", status: "working" })) : agents;
+  // Managed or ephemeral panes must be freshly bootstrapped with the resolved state-root/lifecycle environment
+  const namingAgents = (durable || ephemeral) ? agents.map(agent => ({ ...agent, agent_status: "working", status: "working" })) : agents;
   let agentName = chooseAgentName(namingAgents, roleName, workspaceId, roleCwd, tabId, role.model, role.effort);
-  let paneId = durable ? undefined : findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId, role.model, role.effort);
+  let paneId = (durable || ephemeral) ? undefined : findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId, role.model, role.effort);
   let createdPane: string | undefined;
   let splitPolicy: string | undefined;
   let renameConflictRecovered = false;
@@ -1489,7 +1528,7 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
     const runResult = await herdr(pi, ["pane", "run", paneId, roleCommand]);
     expectOk(runResult, "herdr pane run");
 
-    const startup = await waitForAgentReady(pi, paneId, startupTimeoutMs);
+    const startup = await waitForAgentReady(pi, paneId, startupTimeoutMs, (params as any).startupReadyStableMs ?? STARTUP_READY_STABLE_MS);
     if (startup.status !== "ready") {
       const output = startup.output ?? await readPane(pi, paneId, FAILURE_READ_LINES);
       const message = startup.status === "blocked"
@@ -1508,6 +1547,9 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
       renameConflictRecovered = rename.code === 0;
     }
     expectOk(rename, "herdr agent rename");
+
+    const spawnLog = `crew: spawned ${roleName} in pane ${paneId} (${role.tier ?? role.model ?? "default model"}, workspace: ${workspaceId || "default"}, tab: ${tabId || "default"})`;
+    logLifecycle(pi, onUpdate, "spawn", spawnLog, { role: roleName, agentName, paneId, status: "spawned", workspaceId, tabId, model: role.model, tier: role.tier, ephemeral });
   }
 
   onUpdate?.({ content: [{ type: "text", text: `Starting ${roleName}…` }], details: { role: roleName, agentName, paneId, status: "starting" } });
@@ -1539,7 +1581,7 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
       readOutput: (name, pId, lines, curAgent) =>
         curAgent ? readAgent(pi, name, lines) : readPane(pi, pId, lines),
       now: () => Date.now(),
-      delay: (ms, sig) => delay(ms, sig),
+      delay: (ms, sig) => delayFn(ms, sig),
       onUpdate,
     }
   );
@@ -1585,6 +1627,41 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
       ? JSON.stringify({ status: managedTaskState!.status, taskId, attempt: durable!.attempt, reportArtifactId: managedTaskState!.reportArtifactId, reviewArtifactId: managedTaskState!.reviewArtifactId })
       : boundedLines(markerOutput.text)
     : `[CREW STATUS: ${status}; complete: false] ${managedError ? `Managed completion rejected: ${managedError}` : settled ? "The role settled without a confirmed final marker pair; this is incomplete diagnostic output, not a final answer." : "The role did not complete. This is partial diagnostic output, not a final answer."}\n\n${compactRoleOutput(output, prompt, readLines, durable ? [durable.taskToken] : [])}`;
+
+  let tornDown = false;
+  let removalLogged = false;
+  const isWriter = role.authority === "can-edit";
+  const canTeardown = ephemeral && !!createdPane && !isWriter;
+
+  if (canTeardown && complete) {
+    const summaryMsg = `crew: ${roleName} completed in pane ${createdPane}. Summary:\n${compactOutput}`;
+    logLifecycle(pi, onUpdate, "summary", summaryMsg, { role: roleName, agentName, paneId: createdPane, status: "summary", summary: compactOutput });
+
+    try {
+      try {
+        await delayFn(teardownGraceMs, signal);
+      } catch {
+        // Skip remaining grace wait if cancelled, and still attempt clean teardown
+      }
+      const closeResult = await herdr(pi, ["pane", "close", createdPane]);
+      expectOk(closeResult, "herdr pane close");
+      tornDown = true;
+      const removalMsg = `crew: removed ${roleName} pane ${createdPane} after successful run`;
+      logLifecycle(pi, onUpdate, "remove", removalMsg, { role: roleName, agentName, paneId: createdPane, status: "removed", ephemeral: true });
+      removalLogged = true;
+    } catch (teardownError) {
+      const failMsg = `crew: warning - failed to close pane ${createdPane}: ${teardownError instanceof Error ? teardownError.message : String(teardownError)}`;
+      logLifecycle(pi, onUpdate, "teardown-failed", failMsg, { role: roleName, agentName, paneId: createdPane, error: teardownError instanceof Error ? teardownError.message : String(teardownError) });
+    }
+  } else if (ephemeral && !complete) {
+    const retentionReason = status !== "done" && status !== "idle" ? status : "incomplete marker output";
+    const retentionMsg = `crew: retained ${roleName} pane ${paneId} (${retentionReason}; inspect pane for diagnostics)`;
+    logLifecycle(pi, onUpdate, "retain", retentionMsg, { role: roleName, agentName, paneId, status: "retained", retentionReason, ephemeral: true });
+  } else if (ephemeral && isWriter) {
+    const retentionMsg = `crew: retained writer pane ${paneId} (writer panes cannot be torn down ephemerally)`;
+    logLifecycle(pi, onUpdate, "retain", retentionMsg, { role: roleName, agentName, paneId, status: "retained", retentionReason: "writer", reason: "writer", ephemeral: true });
+  }
+
   const deliveredContextWarnings = durable ? await deliverManagedContextWarnings(pi, durable.access) : 0;
   return {
     content: [{ type: "text", text: compactOutput }],
@@ -1596,6 +1673,10 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
       paneId,
       createdPane,
       reusedPane: !createdPane,
+      ephemeral,
+      tornDown,
+      teardownGraceMs,
+      removalLogged,
       workspaceId,
       cwd: roleCwd,
       command: baseCommand,
@@ -1723,6 +1804,8 @@ export default function crewExtension(pi: ExtensionAPI) {
     checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"], description: "Fallback strategy when no completed crew checkpoint is found: recent (default, serialize recent N user turns), explicit (use explicit context), or error." },
     recentTurns: { type: "number", description: "Number of recent user turns to include when falling back to recent turns. Defaults to 6." },
     maxHandoffChars: { type: "number", description: "Maximum character budget for the pushed brain handoff. Defaults to 24000." },
+    ephemeral: { type: "boolean", description: "Whether to tear down the spawned role pane after successful completion. Defaults to false (or lifecycle.ephemeral from config)." },
+    teardownGraceMs: { type: "number", description: "Grace wait in milliseconds before closing an ephemeral pane on success. Defaults to 5000 (or lifecycle.teardownGraceMs from config)." },
     recoveryReason: { type: "string", description: "Required audit reason for managed recovery." },
     startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout up to a hard ceiling (default 2x timeoutMs). Defaults to 120000." }, hardCapMs: { type: "number", description: "Hard maximum total runtime ceiling after prompt submission that cannot be refreshed by activity. Defaults to 2x timeoutMs." }, readLines: { type: "number", description: "Line bound for partial/diagnostic output when a role does not complete. The full marked final answer is returned in full on success (capped only by the ~2000-line capture window). Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };

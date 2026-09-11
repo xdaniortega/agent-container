@@ -1650,4 +1650,438 @@ test("crew_launch parameter validation enforces valid contextMode, checkpointFal
     () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", maxHandoffChars: 0 } as any),
     /maxHandoffChars must be a positive integer/
   );
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", teardownGraceMs: -1 } as any),
+    /teardownGraceMs must be a positive integer/
+  );
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", teardownGraceMs: 0 } as any),
+    /teardownGraceMs must be a positive integer/
+  );
+});
+
+function createMockHerdr(options: {
+  repo: string;
+  markers: { start: string; end: string };
+  initialAgents?: any[];
+  markerOutputText?: string;
+  pollStatus?: string;
+  closeFails?: boolean;
+}) {
+  let createdPaneId: string | undefined;
+  let promptCalled = false;
+  const closedPanes: string[] = [];
+  const agents = [...(options.initialAgents ?? [])];
+
+  const mockPi = {
+    registerTool() {},
+    appendEntry() {},
+    async exec(command: string, args: string[] = []) {
+      if (command === "pi" && args[0] === "--list-models") {
+        return { code: 0, stdout: "anthropic/claude-opus-4-8\nanthropic/claude-opus-5\ngoogle/gemini-3.8-flash", stderr: "" };
+      }
+      assert.equal(command, "herdr");
+      if (args[0] === "pane" && args[1] === "current") {
+        return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "brain", workspace_id: "ws", tab_id: "tab", cwd: options.repo } } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "split") {
+        createdPaneId = "pane-eph-1";
+        return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: createdPaneId } } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "run") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "pane" && args[1] === "read") return { code: 0, stdout: "ready", stderr: "" };
+      if (args[0] === "agent" && args[1] === "list") {
+        const curStatus = promptCalled ? (options.pollStatus ?? "idle") : "idle";
+        const list = createdPaneId
+          ? [...agents, { name: "scout", pane_id: createdPaneId, workspace_id: "ws", tab_id: "tab", cwd: options.repo, agent_status: curStatus, status: curStatus }]
+          : agents;
+        return { code: 0, stdout: JSON.stringify({ result: { agents: list } }), stderr: "" };
+      }
+      if (args[0] === "agent" && args[1] === "rename") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "agent" && args[1] === "get") {
+        const curStatus = promptCalled ? (options.pollStatus ?? "idle") : "idle";
+        return { code: 0, stdout: JSON.stringify({ result: { agent: { name: args[2], pane_id: createdPaneId ?? agents[0]?.pane_id, agent_status: curStatus, status: curStatus } } }), stderr: "" };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        promptCalled = true;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "agent" && args[1] === "read") {
+        const text = options.markerOutputText !== undefined
+          ? `${options.markers.start}\n${options.markerOutputText}\n${options.markers.end}`
+          : "working without markers";
+        return { code: 0, stdout: text, stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "close") {
+        closedPanes.push(args[2]);
+        return options.closeFails ? { code: 1, stdout: "", stderr: "pane close failed" } : { code: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected herdr call: ${args.join(" ")}`);
+    }
+  };
+
+  return { mockPi, closedPanes };
+}
+
+test("successful ephemeral run emits spawn log + summary, waits teardownGraceMs, calls pane close exactly once, emits removal log, details.tornDown=true", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-success-"));
+  try {
+    const markers = buildCrewMarkers("call-eph-success");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All checks passed." });
+    const updates: any[] = [];
+    const delays: number[] = [];
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Check research items",
+        ephemeral: true,
+        teardownGraceMs: 5000,
+        toolCallId: "call-eph-success",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      (u) => updates.push(u),
+      undefined,
+      async (ms) => { delays.push(ms); }
+    );
+
+    assert.equal(result.details.complete, true);
+    assert.equal(result.details.ephemeral, true);
+    assert.equal(result.details.tornDown, true);
+    assert.equal(result.details.teardownGraceMs, 5000);
+    assert.equal(result.details.removalLogged, true);
+    assert.deepEqual(closedPanes, ["pane-eph-1"]);
+    assert.ok(delays.includes(5000));
+
+    // Spawn log
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: spawned scout in pane pane-eph-1")));
+    // Summary
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: scout completed in pane pane-eph-1. Summary:\nAll checks passed.")));
+    // Removal log
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: removed scout pane pane-eph-1 after successful run")));
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral run where pane close fails retains pane, tornDown=false, warns, and result stays successful", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-closefail-"));
+  try {
+    const markers = buildCrewMarkers("call-eph-closefail");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All checks passed.", closeFails: true });
+    const updates: any[] = [];
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Check research items",
+        ephemeral: true,
+        teardownGraceMs: 5000,
+        toolCallId: "call-eph-closefail",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      (u) => updates.push(u),
+      undefined,
+      async () => {}
+    );
+
+    // Teardown failure must not corrupt the successful result
+    assert.equal(result.details.complete, true);
+    assert.ok(result.content?.[0]?.text?.includes("All checks passed."));
+    // Close was attempted but did not succeed
+    assert.deepEqual(closedPanes, ["pane-eph-1"]);
+    assert.equal(result.details.tornDown, false);
+    assert.equal(result.details.removalLogged, false);
+    // A teardown-failure warning was logged
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: warning - failed to close pane pane-eph-1")));
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("failure/timeout ephemeral run does NOT close the pane, details.tornDown=false, retention logged", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-fail-"));
+  try {
+    const markers = buildCrewMarkers("call-eph-fail");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: undefined, pollStatus: "failed" });
+    const updates: any[] = [];
+    const delays: number[] = [];
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Check research items",
+        ephemeral: true,
+        timeoutMs: 100,
+        toolCallId: "call-eph-fail",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      (u) => updates.push(u),
+      undefined,
+      async (ms) => { delays.push(ms); }
+    );
+
+    assert.equal(result.details.complete, false);
+    assert.equal(result.details.ephemeral, true);
+    assert.equal(result.details.tornDown, false);
+    assert.equal(result.details.removalLogged, false);
+    assert.deepEqual(closedPanes, []); // Pane close was NEVER called
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: retained scout pane pane-eph-1")));
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral mode does not reuse an existing pane", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-noreuse-"));
+  try {
+    const markers = buildCrewMarkers("call-eph-noreuse");
+    const initialAgents = [{
+      name: "scout",
+      pane_id: "pane-existing-scout",
+      workspace_id: "ws",
+      tab_id: "tab",
+      cwd: repo,
+      agent_status: "idle",
+      status: "idle",
+    }];
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, initialAgents, markerOutputText: "OK" });
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Run one-off check",
+        ephemeral: true,
+        toolCallId: "call-eph-noreuse",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      undefined,
+      undefined,
+      async () => {}
+    );
+
+    assert.equal(result.details.ephemeral, true);
+    assert.equal(result.details.createdPane, "pane-eph-1");
+    assert.equal(result.details.reusedPane, false);
+    assert.deepEqual(closedPanes, ["pane-eph-1"]); // closed the created pane, not existing
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("non-ephemeral default is unchanged (no close)", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-noneph-default-"));
+  try {
+    const markers = buildCrewMarkers("call-noneph-default");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "Normal output" });
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Normal scout task",
+        toolCallId: "call-noneph-default",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      undefined,
+      undefined,
+      async () => {}
+    );
+
+    assert.equal(result.details.complete, true);
+    assert.equal(result.details.ephemeral, false);
+    assert.equal(result.details.tornDown, false);
+    assert.deepEqual(closedPanes, []); // pane close never called
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("teardown of a reused/writer pane is refused/never attempted", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-writer-refused-"));
+  try {
+    const markers = buildCrewMarkers("call-writer-refused");
+    let createdPaneId: string | undefined;
+    const closedPanes: string[] = [];
+
+    const mockPi = {
+      registerTool() {},
+      appendEntry() {},
+      async exec(command: string, args: string[] = []) {
+        if (command === "pi" && args[0] === "--list-models") {
+          return { code: 0, stdout: "anthropic/claude-opus-4-8\nanthropic/claude-opus-5\ngoogle/gemini-3.8-flash", stderr: "" };
+        }
+        assert.equal(command, "herdr");
+        if (args[0] === "pane" && args[1] === "current") {
+          return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "brain", workspace_id: "ws", tab_id: "tab", cwd: repo } } }), stderr: "" };
+        }
+        if (args[0] === "pane" && args[1] === "split") {
+          createdPaneId = "pane-writer-1";
+          return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: createdPaneId } } }), stderr: "" };
+        }
+        if (args[0] === "pane" && args[1] === "run") return { code: 0, stdout: "", stderr: "" };
+        if (args[0] === "pane" && args[1] === "read") return { code: 0, stdout: "ready", stderr: "" };
+        if (args[0] === "agent" && args[1] === "list") {
+          return { code: 0, stdout: JSON.stringify({ result: { agents: [{ name: "executor", pane_id: createdPaneId, workspace_id: "ws", tab_id: "tab", cwd: repo, agent_status: "idle", status: "idle" }] } }), stderr: "" };
+        }
+        if (args[0] === "agent" && args[1] === "rename") return { code: 0, stdout: "", stderr: "" };
+        if (args[0] === "agent" && args[1] === "get") {
+          return { code: 0, stdout: JSON.stringify({ result: { agent: { name: "executor", pane_id: createdPaneId, agent_status: "idle", status: "idle" } } }), stderr: "" };
+        }
+        if (args[0] === "agent" && args[1] === "prompt") return { code: 0, stdout: "", stderr: "" };
+        if (args[0] === "agent" && args[1] === "read") {
+          return { code: 0, stdout: `${markers.start}\nImplemented\n${markers.end}`, stderr: "" };
+        }
+        if (args[0] === "pane" && args[1] === "close") {
+          closedPanes.push(args[2]);
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        throw new Error(`unexpected herdr call: ${args.join(" ")}`);
+      }
+    };
+
+    const updates: any[] = [];
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "executor",
+        task: "Implement phase",
+        ephemeral: true,
+        toolCallId: "call-writer-refused",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      (u) => updates.push(u),
+      undefined,
+      async () => {}
+    );
+
+    assert.equal(result.details.complete, true);
+    assert.equal(result.details.ephemeral, true);
+    assert.equal(result.details.tornDown, false);
+    assert.deepEqual(closedPanes, []); // close was NEVER called for writer pane
+    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: retained writer pane")));
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral teardown respects abort signal during grace wait", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-abort-"));
+  try {
+    const markers = buildCrewMarkers("call-eph-abort");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All done" });
+    const ac = new AbortController();
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Check research items",
+        ephemeral: true,
+        teardownGraceMs: 10000,
+        toolCallId: "call-eph-abort",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      ac.signal,
+      undefined,
+      undefined,
+      async (_ms, sig) => {
+        ac.abort();
+        if (sig?.aborted) throw new Error("cancelled");
+      }
+    );
+
+    assert.equal(result.details.tornDown, true);
+    assert.deepEqual(closedPanes, ["pane-eph-1"]); // Teardown still happened cleanly
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral lifecycle config defaults are respected", async () => {
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  const repo = mkdtempSync(join(tmpdir(), "crew-eph-config-"));
+  try {
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    writeFileSync(
+      join(repo, ".pi", "model-tiers.json"),
+      JSON.stringify({
+        lifecycle: { ephemeral: true, teardownGraceMs: 3500 },
+      })
+    );
+    const markers = buildCrewMarkers("call-eph-config");
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "Config result" });
+    const delays: number[] = [];
+
+    const result = await executeCrewLaunch(
+      mockPi as any,
+      {
+        role: "scout",
+        task: "Check research",
+        toolCallId: "call-eph-config",
+        startupTimeoutMs: 1000,
+        startupReadyStableMs: 0,
+        configCwd: repo,
+      } as any,
+      undefined,
+      undefined,
+      undefined,
+      async (ms) => { delays.push(ms); }
+    );
+
+    assert.equal(result.details.ephemeral, true);
+    assert.equal(result.details.teardownGraceMs, 3500);
+    assert.equal(result.details.tornDown, true);
+    assert.ok(delays.includes(3500));
+    assert.deepEqual(closedPanes, ["pane-eph-1"]);
+  } finally {
+    process.env.HERDR_ENV = previousHerdr;
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
