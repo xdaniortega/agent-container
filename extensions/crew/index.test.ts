@@ -25,6 +25,16 @@ import crewExtension, {
   resolveParallelReviewAgent,
   assertValidTierName,
   type ModelTiers,
+  buildHandoff,
+  selectHandoffEntries,
+  serializeSessionEntries,
+  findCheckpoint,
+  findCurrentCrewLaunch,
+  userBoundaryIndex,
+  visibleMessageText,
+  type SessionEntryLike,
+  type ContextMode,
+  type CheckpointFallback,
   extractMarkerOutput,
   updateMarkerOutput,
   findReusableRolePane,
@@ -1366,4 +1376,278 @@ await regressionTest("snapshot-bound submission rejects stale reviewer launch be
     await assert.rejects(() => prepareDurableLaunch({ enabled: true, baseCommand: "pi", cwd: repo, role: "reviewer", taskId: "task-snapshot", runId: owner.runId, ownerSessionId: "snapshot-owner" }), /snapshot is stale/);
     assert.equal((await readTaskAttempt(owner, "task-snapshot", 1)).status, "submitted");
   } finally { rmSync(repo, { recursive: true, force: true }); rmSync(stateRoot, { recursive: true, force: true }); }
+});
+
+test("handoff boundary uses last completed crew_launch checkpoint, recent-turns fallback when none", () => {
+  const currentToolCallId = "call-current-123";
+  const branch: SessionEntryLike[] = [
+    { id: "e1", type: "message", message: { role: "user", content: "Initial user instruction" } },
+    { id: "e2", type: "message", message: { role: "assistant", content: "Starting initial scout..." } },
+    {
+      id: "e3",
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "crew_launch",
+        toolCallId: "call-scout-1",
+        isError: false,
+        content: "Scout complete: mapped files.",
+        details: { complete: true, role: "scout" },
+      },
+    },
+    { id: "e4", type: "message", message: { role: "user", content: "Great, now implement phase 1." } },
+    { id: "e5", type: "message", message: { role: "assistant", content: "Starting executor..." } },
+    {
+      id: "e6",
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Launching executor delegation" },
+          { type: "toolCall", id: currentToolCallId, name: "crew_launch" },
+        ],
+      },
+    },
+  ];
+
+  // Case 1: Checkpoint found
+  const handoffWithCheckpoint = buildHandoff(branch, currentToolCallId, "since-last-crew");
+  assert.equal(handoffWithCheckpoint.fallbackUsed, false);
+  assert.equal(handoffWithCheckpoint.checkpointEntryId, "e3");
+  assert.ok(handoffWithCheckpoint.text.includes("Scout complete: mapped files."));
+  assert.ok(handoffWithCheckpoint.text.includes("Great, now implement phase 1."));
+  assert.ok(handoffWithCheckpoint.text.includes("Starting executor..."));
+  assert.ok(!handoffWithCheckpoint.text.includes("Initial user instruction"));
+
+  // Case 2: No checkpoint on branch -> fallback to recent user turns
+  const branchNoCheckpoint: SessionEntryLike[] = [
+    { id: "e1", type: "message", message: { role: "user", content: "Turn 1: hello" } },
+    { id: "e2", type: "message", message: { role: "assistant", content: "Reply 1" } },
+    { id: "e3", type: "message", message: { role: "user", content: "Turn 2: do research" } },
+    { id: "e4", type: "message", message: { role: "assistant", content: "Reply 2" } },
+    { id: "e5", type: "message", message: { role: "user", content: "Turn 3: launch now" } },
+    {
+      id: "e6",
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: currentToolCallId, name: "crew_launch" },
+        ],
+      },
+    },
+  ];
+
+  const handoffFallback = buildHandoff(branchNoCheckpoint, currentToolCallId, "since-last-crew", "recent", 2);
+  assert.equal(handoffFallback.fallbackUsed, true);
+  assert.equal(handoffFallback.checkpointEntryId, undefined);
+  assert.ok(handoffFallback.text.includes("Turn 2: do research"));
+  assert.ok(handoffFallback.text.includes("Reply 2"));
+  assert.ok(handoffFallback.text.includes("Turn 3: launch now"));
+  assert.ok(!handoffFallback.text.includes("Turn 1: hello"));
+
+  // Case 3: No checkpoint and fallback="error" -> throws
+  assert.throws(
+    () => buildHandoff(branchNoCheckpoint, currentToolCallId, "since-last-crew", "error"),
+    /no successful complete crew_launch checkpoint/
+  );
+
+  // Case 4: No checkpoint and fallback="explicit" -> returns explicit text
+  const handoffExplicitFallback = buildHandoff(branchNoCheckpoint, currentToolCallId, "since-last-crew", "explicit", 2, 24000, "fallback explicit text");
+  assert.equal(handoffExplicitFallback.fallbackUsed, true);
+  assert.equal(handoffExplicitFallback.text, "fallback explicit text");
+});
+
+test("noise filtering drops thinking, compacts toolCall, placeholders images, and drops orphan tool results", () => {
+  // Test entry with thinking, toolCall, image, and text
+  const mixedEntry: SessionEntryLike = {
+    id: "m1",
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Internal reasoning chain that should be stripped." },
+        { type: "thinkingSignature", signature: "sig123" },
+        { type: "text", text: "Visible assistant explanation." },
+        { type: "toolCall", id: "tc-grep-1", name: "grep" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+      ],
+    },
+  };
+
+  const text = visibleMessageText(mixedEntry);
+  assert.ok(!text.includes("Internal reasoning chain"));
+  assert.ok(!text.includes("sig123"));
+  assert.ok(text.includes("Visible assistant explanation."));
+  assert.ok(text.includes("[tool call: grep id=tc-grep-1]"));
+  assert.ok(text.includes("[image]"));
+
+  // Test dropping orphan tool results
+  const entriesWithOrphan: SessionEntryLike[] = [
+    {
+      id: "orphan-1",
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "bash",
+        toolCallId: "tc-missing-call",
+        content: "Orphan output that has no matching tool call in this slice",
+      },
+    },
+    {
+      id: "parent-call-msg",
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tc-valid-1", name: "read" }],
+      },
+    },
+    {
+      id: "valid-tool-result",
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "read",
+        toolCallId: "tc-valid-1",
+        content: "Valid tool output",
+      },
+    },
+  ];
+
+  const filtered = selectHandoffEntries(entriesWithOrphan);
+  assert.equal(filtered.length, 2);
+  assert.equal(filtered[0].id, "parent-call-msg");
+  assert.equal(filtered[1].id, "valid-tool-result");
+  const serialized = serializeSessionEntries(filtered);
+  assert.ok(!serialized.includes("Orphan output"));
+  assert.ok(serialized.includes("Valid tool output"));
+});
+
+test("redaction applied to pushed handoff", () => {
+  const branchWithSecrets: SessionEntryLike[] = [
+    {
+      id: "s1",
+      type: "message",
+      message: {
+        role: "user",
+        content: [
+          "Connect with credentials:",
+          "apiKey: 'sk-super-secret-key-12345'",
+          "Authorization: Bearer super-secret-bearer-token-abc",
+          "-----BEGIN RSA PRIVATE KEY-----",
+          "MIIEowIBAAKCAQEA0m4secretbytes...",
+          "-----END RSA PRIVATE KEY-----",
+        ].join("\n"),
+      },
+    },
+  ];
+
+  const handoff = buildHandoff(branchWithSecrets, undefined, "since-last-crew");
+  assert.ok(!handoff.text.includes("sk-super-secret-key-12345"));
+  assert.ok(!handoff.text.includes("super-secret-bearer-token-abc"));
+  assert.ok(!handoff.text.includes("MIIEowIBAAKCAQEA0m4secretbytes..."));
+  assert.ok(handoff.text.includes("apiKey: [redacted]"));
+  assert.ok(handoff.text.includes("Authorization: [redacted]"));
+  assert.ok(handoff.text.includes("[credential redacted]"));
+});
+
+test("maxHandoffChars cap enforced (oversized handoff truncated)", () => {
+  const largeBranch: SessionEntryLike[] = [
+    {
+      id: "l1",
+      type: "message",
+      message: {
+        role: "user",
+        content: "A".repeat(500),
+      },
+    },
+  ];
+
+  const handoffCapped = buildHandoff(largeBranch, undefined, "since-last-crew", "recent", 6, 120);
+  assert.equal(handoffCapped.text.length, 120);
+});
+
+test("default explicit mode injects no parent context", () => {
+  const branch: SessionEntryLike[] = [
+    { id: "e1", type: "message", message: { role: "user", content: "Secret parent conversation" } },
+  ];
+
+  // buildHandoff in explicit mode returns explicit text only
+  const explicitHandoff = buildHandoff(branch, undefined, "explicit", "recent", 6, 24000, "user-supplied explicit context");
+  assert.equal(explicitHandoff.text, "user-supplied explicit context");
+  assert.deepEqual(explicitHandoff.entries, []);
+  assert.equal(explicitHandoff.fallbackUsed, false);
+
+  // buildRolePrompt default (no contextMode or explicit mode)
+  const role = resolveRole("scout", {});
+  const prompt = buildRolePrompt("scout", role, "Investigate bug", "/repo", { context: "user-supplied explicit context" });
+  assert.ok(!prompt.includes("## Brain handoff (verbatim)"));
+  assert.ok(!prompt.includes("Secret parent conversation"));
+  assert.ok(prompt.includes("## Context\nuser-supplied explicit context"));
+  assert.ok(prompt.includes("You do not have access to the parent agent's conversation."));
+
+  // buildRolePrompt with since-last-crew produces ## Brain handoff (verbatim)
+  const handoffPrompt = buildRolePrompt("scout", role, "Investigate bug", "/repo", {
+    contextMode: "since-last-crew",
+    handoffText: "Serialized brain entries here",
+  });
+  assert.ok(handoffPrompt.includes("## Brain handoff (verbatim)\n~~~text\nSerialized brain entries here\n~~~\n## End brain handoff"));
+
+  // since-last-crew without handoffText falls back to normal explicit context rendering without brain handoff block
+  const noHandoffPrompt = buildRolePrompt("scout", role, "Investigate bug", "/repo", {
+    contextMode: "since-last-crew",
+    context: "explicit only",
+  });
+  assert.ok(!noHandoffPrompt.includes("## Brain handoff (verbatim)"));
+  assert.ok(noHandoffPrompt.includes("## Context\nexplicit only"));
+});
+
+test("maxHandoffChars boundary truncation cannot re-expose secrets", () => {
+  const secret = "super-secret-api-token-value-12345";
+  const branchWithSecret: SessionEntryLike[] = [
+    {
+      id: "sec-1",
+      type: "message",
+      message: {
+        role: "user",
+        content: `Prefix text before secret token. apiKey: '${secret}' and trailing notes.`,
+      },
+    },
+  ];
+
+  const unbudgeted = buildHandoff(branchWithSecret, undefined, "since-last-crew");
+  assert.ok(unbudgeted.text.includes("apiKey: [redacted]"));
+  assert.ok(!unbudgeted.text.includes(secret));
+
+  const marker = "[redacted]";
+  const markerIndex = unbudgeted.text.indexOf(marker);
+  assert.ok(markerIndex > 0);
+
+  for (const offset of [0, 4, marker.length, marker.length + 3]) {
+    const cutLimit = markerIndex + offset;
+    const truncatedHandoff = buildHandoff(branchWithSecret, undefined, "since-last-crew", "recent", 6, cutLimit);
+    assert.equal(truncatedHandoff.text.length, cutLimit);
+    assert.ok(!truncatedHandoff.text.includes(secret));
+    assert.ok(!truncatedHandoff.text.includes("super-secret"));
+  }
+});
+
+test("crew_launch parameter validation enforces valid contextMode, checkpointFallback, and positive numbers", async () => {
+  const mockPi = { registerTool() {}, async exec() { return { code: 0, stdout: "", stderr: "" }; } };
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", contextMode: "invalid" as any } as any),
+    /contextMode must be explicit or since-last-crew/
+  );
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", checkpointFallback: "invalid" as any } as any),
+    /checkpointFallback must be recent, explicit, or error/
+  );
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", recentTurns: -1 } as any),
+    /recentTurns must be a positive integer/
+  );
+  await assert.rejects(
+    () => executeCrewLaunch(mockPi as any, { role: "scout", task: "task", maxHandoffChars: 0 } as any),
+    /maxHandoffChars must be a positive integer/
+  );
 });

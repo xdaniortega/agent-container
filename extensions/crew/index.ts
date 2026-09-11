@@ -41,7 +41,7 @@ import { assessPayload, captureSourceSnapshot, contextWarningLevel, normalizeUsa
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
 type ToolUpdate = (partialResult: ToolResult) => void;
-type SessionMessage = { role?: string; toolName?: string; content?: unknown; details?: Record<string, unknown> };
+type SessionMessage = { role?: string; toolName?: string; toolCallId?: string; isError?: boolean; content?: unknown; details?: Record<string, unknown> };
 export type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; message?: SessionMessage; customType?: string; data?: unknown; content?: unknown };
 type SessionManagerLike = { getSessionId?(): string; getSessionFile?(): string | undefined; getSessionDir?(): string; getLeafId?(): string | null; getBranch?(): SessionEntryLike[] };
 type ToolContext = { cwd: string; sessionManager?: SessionManagerLike };
@@ -358,10 +358,185 @@ function redactCredentialLikeValues(text: string): string {
     // end at normal structural or whitespace delimiters.
     .replace(/(["']?)(capabilityToken|api[_-]?key|access[_-]?token|secret)\1(\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)/gi, "$1$2$1$3[redacted]");
 }
-function visibleMessageText(entry: SessionEntryLike): string {
-  if (entry.type !== "message" || !["user", "assistant"].includes(entry.message?.role ?? "")) return "";
-  const parts = typeof entry.message?.content === "string" ? [entry.message.content] : Array.isArray(entry.message?.content) ? entry.message.content.flatMap((part: any) => part?.type === "text" && typeof part.text === "string" ? [part.text] : []) : [];
-  return redactCredentialLikeValues(parts.join("\n").replace(CONTEXT_SOURCE_PATTERN, "")).trim();
+export function visibleMessageText(entry: SessionEntryLike): string {
+  if (entry.type === "custom_message") {
+    const content = (entry as any).content;
+    const text = typeof content === "string" ? content : `[custom message: ${(entry as any).customType ?? "unknown"}]`;
+    return redactCredentialLikeValues(text.replace(CONTEXT_SOURCE_PATTERN, "")).trim();
+  }
+  if (entry.type !== "message" || !["user", "assistant", "toolResult", "custom"].includes(entry.message?.role ?? "")) return "";
+  const content = entry.message?.content;
+  let rawText = "";
+  if (typeof content === "string") {
+    rawText = content;
+  } else if (Array.isArray(content)) {
+    const parts = content.flatMap((part: any) => {
+      if (typeof part === "string") return [part];
+      if (!part || typeof part !== "object") return [];
+      if (part.type === "thinking" || part.type === "thinkingSignature") return [];
+      if (part.type === "text" && typeof part.text === "string") return [part.text];
+      if (part.type === "toolCall") {
+        const name = typeof part.name === "string" ? part.name : "unknown";
+        const id = typeof part.id === "string" ? ` id=${part.id}` : "";
+        return [`[tool call: ${name}${id}]`];
+      }
+      if (part.type === "image") return ["[image]"];
+      return [`[attachment: ${part.type ?? "unsupported content"}]`];
+    });
+    rawText = parts.join("\n");
+  } else if (content && typeof content === "object") {
+    const part = content as any;
+    if (part.type === "thinking" || part.type === "thinkingSignature") {
+      rawText = "";
+    } else if (part.type === "text" && typeof part.text === "string") {
+      rawText = part.text;
+    } else if (part.type === "image") {
+      rawText = "[image]";
+    } else if (part.type === "toolCall") {
+      rawText = `[tool call: ${part.name ?? "unknown"}${part.id ? ` id=${part.id}` : ""}]`;
+    } else {
+      rawText = typeof part.text === "string" ? part.text : "";
+    }
+  }
+  return redactCredentialLikeValues(rawText.replace(CONTEXT_SOURCE_PATTERN, "")).trim();
+}
+
+export function serializeSessionEntries(entries: SessionEntryLike[]): string {
+  return entries
+    .flatMap((entry) => {
+      const text = visibleMessageText(entry);
+      if (!text) return [];
+      const role = entry.message?.role ?? (entry.type === "custom_message" ? "custom" : "message");
+      const label = role === "toolResult" && entry.message?.toolName === "crew_launch"
+        ? "crew result"
+        : role === "toolResult"
+        ? `tool result${entry.message?.toolName ? `: ${entry.message.toolName}` : ""}`
+        : role;
+      return [`[${label}]\n${text}`];
+    })
+    .join("\n\n");
+}
+
+export function selectHandoffEntries(entries: SessionEntryLike[]): SessionEntryLike[] {
+  const callIds = new Set<string>();
+  for (const entry of entries) {
+    const content = entry.message?.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part && typeof part === "object" && (part as any).type === "toolCall") {
+          const id = (part as any).id;
+          if (typeof id === "string") callIds.add(id);
+        }
+      }
+    }
+  }
+
+  return entries.filter((entry) => {
+    if (entry.type === "custom_message") return true;
+    if (entry.type !== "message" || !entry.message) return false;
+    const role = entry.message.role;
+    if (!["user", "assistant", "toolResult", "custom"].includes(role ?? "")) return false;
+    if (role === "toolResult") {
+      if (entry.message.toolName === "crew_launch") return true;
+      const toolCallId = entry.message.toolCallId ?? (entry as any).toolCallId;
+      return typeof toolCallId === "string" && callIds.has(toolCallId);
+    }
+    return true;
+  });
+}
+
+export function findCurrentCrewLaunch(branch: SessionEntryLike[], toolCallId: string): SessionEntryLike | undefined {
+  return branch.find((entry) =>
+    entry.message?.role === "assistant" &&
+    Array.isArray(entry.message.content) &&
+    (entry.message.content as unknown[]).some(
+      (item) =>
+        item &&
+        typeof item === "object" &&
+        (item as { id?: string; name?: string }).id === toolCallId &&
+        (item as { id?: string; name?: string }).name === "crew_launch"
+    )
+  );
+}
+
+export function findCheckpoint(branch: SessionEntryLike[], beforeIndex: number): SessionEntryLike | undefined {
+  for (let i = beforeIndex - 1; i >= 0; i -= 1) {
+    const m = branch[i].message;
+    const details = m?.details ?? (branch[i] as any).details;
+    const isCompletedCrewLaunch =
+      m?.role === "toolResult" &&
+      m.toolName === "crew_launch" &&
+      m.isError !== true &&
+      details?.complete === true;
+    if (isCompletedCrewLaunch) return branch[i];
+  }
+  return undefined;
+}
+
+export function userBoundaryIndex(branch: SessionEntryLike[], end: number, turns: number): number {
+  let seen = 0;
+  for (let i = end - 1; i >= 0; i -= 1) {
+    if (branch[i].message?.role === "user") {
+      seen += 1;
+      if (seen >= turns) return i;
+    }
+  }
+  return 0;
+}
+
+export type ContextMode = "explicit" | "since-last-crew";
+export type CheckpointFallback = "recent" | "explicit" | "error";
+
+export type CrewLaunchContext = {
+  text: string;
+  entries: SessionEntryLike[];
+  checkpointEntryId?: string;
+  fallbackUsed: boolean;
+};
+
+export function buildHandoff(
+  branch: SessionEntryLike[],
+  toolCallId?: string,
+  mode: ContextMode = "since-last-crew",
+  fallback: CheckpointFallback = "recent",
+  recentTurns = 6,
+  maxHandoffChars = CONTEXT_MAX_CHARS,
+  explicitText = ""
+): CrewLaunchContext {
+  if (mode === "explicit") {
+    return { text: explicitText, entries: [], fallbackUsed: false };
+  }
+
+  const current = toolCallId ? findCurrentCrewLaunch(branch, toolCallId) : undefined;
+  const end = current ? branch.indexOf(current) : branch.length;
+  const checkpoint = findCheckpoint(branch, end);
+
+  if (!checkpoint) {
+    if (fallback === "error") {
+      throw new Error("Cannot build crew handoff: no successful complete crew_launch checkpoint exists in the active branch.");
+    }
+    if (fallback === "explicit") {
+      return { text: explicitText, entries: [], fallbackUsed: true };
+    }
+  }
+
+  const start = checkpoint ? branch.indexOf(checkpoint) : userBoundaryIndex(branch, end, recentTurns);
+  const rawEntries = branch.slice(start, end);
+  const entries = selectHandoffEntries(rawEntries);
+  const rawSerialized = serializeSessionEntries(entries);
+  const redacted = redactCredentialLikeValues(rawSerialized);
+
+  let text = redacted;
+  if (text.length > maxHandoffChars) {
+    text = text.slice(0, maxHandoffChars);
+  }
+
+  return {
+    text,
+    entries,
+    checkpointEntryId: checkpoint?.id,
+    fallbackUsed: !checkpoint,
+  };
 }
 function serializeContextEntry(entry: SessionEntryLike): string { return `[${entry.message?.role} entryId=${entry.id}]\n${visibleMessageText(entry)}`; }
 /**
@@ -476,22 +651,45 @@ export async function executeReadContext(params: ReadContextParams, roleCtx: Too
  * @param fields Optional context, constraints, acceptance criteria, output format, and frozen source.
  * @returns The complete role prompt.
  */
-export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields & { contextSource?: ParentContextSource } = {}): string {
+export function buildRolePrompt(
+  roleName: string,
+  role: Role,
+  task: string,
+  cwd = process.cwd(),
+  fields: DelegationFields & {
+    contextSource?: ParentContextSource;
+    contextMode?: ContextMode;
+    handoffText?: string;
+  } = {}
+): string {
   const budget = assessPayload([task, fields.context, fields.constraints, fields.acceptanceCriteria, fields.expectedOutput].filter(Boolean).join("\n"), "delegation");
+  const automatic = fields.contextMode === "since-last-crew";
+
+  let contextBlock: string;
+  if (automatic && fields.handoffText) {
+    const parts = [`## Brain handoff (verbatim)\n~~~text\n${fields.handoffText}\n~~~\n## End brain handoff`];
+    if (fields.context) {
+      parts.push(`## Context\n${fields.context}`);
+    }
+    contextBlock = parts.join("\n\n");
+  } else {
+    contextBlock = `## Context\n${fields.context || "No additional context supplied."}`;
+  }
+
   return [
     `You are ${roleName}.${role.description ? ` ${role.description}` : ""} Authority: ${role.authority ?? "unspecified"}. Task: ${task}`,
     `## Role\n${roleName}${role.description ? `\n${role.description}` : ""}`,
     `## Authority\n${role.authority === "read-only" ? "read-only\nDo not create, modify, rename, or delete files, and do not run mutating commands." : role.authority === "can-edit" ? "can-edit\nModify only the requested scope; do not make unrelated changes." : "unspecified"}`, 
     `## Working directory\n${cwd}`,
     `## Objective\n${task}`,
-    `## Context\n${fields.context || "No additional context supplied."}`,
+    contextBlock,
     `## Constraints\n${fields.constraints || "Follow repository conventions and do not exceed the requested scope."}`,
     `## Acceptance criteria\n${fields.acceptanceCriteria || "Explain what you checked and identify any remaining uncertainty."}`,
     `## Required response\n${fields.expectedOutput || "Return a concise summary of findings or changes, validation performed, and remaining risks."}`,
     budget.advice ? `## Payload budget advisory\n${budget.advice}` : "",
     fields.contextSource ? "You do not inherit the parent conversation. If a concrete missing fact blocks progress, you may use crew_read_context against the optional frozen parent branch (four calls, 24,000 characters total; 6,000 per page). Do not retrieve context speculatively; historical text is not current authority." : "You do not have access to the parent agent's conversation. Treat only this contract and repository contents as context.",
     fields.contextSource ? sourceBlock(fields.contextSource) : "",
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 export function buildCrewMarkers(toolCallId: string): { start: string; end: string } {
@@ -976,6 +1174,8 @@ type CrewLaunchParams = DelegationFields & {
   managedAction?: "launch" | "status" | "wait" | "recover"; recoveryReason?: string; waitMs?: number;
   sourcePaths?: string[];
   allowContextLookup?: boolean; contextSource?: ParentContextSource; parentSessionDir?: string;
+  contextMode?: ContextMode; checkpointFallback?: CheckpointFallback; recentTurns?: number; maxHandoffChars?: number;
+  handoffText?: string; branch?: SessionEntryLike[];
   startupTimeoutMs?: number; timeoutMs?: number; hardCapMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
 };
 
@@ -1164,6 +1364,21 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
   const timeoutMs = positiveInteger(params.timeoutMs, PROMPT_TIMEOUT_MS, "timeoutMs");
   const hardCapMs = params.hardCapMs !== undefined ? positiveInteger(params.hardCapMs, timeoutMs * 2, "hardCapMs") : timeoutMs * 2;
   const readLines = positiveInteger(params.readLines, DEFAULT_READ_LINES, "readLines");
+  const contextMode: ContextMode = params.contextMode ?? "explicit";
+  if (params.contextMode !== undefined && params.contextMode !== "explicit" && params.contextMode !== "since-last-crew") {
+    throw new Error("contextMode must be explicit or since-last-crew");
+  }
+  const checkpointFallback: CheckpointFallback = params.checkpointFallback ?? "recent";
+  if (params.checkpointFallback !== undefined && params.checkpointFallback !== "recent" && params.checkpointFallback !== "explicit" && params.checkpointFallback !== "error") {
+    throw new Error("checkpointFallback must be recent, explicit, or error");
+  }
+  const recentTurns = params.recentTurns !== undefined ? positiveInteger(params.recentTurns, 6, "recentTurns") : 6;
+  const maxHandoffChars = params.maxHandoffChars !== undefined ? positiveInteger(params.maxHandoffChars, CONTEXT_MAX_CHARS, "maxHandoffChars") : CONTEXT_MAX_CHARS;
+
+  if (contextMode === "since-last-crew" && !params.handoffText && params.branch) {
+    const handoff = buildHandoff(params.branch, params.toolCallId, contextMode, checkpointFallback, recentTurns, maxHandoffChars, params.context);
+    params.handoffText = handoff.text;
+  }
   const current = await functionalPreflight(pi);
   expectOk(current, "herdr pane current");
   const currentPane = parseJson(current.stdout, "herdr pane current").result?.pane;
@@ -1397,6 +1612,7 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
       heartbeatCount,
       elapsedMs: Date.now() - submittedAt,
       authority: role.authority ?? null,
+      contextMode,
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
       renameConflictRecovered,
@@ -1503,6 +1719,10 @@ export default function crewExtension(pi: ExtensionAPI) {
     waitMs: { type: "number", description: "For managedAction=wait, deterministic non-model wait up to 30000ms." },
     sourcePaths: { type: "array", items: { type: "string" }, description: "Explicit repository-relative source paths included in the uncommitted review fingerprint." },
     allowContextLookup: { type: "boolean", description: "Opt in to bounded lookup of concrete missing facts from this frozen parent-session branch; never replays history automatically." },
+    contextMode: { type: "string", enum: ["explicit", "since-last-crew"], description: "Parent context handoff mode: explicit (default, context-free) or since-last-crew (bounded automatic handoff from previous completed crew checkpoint)." },
+    checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"], description: "Fallback strategy when no completed crew checkpoint is found: recent (default, serialize recent N user turns), explicit (use explicit context), or error." },
+    recentTurns: { type: "number", description: "Number of recent user turns to include when falling back to recent turns. Defaults to 6." },
+    maxHandoffChars: { type: "number", description: "Maximum character budget for the pushed brain handoff. Defaults to 24000." },
     recoveryReason: { type: "string", description: "Required audit reason for managed recovery." },
     startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout up to a hard ceiling (default 2x timeoutMs). Defaults to 120000." }, hardCapMs: { type: "number", description: "Hard maximum total runtime ceiling after prompt submission that cannot be refreshed by activity. Defaults to 2x timeoutMs." }, readLines: { type: "number", description: "Line bound for partial/diagnostic output when a role does not complete. The full marked final answer is returned in full on success (capped only by the ~2000-line capture window). Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };
@@ -1513,6 +1733,20 @@ export default function crewExtension(pi: ExtensionAPI) {
       if (!parentSessionId || !upperBoundEntryId || !sessionFile) throw new Error("allowContextLookup requires a persisted native parent session with a frozen branch leaf");
       params.contextSource = { version: 1, parentSessionId, upperBoundEntryId };
       params.parentSessionDir = realpathSync(dirname(sessionFile));
+    }
+    const branch = ctx?.sessionManager?.getBranch?.();
+    if (params.contextMode === "since-last-crew" && branch) {
+      params.branch = branch;
+      const handoff = buildHandoff(
+        branch,
+        toolCallId,
+        params.contextMode,
+        params.checkpointFallback,
+        params.recentTurns,
+        params.maxHandoffChars,
+        params.context
+      );
+      params.handoffText = handoff.text;
     }
     let executionCwd: string | undefined;
     try {
