@@ -19,6 +19,12 @@ import crewExtension, {
   chooseAgentName,
   compactRoleOutput,
   configCandidates,
+  modelTiersCandidates,
+  loadModelTiers,
+  resolveModelTier,
+  resolveParallelReviewAgent,
+  assertValidTierName,
+  type ModelTiers,
   extractMarkerOutput,
   updateMarkerOutput,
   findReusableRolePane,
@@ -149,8 +155,8 @@ test("resolveQueueKey derives authority from resolved config so overrides serial
   try {
     mkdirSync(join(tempDir, ".pi"), { recursive: true });
     writeFileSync(
-      join(tempDir, ".pi", "crew.config.json"),
-      JSON.stringify({ roles: { scout: { authority: "can-edit" } } })
+      join(tempDir, ".pi", "model-tiers.json"),
+      JSON.stringify({ crewRoles: { scout: { authority: "can-edit" } } })
     );
 
     const scoutDetails = resolveQueueKey("scout", tempDir);
@@ -253,7 +259,7 @@ test("unknown roles are rejected", () => {
 
 test("invalid configured authority and model are rejected", () => {
   assert.throws(() => resolveRole("scout", { roles: { scout: { authority: "write-all" as never } } }), /Invalid authority/);
-  assert.throws(() => resolveRole("scout", { roles: { scout: { model: "bad model" } } }), /Invalid model/);
+  assert.throws(() => resolveRole("scout", { roles: { scout: { model: "bad/model with space" } } }), /Invalid model/);
 });
 
 test("role names must be Herdr-compatible", () => {
@@ -264,14 +270,15 @@ test("role names must be Herdr-compatible", () => {
 });
 
 test("config candidates prefer project config before global config", () => {
-  assert.deepEqual(configCandidates("/repo", "/home/me"), [
-    "/repo/.pi/crew.config.json",
-    "/repo/.pi/skills/crew/crew.config.json",
-    "/repo/skills/crew/crew.config.json",
-    "/.pi/crew.config.json",
-    "/home/me/.pi/agent/skills/crew/crew.config.json",
-    "/home/me/.pi/crew.config.json",
+  assert.deepEqual(modelTiersCandidates("/repo", "/home/me"), [
+    "/repo/.pi/model-tiers.json",
+    "/repo/.pi/skills/crew/model-tiers.json",
+    "/repo/skills/crew/model-tiers.json",
+    "/.pi/model-tiers.json",
+    "/home/me/.pi/agent/skills/crew/model-tiers.json",
+    "/home/me/.pi/model-tiers.json",
   ]);
+  assert.deepEqual(configCandidates("/repo", "/home/me"), modelTiersCandidates("/repo", "/home/me"));
 });
 
 test("reuse eligibility requires same role, idle or done, workspace, cwd, and pane", () => {
@@ -1088,7 +1095,7 @@ await regressionTest("actual managed completion wiring refuses marker-only succe
   try {
     await import("node:child_process").then(({ execFileSync }) => execFileSync("git", ["init", "-q", repo]));
     mkdirSync(join(repo, ".pi"), { recursive: true });
-    writeFileSync(join(repo, ".pi", "crew.config.json"), JSON.stringify({ roles: { executor: { authority: "can-edit" } } }));
+    writeFileSync(join(repo, ".pi", "model-tiers.json"), JSON.stringify({ crewRoles: { executor: { authority: "can-edit" } } }));
     const agent = { name: "executor", pane_id: "pane-managed", workspace_id: "ws", tab_id: "tab", cwd: repo, agent_status: "idle" };
     let paneCreated = false;
     const mockPi = { registerTool() {}, async exec(command: string, args: string[] = []) {
@@ -1239,13 +1246,107 @@ await regressionTest("cleanup preview retains live blockers and finalization is 
 });
 
 test("model effort, advisory budgets, and normalized current-context warnings are explicit", () => {
-  const permanent = JSON.parse(readFileSync(join(process.cwd(), "skills", "crew", "crew.config.json"), "utf8"));
-  assert.deepEqual(Object.fromEntries(Object.entries(permanent.roles).map(([name, value]: [string, any]) => [name, [value.model, value.effort]])), { scout: ["google/gemini-3.8-flash", "medium"], oracle: ["anthropic/claude-opus-5", "xhigh"], executor: ["google/gemini-3.8-flash", "medium"], reviewer: ["anthropic/claude-opus-5", "xhigh"] });
-  const tiers = JSON.parse(readFileSync(join(process.cwd(), "skills", "crew", "model-tiers.json"), "utf8")).parallelCodeReview;
-  assert.deepEqual(tiers.synthesis, { model: "anthropic/claude-opus-4-8", effort: "medium" }); assert.equal(tiers.small.effort, "low");
+  const permanent = JSON.parse(readFileSync(join(process.cwd(), "skills", "crew", "model-tiers.json"), "utf8"));
+  assert.deepEqual(permanent.models, {
+    frontier: "anthropic/claude-opus-5",
+    medium: "anthropic/claude-opus-4-8",
+    small: "google/gemini-3.8-flash",
+  });
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(permanent.crewRoles).map(([name, value]: [string, any]) => [
+        name,
+        [value.model, value.reasoning, value.authority],
+      ])
+    ),
+    {
+      scout: ["medium", "medium", "read-only"],
+      oracle: ["frontier", "xhigh", "read-only"],
+      executor: ["small", "medium", "can-edit"],
+      "executor-escalation": ["medium", "medium", "can-edit"],
+      reviewer: ["frontier", "xhigh", "read-only"],
+    }
+  );
+
+  // resolveRole resolves tiers to concrete Opus5/Opus4.8/Gemini + correct reasoning:
+  const scoutRole = resolveRole("scout", permanent);
+  assert.equal(scoutRole.model, "anthropic/claude-opus-4-8");
+  assert.equal(scoutRole.reasoning, "medium");
+  assert.equal(scoutRole.effort, "medium");
+  assert.equal(scoutRole.tier, "medium");
+
+  const oracleRole = resolveRole("oracle", permanent);
+  assert.equal(oracleRole.model, "anthropic/claude-opus-5");
+  assert.equal(oracleRole.reasoning, "xhigh");
+
+  const executorRole = resolveRole("executor", permanent);
+  assert.equal(executorRole.model, "google/gemini-3.8-flash");
+  assert.equal(executorRole.reasoning, "medium");
+
+  const reviewerRole = resolveRole("reviewer", permanent);
+  assert.equal(reviewerRole.model, "anthropic/claude-opus-5");
+  assert.equal(reviewerRole.reasoning, "xhigh");
+
+  // Parallel review agent resolution:
+  const reviewTiers = permanent.parallelCodeReview;
+  assert.deepEqual(reviewTiers.synthesis, { model: "medium", reasoning: "medium" });
+  assert.equal(reviewTiers.testRunner.reasoning, "low");
+  const resolvedSynthesis = resolveParallelReviewAgent("synthesis", permanent);
+  assert.equal(resolvedSynthesis.model, "anthropic/claude-opus-4-8");
+  assert.equal(resolvedSynthesis.reasoning, "medium");
+  const resolvedTestRunner = resolveParallelReviewAgent("testRunner", permanent);
+  assert.equal(resolvedTestRunner.model, "google/gemini-3.8-flash");
+  assert.equal(resolvedTestRunner.reasoning, "low");
+
+  // Legacy parallelCodeReview inline concrete form:
+  const legacyReviewConfig: ModelTiers = {
+    parallelCodeReview: {
+      synthesis: { model: "anthropic/claude-opus-4-8", effort: "medium" },
+    },
+  };
+  const resolvedLegacy = resolveParallelReviewAgent("synthesis", legacyReviewConfig);
+  assert.equal(resolvedLegacy.model, "anthropic/claude-opus-4-8");
+  assert.equal(resolvedLegacy.reasoning, "medium");
+
+  // Inline concrete model override beats tier:
+  const overrideConfig: ModelTiers = {
+    models: { medium: "anthropic/claude-opus-4-8" },
+    crewRoles: {
+      scout: { model: "custom-provider/custom-model", reasoning: "high", authority: "read-only" },
+    },
+  };
+  const overriddenRole = resolveRole("scout", overrideConfig);
+  assert.equal(overriddenRole.model, "custom-provider/custom-model");
+  assert.equal(overriddenRole.reasoning, "high");
+  assert.equal(overriddenRole.tier, undefined);
+
+  // Unknown model tier throws:
+  assert.throws(
+    () => resolveRole("scout", { models: { small: "google/gemini-3.8-flash" }, crewRoles: { scout: { model: "frontier" } } }),
+    /Unknown model tier/
+  );
+  assert.throws(
+    () => resolveModelTier("nonexistent", { models: { small: "google/gemini-3.8-flash" } }),
+    /Unknown model tier/
+  );
+
+  // Reasoning must be a valid THINKING_LEVELS value:
+  assert.throws(
+    () => resolveRole("scout", { crewRoles: { scout: { reasoning: "turbo" as any } } }),
+    /Invalid effort/
+  );
+  assert.throws(
+    () => resolveRole("scout", { crewRoles: { scout: { effort: "turbo" as any } } }),
+    /Invalid effort/
+  );
+
+  // Missing config file / empty config -> undefined model (env default), no throw:
+  const emptyRole = resolveRole("executor", {});
+  assert.equal(emptyRole.model, undefined);
+  assert.equal(emptyRole.reasoning, undefined);
+  assert.equal(emptyRole.authority, "can-edit");
+
   assert.equal(buildRoleCommand("pi", "provider/model", "can-edit", undefined, "medium"), "pi --approve --model provider/model --thinking medium");
-  assert.equal(resolveRole("scout", { roles: { scout: { model: "provider/model", effort: "medium", authority: "read-only" } } } as any).effort, "medium");
-  assert.throws(() => resolveRole("scout", { roles: { scout: { effort: "turbo" } } } as any), /Invalid effort/);
   assert.equal(assessPayload("x".repeat(9000), "delegation").overBudget, true);
   assert.deepEqual(normalizeUsage({ input: 10, cacheRead: 20, cacheWrite: 30, output: 5, reasoning: 999, cost: { total: 1.25 } }), { inputTokens: 10, outputTokens: 5, cacheReadTokens: 20, cacheWriteTokens: 30, currentContextTokens: 60, cost: 1.25 });
   assert.equal(contextWarningLevel(74999), "none"); assert.equal(contextWarningLevel(75000), "warn"); assert.equal(contextWarningLevel(70000, "warn"), "warn"); assert.equal(contextWarningLevel(64999, "warn"), "none"); assert.equal(contextWarningLevel(125000), "checkpoint"); assert.equal(contextWarningLevel(116000, "checkpoint"), "checkpoint");

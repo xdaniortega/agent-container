@@ -34,52 +34,59 @@ Custom roles may be added in crew config. Unknown roles should not be invented; 
 
 ## Config
 
-`crew_launch` and `crew_rules` read crew config for role descriptions, authorities, and launch models.
+`crew_launch` and `crew_rules` read crew config from `model-tiers.json` for model tier mappings, role descriptions, authorities, and reasoning levels.
 
 Lookup order:
 
-1. The nearest `./.pi/crew.config.json`, searching from the delegated pane working directory upward
-2. `<PI_CODING_AGENT_DIR ?? ~/.pi/agent>/skills/crew/crew.config.json`
-3. `~/.pi/crew.config.json`
+1. The nearest `./.pi/model-tiers.json`, searching from the delegated pane working directory upward
+2. `<PI_CODING_AGENT_DIR ?? ~/.pi/agent>/skills/crew/model-tiers.json`
+3. `~/.pi/model-tiers.json`
 
 Config shape:
 
 ```json
 {
-  "roles": {
+  "models": {
+    "frontier": "anthropic/claude-opus-5",
+    "medium": "anthropic/claude-opus-4-8",
+    "small": "google/gemini-3.8-flash"
+  },
+  "crewRoles": {
     "scout": {
-      "description": "Finds local and online context...",
-      "model": "google/gemini-3.8-flash",
-      "effort": "medium",
-      "authority": "read-only"
+      "model": "medium",
+      "reasoning": "medium",
+      "authority": "read-only",
+      "description": "Finds targeted local and online context..."
     }
+  },
+  "parallelCodeReview": {
+    "testRunner": { "model": "small", "reasoning": "low" }
   }
 }
 ```
 
-Use `description` as the role's standing behavior, `model` as an exact provider/id, `effort` as a supported Pi thinking level, and `authority` as either `read-only` or `can-edit`.
+Use `models` as the provider-agnostic mapping from abstract model tier to concrete provider/model id. Each crew role specifies `model` as an abstract model tier (`frontier` / `medium` / `small`) or an inline provider/model id escape hatch, `reasoning` as a concrete Pi thinking level (`xhigh` / `medium` / `low`), `authority` as either `read-only` or `can-edit`, and `description` as the role's standing behavior.
 
 Use `crew_rules` to inspect the resolved role configuration and source path when needed.
 
-## Model & effort assignments
+## Model & reasoning assignments
 
-Resolved model and effort per role for this environment. Effort is the reasoning/thinking level.
+Roles are provider-agnostic: each specifies an abstract **model tier** (`frontier` / `medium` / `small`) resolved via `model-tiers.json`, and a concrete **reasoning** level (`xhigh` / `medium` / `low`).
 
-| Layer / role | Model | Effort |
+| Role | Model tier | Reasoning |
 |---|---|---|
-| brain (session) | `anthropic/claude-opus-4-8` | `medium`; `xhigh` for difficult decisions |
-| `scout` | `google/gemini-3.8-flash` | `medium` |
-| `oracle` | `anthropic/claude-opus-5` | `xhigh` |
-| `executor` (default) | `google/gemini-3.8-flash` | `medium` |
-| `executor` (explicit difficult-task escalation) | `anthropic/claude-opus-4-8` | `medium` |
-| `reviewer` | `anthropic/claude-opus-5` | `xhigh` |
+| `scout` | `medium` | `medium` |
+| `oracle` | `frontier` | `xhigh` |
+| `executor` (default) | `small` | `medium` |
+| `executor` (escalation) | `medium` | `medium` |
+| `reviewer` | `frontier` | `xhigh` |
 
 Notes:
 
-- The `model` field in crew config must be a plain `provider/id`. Keep `effort` separate; the extension validates it and forwards it with Pi's `--thinking` option.
-- The brain's model/effort is fixed at session launch (`pi --model anthropic/claude-opus-4-8 --thinking medium`, or `xhigh` for difficult decisions), not by crew config. Do not hot-swap an active parent merely to match this table.
-- GPT Sol medium may be selected temporarily for implementation when explicitly requested; it is not the permanent crew profile.
-- Parallel-code-review resolves `frontier` and final synthesis to Opus 4.8 medium, `mid` to Gemini Flash medium, and `small` to Gemini Flash low through environment mapping rather than hardcoded portable-skill model names.
+- Abstract model tiers are mapped to concrete provider/models in `models` within `model-tiers.json`. To switch providers, edit only `models`.
+- Reasoning is a concrete level per member, validated and forwarded with Pi's `--thinking` option.
+- An inline concrete `model` (e.g. `provider/model`) is honored as an escape hatch.
+- Parallel-code-review agents similarly specify model tier and reasoning resolved via `model-tiers.json`.
 
 ## Using `crew_launch`
 

@@ -1,8 +1,81 @@
 {
+  "models": {
+    "frontier": "anthropic/claude-opus-5",
+    "medium": "anthropic/claude-opus-4-8",
+    "small": "google/gemini-3.8-flash"
+  },
+  "crewRoles": {
+    "scout": {
+      "model": "medium",
+      "reasoning": "medium",
+      "authority": "read-only",
+      "description": "Finds targeted local and online context. Read only the current phase contract and explicitly required evidence; return a bounded context map with references, facts, risks, and suggested next steps."
+    },
+    "oracle": {
+      "model": "frontier",
+      "reasoning": "xhigh",
+      "authority": "read-only",
+      "description": "Advises on the current decision, architecture, sequencing, tradeoffs, alternatives, and risks without re-planning completed phases or loading optional history."
+    },
+    "executor": {
+      "model": "small",
+      "reasoning": "medium",
+      "authority": "can-edit",
+      "description": "Implements one approved phase from its current contract in a fresh task context. Publish factual validation and risks, reference full evidence, and keep returned prose concise."
+    },
+    "executor-escalation": {
+      "model": "medium",
+      "reasoning": "medium",
+      "authority": "can-edit",
+      "description": "Stronger model tier for a stuck executor re-launch."
+    },
+    "reviewer": {
+      "model": "frontier",
+      "reasoning": "xhigh",
+      "authority": "read-only",
+      "description": "Independently reviews the exact source snapshot and current contract without inheriting executor reasoning. Verify evidence selectively, publish a structured verdict, and keep all blocking findings distinct."
+    }
+  },
   "parallelCodeReview": {
-    "frontier": { "model": "anthropic/claude-opus-4-8", "effort": "medium" },
-    "mid": { "model": "google/gemini-3.8-flash", "effort": "medium" },
-    "small": { "model": "google/gemini-3.8-flash", "effort": "low" },
-    "synthesis": { "model": "anthropic/claude-opus-4-8", "effort": "medium" }
+    "testRunner": {
+      "model": "small",
+      "reasoning": "low"
+    },
+    "linter": {
+      "model": "small",
+      "reasoning": "low"
+    },
+    "codeReviewer": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "security": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "qualityStyle": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "testQuality": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "performance": {
+      "model": "small",
+      "reasoning": "medium"
+    },
+    "dependency": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "simplification": {
+      "model": "medium",
+      "reasoning": "medium"
+    },
+    "synthesis": {
+      "model": "medium",
+      "reasoning": "medium"
+    }
   }
 }

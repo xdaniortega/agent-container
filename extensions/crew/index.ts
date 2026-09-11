@@ -64,14 +64,37 @@ type ExtensionAPI = {
 
 export type RoleAuthority = "read-only" | "can-edit";
 
-type Role = {
+export type Role = {
   description?: string;
   model?: string;
   effort?: ThinkingLevel;
+  reasoning?: ThinkingLevel;
   authority?: RoleAuthority;
+  tier?: string;
 };
 
-type CrewConfig = { roles?: Record<string, Role> };
+export type CrewRoleConfig = {
+  model?: string;
+  reasoning?: ThinkingLevel;
+  effort?: ThinkingLevel;
+  authority?: RoleAuthority;
+  description?: string;
+};
+
+export type ParallelReviewAgentConfig = {
+  model?: string;
+  reasoning?: ThinkingLevel;
+  effort?: ThinkingLevel;
+};
+
+export type ModelTiers = {
+  models?: Record<string, string>;
+  crewRoles?: Record<string, CrewRoleConfig>;
+  roles?: Record<string, CrewRoleConfig>;
+  parallelCodeReview?: Record<string, ParallelReviewAgentConfig>;
+};
+
+export type CrewConfig = ModelTiers;
 type AgentLike = {
   name?: string;
   pane_id?: string;
@@ -114,6 +137,10 @@ const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authori
     description: "Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks.",
     authority: "can-edit",
   },
+  "executor-escalation": {
+    description: "Stronger model tier for a stuck executor re-launch.",
+    authority: "can-edit",
+  },
   reviewer: {
     description: "Reviews plans or diffs for correctness, missed requirements, test gaps, maintainability risks, and actionable findings.",
     authority: "read-only",
@@ -141,19 +168,21 @@ export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: 
   return stateRoot ? `env CREW_STATE_ROOT=${shellQuote(stateRoot)} ${command}` : command;
 }
 
-export function parseCrewConfig(raw: string): CrewConfig {
-  const parsed = JSON.parse(raw) as CrewConfig;
+export function parseModelTiers(raw: string): ModelTiers {
+  const parsed = JSON.parse(raw) as ModelTiers;
   return parsed && typeof parsed === "object" ? parsed : {};
 }
+
+export const parseCrewConfig = parseModelTiers;
 
 function normalizedCwd(cwd: string): string {
   const absolute = resolve(cwd);
   try { return realpathSync(absolute); } catch { return absolute.replace(/[\\\\/]+$/, "") || absolute; }
 }
 
-export function resolveQueueKey(roleName: string, cwd: string, explicitConfig?: CrewConfig): { authority: RoleAuthority; key: string } {
+export function resolveQueueKey(roleName: string, cwd: string, explicitConfig?: ModelTiers): { authority: RoleAuthority; key: string } {
   const normalized = normalizedCwd(cwd);
-  const config = explicitConfig ?? loadCrewConfig(normalized).config;
+  const config = explicitConfig ?? loadModelTiers(normalized).config;
   const role = resolveRole(roleName, config);
   const authority = role.authority ?? "can-edit";
   const key = authority === "read-only"
@@ -162,31 +191,35 @@ export function resolveQueueKey(roleName: string, cwd: string, explicitConfig?: 
   return { authority, key };
 }
 
-export function configCandidates(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): string[] {
+export function modelTiersCandidates(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): string[] {
   const candidates: string[] = [];
   let current = normalizedCwd(cwd);
   const selected = current;
   while (true) {
-    candidates.push(join(current, ".pi", "crew.config.json"));
+    candidates.push(join(current, ".pi", "model-tiers.json"));
     if (current === selected) {
-      candidates.push(join(current, ".pi", "skills", "crew", "crew.config.json"));
-      candidates.push(join(current, "skills", "crew", "crew.config.json"));
+      candidates.push(join(current, ".pi", "skills", "crew", "model-tiers.json"));
+      candidates.push(join(current, "skills", "crew", "model-tiers.json"));
     }
     if (current === dirname(current)) break;
     current = dirname(current);
   }
-  candidates.push(join(agentDir, "skills", "crew", "crew.config.json"));
-  candidates.push(join(home, ".pi", "crew.config.json"));
+  candidates.push(join(agentDir, "skills", "crew", "model-tiers.json"));
+  candidates.push(join(home, ".pi", "model-tiers.json"));
   return [...new Set(candidates)];
 }
 
-export function loadCrewConfig(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): { config: CrewConfig; path?: string } {
-  for (const path of configCandidates(cwd, home, agentDir)) {
+export const configCandidates = modelTiersCandidates;
+
+export function loadModelTiers(cwd = process.cwd(), home = homedir(), agentDir = process.env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent")): { config: ModelTiers; path?: string } {
+  for (const path of modelTiersCandidates(cwd, home, agentDir)) {
     if (!existsSync(path)) continue;
-    return { config: parseCrewConfig(readFileSync(path, "utf8")), path };
+    return { config: parseModelTiers(readFileSync(path, "utf8")), path };
   }
   return { config: {}, path: undefined };
 }
+
+export const loadCrewConfig = loadModelTiers;
 
 function assertValidAuthority(authority: unknown, roleName: string): asserts authority is Role["authority"] | undefined {
   if (authority === undefined) return;
@@ -206,33 +239,94 @@ function assertValidEffort(effort: unknown, roleName: string): asserts effort is
   if (effort !== undefined && !THINKING_LEVELS.includes(effort as ThinkingLevel)) throw new Error(`Invalid effort for crew role ${roleName}`);
 }
 
+export function assertValidTierName(tier: unknown, models: Record<string, string> | undefined, roleName: string): asserts tier is string {
+  if (typeof tier !== "string" || !models || !Object.prototype.hasOwnProperty.call(models, tier)) {
+    throw new Error(`Unknown model tier "${String(tier)}" for crew role ${roleName}`);
+  }
+}
+
+export function resolveModelTier(tier: string, tiers: ModelTiers): string {
+  assertValidTierName(tier, tiers.models, tier);
+  const model = tiers.models![tier];
+  assertValidModel(model, tier);
+  return model;
+}
+
 function assertValidRoleName(roleName: string): void {
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(roleName)) {
     throw new Error("crew_launch role must match Herdr agent names: lowercase letter followed by lowercase letters, numbers, underscore, or hyphen; max 32 chars");
   }
 }
 
-export function resolveRole(roleName: string, config: CrewConfig): Role & { name: string } {
+export function resolveRole(roleName: string, config: ModelTiers = {}): Role & { name: string } {
   assertValidRoleName(roleName);
-  const configured = config.roles?.[roleName];
+  const configured = config.crewRoles?.[roleName] ?? config.roles?.[roleName];
   const fallback = DEFAULT_ROLES[roleName];
   if (!configured && !fallback) {
     throw new Error(`Unknown crew role: ${roleName}`);
   }
   const authority = configured?.authority ?? fallback?.authority;
-  const model = configured?.model;
-  const effort = configured?.effort;
+  const rawReasoning = configured?.reasoning ?? configured?.effort;
   assertValidAuthority(authority, roleName);
-  assertValidModel(model, roleName);
-  assertValidEffort(effort, roleName);
+  assertValidEffort(rawReasoning, roleName);
+
+  let resolvedModel: string | undefined;
+  let tier: string | undefined;
+
+  if (configured?.model) {
+    if (configured.model.includes("/")) {
+      assertValidModel(configured.model, roleName);
+      resolvedModel = configured.model;
+    } else {
+      assertValidTierName(configured.model, config.models, roleName);
+      tier = configured.model;
+      resolvedModel = config.models![configured.model];
+      assertValidModel(resolvedModel, roleName);
+    }
+  }
+
   return {
     name: roleName,
     description: configured?.description ?? fallback?.description,
     authority,
-    model,
-    ...(effort ? { effort } : {}),
+    model: resolvedModel,
+    ...(tier ? { tier } : {}),
+    ...(rawReasoning ? { effort: rawReasoning, reasoning: rawReasoning } : {}),
   };
 }
+
+export function resolveParallelReviewAgent(agentName: string, config: ModelTiers): { name: string; model?: string; reasoning?: ThinkingLevel; effort?: ThinkingLevel; tier?: string } {
+  const configured = config.parallelCodeReview?.[agentName];
+  if (!configured) {
+    throw new Error(`Unknown parallel review agent: ${agentName}`);
+  }
+  const rawReasoning = configured.reasoning ?? configured.effort;
+  assertValidEffort(rawReasoning, agentName);
+
+  let resolvedModel: string | undefined;
+  let tier: string | undefined;
+
+  if (configured.model) {
+    if (configured.model.includes("/")) {
+      assertValidModel(configured.model, agentName);
+      resolvedModel = configured.model;
+    } else {
+      assertValidTierName(configured.model, config.models, agentName);
+      tier = configured.model;
+      resolvedModel = config.models![configured.model];
+      assertValidModel(resolvedModel, agentName);
+    }
+  }
+
+  return {
+    name: agentName,
+    model: resolvedModel,
+    ...(tier ? { tier } : {}),
+    ...(rawReasoning ? { effort: rawReasoning, reasoning: rawReasoning } : {}),
+  };
+}
+
+export const resolveReviewAgent = resolveParallelReviewAgent;
 
 export type DelegationFields = { context?: string; constraints?: string; acceptanceCriteria?: string; expectedOutput?: string };
 export type ParentContextSource = { version: 1; parentSessionId: string; upperBoundEntryId: string };
@@ -1109,8 +1203,9 @@ export async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchPara
     const recovered = await recoverTaskAttempt(access, params.taskId, attempt, true, params.recoveryReason.trim());
     return { content: [{ type: "text", text: JSON.stringify(recovered) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: recovered.status, recovered: true, writerLiveness: agent ? liveness : "absent" } };
   }
-  const { config, path: configPath } = loadCrewConfig(params.configCwd ?? roleCwd);
-  const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
+  const { config, path: configPath } = loadModelTiers(params.configCwd ?? roleCwd);
+  const configuredRoles = { ...config.roles, ...config.crewRoles };
+  const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(configuredRoles)]);
   const role = resolveRole(roleName, config);
   const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, params);
   const markers = buildCrewMarkers(params.toolCallId ?? "crew_launch");
@@ -1345,17 +1440,29 @@ async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) 
     const current = await herdr(pi, ["pane", "current", "--current"]);
     if (current.code === 0) configCwd = parseJson(current.stdout, "herdr pane current").result?.pane?.foreground_cwd || parseJson(current.stdout, "herdr pane current").result?.pane?.cwd;
   }
-  const { config, path: configPath } = loadCrewConfig(configCwd ?? process.cwd());
-  const roleNames = [...new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})])].sort();
+  const { config, path: configPath } = loadModelTiers(configCwd ?? process.cwd());
+  const configuredRoles = { ...config.roles, ...config.crewRoles };
+  const roleNames = [...new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(configuredRoles)])].sort();
   const catalogResult = await pi.exec(selectDiscoveryCommand(), ["--list-models"], { timeout: 10_000 });
   const catalog = parseModelCatalog(catalogResult.stdout);
   const roles = Object.fromEntries(roleNames.map((name) => {
     const role = resolveRole(name, config);
     const modelState = role.model ? modelMatch(role.model, catalog) : "default";
     const catalogPresent = role.model ? (catalogResult.code === 0 && modelState === "exact") : null;
-    return [name, { description: role.description ?? null, authority: role.authority ?? null, configured: role.model ?? null,
-      model: role.model ?? null, effort: role.effort ?? null, modelState, catalogPresent, authenticationUnknown: true,
-      launchable: role.model ? catalogPresent : true, currentlyUsed: null }];
+    return [name, {
+      description: role.description ?? null,
+      authority: role.authority ?? null,
+      tier: role.tier ?? null,
+      configured: role.tier ?? role.model ?? null,
+      model: role.model ?? null,
+      effort: role.effort ?? null,
+      reasoning: role.reasoning ?? role.effort ?? null,
+      modelState,
+      catalogPresent,
+      authenticationUnknown: true,
+      launchable: role.model ? catalogPresent : true,
+      currentlyUsed: null,
+    }];
   }));
   return {
     content: [{ type: "text", text: JSON.stringify({ configPath: configPath ?? null, roles }, null, 2) }],
@@ -1626,7 +1733,7 @@ export default function crewExtension(pi: ExtensionAPI) {
     parameters: {
       type: "object",
       properties: {
-        configCwd: { type: "string", description: "Directory for project .pi/crew.config.json lookup. Defaults to current process cwd." },
+        configCwd: { type: "string", description: "Directory for project .pi/model-tiers.json lookup. Defaults to current process cwd." },
       },
       additionalProperties: false,
     },
