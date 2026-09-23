@@ -27,8 +27,15 @@ try {
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
     sendMessage(message: unknown, options: unknown) { modelMessages.push({ message, options }); },
   } as any);
-  assert.deepEqual([...tools.keys()], ["crew_launch", "crew_read_context", "crew_publish", "crew_read", "crew_control", "crew_rules"]);
+  assert.deepEqual([...tools.keys()], ["crew_launch", "crew_status", "crew_read_context", "crew_publish", "crew_read", "crew_control", "crew_rules"]);
+  assert.ok(commands.has("crew-status"));
   assert.ok(commands.has("crew-handoff"));
+
+  const restoredRecord = { launchId: "launch-restored", role: "scout", controllerStatus: "settled", herdrStatus: "idle", complete: true, agentContinues: false, startedAt: "2026-01-01T00:00:00.000Z", observedAt: "2026-01-01T00:00:01.000Z", lastProgressAt: "2026-01-01T00:00:01.000Z", recoveryHint: "none" };
+  const restoreCtx = { cwd: repo, sessionManager: { getSessionId: () => "restore-session", getBranch: () => [{ type: "custom", customType: "crew-child-lifecycle", data: restoredRecord }] }, ui: { setStatus() {} } };
+  for (const handler of events.get("session_start") ?? []) await handler({}, restoreCtx);
+  const restoredStatus = JSON.parse((await tools.get("crew_status").execute("status", {}, undefined, undefined, restoreCtx)).content[0].text);
+  assert.equal(restoredStatus.records[0].launchId, "launch-restored");
 
   const sessionId = "isolated-runtime-session";
   const access = await createRunState({ cwd: repo, stateRoot, runId: "runtime-run", ownerSessionId: sessionId }); rememberOwnerAccess(sessionId, access);
@@ -62,7 +69,8 @@ try {
     appendEntry() {}, sendMessage(message: unknown, options: unknown) { childModelMessages.push({ message, options }); },
   } as any);
   const childCtx = { cwd: repo, getContextUsage: () => ({ tokens: 76000 }), sessionManager: { getSessionId: () => "runtime-child-session", getBranch: () => [{ type: "message", id: "child-prompt", parentId: null, message: { role: "user", content: childPrompt } }] }, ui: { notify: (...args: any[]) => notices.push(args) } };
-  childEvents.get("session_start")![0]({}, childCtx); await childEvents.get("message_end")![0]({ message: { role: "assistant", usage: { input: 76000, output: 1 } } }, childCtx);
+  for (const handler of childEvents.get("session_start") ?? []) await handler({}, childCtx);
+  await childEvents.get("message_end")![0]({ message: { role: "assistant", usage: { input: 76000, output: 1 } } }, childCtx);
   let inbox = await readInbox(access); assert.equal(inbox.messages.filter(message => message.category === "notification" && message.taskId === "runtime-child").length, 1);
   assert.equal(childModelMessages.length, 1, "child queues only its local warning"); assert.equal(modelMessages.length, 1, "parent instance has not shared the child's sendMessage mock");
   const lookalikeDraft = await beginPublication(access, { kind: "message", taskId: "runtime-child", attempt: 1, recipient: "executor", category: "notification", blocking: false });

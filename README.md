@@ -124,11 +124,17 @@ The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets 
 npm run install-crew
 ```
 
+For code work, the brain normalizes either a raw request or an existing user plan into explicit phases. Standard, localized phases are implemented provisionally and reviewed together at the end; major or cross-cutting phases receive an immediate independent reviewer. After feature review, the workflow runs the installed `parallel-code-review` skill over the complete integration diff and resolves compatible Medium-or-higher findings.
+
+The setup provides one mutation role, `executor`. It does not provide a separate escalation executor; bounded retries reuse the configured executor and unresolved work returns to the user.
+
+Managed direct-mode runs support risk promotion and exact deferred review batches through `crew_control` (`task-promote`, `task-defer`, and `review-batch-create`). Managed durable coordination remains unavailable through `pic-proxy`; use direct `pic` when artifact-gated batch review is required.
+
 ### Choosing / changing models
 
 Crew roles and review agents never hardcode a provider or model. Each names an abstract **model tier** (`frontier` / `medium` / `small`) plus a concrete **reasoning** level (`xhigh` / `medium` / `low`). Everything lives in the single **`model-tiers.json`**:
 - `models.frontier|medium|small` → the provider/model each tier means for us (e.g. `frontier` = Opus 5, `medium` = Opus 4.8, `small` = Gemini 3.8 Flash). **Change which model a crew member uses by editing these three values.**
-- `crewRoles.<role>` → the `{ model: <tier>, reasoning: <level>, authority, description }` per crew member (scout, oracle, executor, executor-escalation, reviewer).
+- `crewRoles.<role>` → the `{ model: <tier>, reasoning: <level>, authority, description }` per crew member (scout, oracle, executor, reviewer).
 - `parallelCodeReview.<agent>` → the model tier + reasoning per review agent.
 
 Example: to run everything on your own provider, change only the three `models.*` values. To make the reviewer cheaper, set `crewRoles.reviewer.model` to `medium`; to make it think harder, raise `crewRoles.reviewer.reasoning`. An inline concrete `"model": "provider/x"` override is still honored as an escape hatch.
@@ -152,6 +158,8 @@ PIC_HERDR_BRIDGE=0 pic-proxy   # disable Herdr status bridge
 ```
 
 Run `herdr integration install pi` on the host once. The entrypoint loads `herdr-agent-state.ts` only when `HERDR_ENV=1`.
+
+Crew launches bind a stable launch ID to the child pane and Herdr `agent_session`. The extension keeps controller state, raw Herdr state, managed task state, and completion evidence separate so an idle child is not mistaken for verified completion. Use the `crew_status` tool from the brain or `/crew-status` interactively to inspect running, blocked, timed-out-but-live, lost, replaced, or settled-incomplete children. A compact `crew:` footer indicator appears when work is active or needs attention.
 
 You can publish container ports to the host by passing `-p` or `--publish` arguments:
 ```bash
