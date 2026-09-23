@@ -5,9 +5,13 @@ import { dirname, join, resolve } from "node:path";
 import {
   acknowledgeInbox,
   appendPublicationChunk,
+  bindTaskChildSession,
   createPhaseCheckpoint,
+  createReviewBatch,
+  deferTaskAttempt,
   finalizeArtifactCleanup,
   previewArtifactCleanup,
+  promoteTaskAttempt,
   publishPhaseContract,
   readCurrentPhase,
   readPhaseCheckpoint,
@@ -24,6 +28,7 @@ import {
   disposeTaskEvidence,
   markWriterRunning,
   recoverTaskAttempt,
+  recoverTaskReview,
   defaultCrewStateRoot,
   finalizePublication,
   readArtifact,
@@ -32,11 +37,15 @@ import {
   resolveRepositoryIdentity,
   submitTaskAttempt,
   transitionTaskAttempt,
+  type ChildSessionBinding,
   type PublicationMetadata,
   type RunAccess,
   type PlanIndex,
+  type ReviewTiming,
+  type RiskClass,
 } from "./state.ts";
 import { assessPayload, captureSourceSnapshot, contextWarningLevel, normalizeUsage, THINKING_LEVELS, type ThinkingLevel } from "./workflow.ts";
+import { herdrObservation, isActiveChild, reconcileChildLaunch, type ChildLaunchRecord, type HerdrAgentLike } from "./herdr-session.ts";
 
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
@@ -44,7 +53,7 @@ type ToolUpdate = (partialResult: ToolResult) => void;
 type SessionMessage = { role?: string; toolName?: string; toolCallId?: string; isError?: boolean; content?: unknown; details?: Record<string, unknown> };
 export type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; message?: SessionMessage; customType?: string; data?: unknown; content?: unknown };
 type SessionManagerLike = { getSessionId?(): string; getSessionFile?(): string | undefined; getSessionDir?(): string; getLeafId?(): string | null; getBranch?(): SessionEntryLike[] };
-type ToolContext = { cwd: string; sessionManager?: SessionManagerLike };
+type ToolContext = { cwd: string; mode?: string; hasUI?: boolean; ui?: { setStatus?(id: string, text?: string): void; notify?(message: string, level?: "info" | "warning" | "error"): void }; sessionManager?: SessionManagerLike };
 type ExtensionAPI = {
   exec(command: string, args?: string[], options?: { timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
   registerTool(tool: {
@@ -101,23 +110,9 @@ export type ModelTiers = {
 };
 
 export type CrewConfig = ModelTiers;
-type AgentLike = {
-  name?: string;
-  pane_id?: string;
-  workspace_id?: string;
-  tab_id?: string;
-  foreground_cwd?: string;
-  cwd?: string;
-  agent_status?: string;
-  status?: string;
-  model?: string;
-  model_id?: string;
-  thinking_level?: string;
-  reasoning_level?: string;
-  session_id?: string;
-};
+type AgentLike = HerdrAgentLike;
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const STARTUP_TIMEOUT_MS = 120_000;
 const PROMPT_TIMEOUT_MS = 120_000;
 const DEFAULT_READ_LINES = 200;
@@ -141,10 +136,6 @@ const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authori
   },
   executor: {
     description: "Implements the approved plan with minimal pragmatic changes and reports changed files, validation, and risks.",
-    authority: "can-edit",
-  },
-  "executor-escalation": {
-    description: "Stronger model tier for a stuck executor re-launch.",
     authority: "can-edit",
   },
   reviewer: {
@@ -929,8 +920,8 @@ function logLifecycle(
   });
 }
 
-async function herdr(pi: ExtensionAPI, args: string[], timeout = PROMPT_TIMEOUT_MS): Promise<ExecResult> {
-  return pi.exec("herdr", args, { timeout });
+async function herdr(pi: ExtensionAPI, args: string[], timeout = PROMPT_TIMEOUT_MS, signal?: AbortSignal): Promise<ExecResult> {
+  return pi.exec("herdr", args, { timeout, signal });
 }
 
 async function readAgent(pi: ExtensionAPI, role: string, lines: number): Promise<string> {
@@ -1012,6 +1003,13 @@ export async function getOrCorroborateAgent(pi: ExtensionAPI, agentName: string)
   }
 }
 
+async function waitForAgentTransition(pi: ExtensionAPI, agentName: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  // This wait is an optimization, not an authority. A disappearance or bridge
+  // error is reconciled by the following get/list observation.
+  const result = await herdr(pi, ["agent", "wait", agentName, "--timeout", String(timeoutMs)], timeoutMs + 2_000, signal);
+  return result.code === 0 || /timeout/i.test(result.stderr || result.stdout);
+}
+
 export async function functionalPreflight(pi: ExtensionAPI): Promise<ExecResult> {
   if (process.env.HERDR_ENV !== "1") {
     throw new Error("I am not currently running inside Herdr (HERDR_ENV must equal 1).");
@@ -1062,11 +1060,13 @@ export type PollingDependencies = {
   readOutput: (agentName: string, paneId: string, lines: number, currentAgent?: AgentLike) => Promise<string>;
   now: () => number;
   delay: (ms: number, signal?: AbortSignal) => Promise<void>;
+  waitForState?: (agentName: string, timeoutMs: number, signal?: AbortSignal) => Promise<boolean>;
   onUpdate?: ToolUpdate;
 };
 
 export async function runCrewPollingLoop(
   params: {
+    launchId?: string;
     roleName: string;
     agentName: string;
     paneId: string;
@@ -1089,6 +1089,7 @@ export async function runCrewPollingLoop(
   lastKnownAgent?: AgentLike;
 }> {
   const {
+    launchId,
     roleName,
     agentName,
     paneId,
@@ -1100,7 +1101,7 @@ export async function runCrewPollingLoop(
     readLines,
     signal,
   } = params;
-  const { getAgent, readOutput, now, delay: delayFn, onUpdate } = deps;
+  const { getAgent, readOutput, now, delay: delayFn, waitForState, onUpdate } = deps;
 
   let lastProgressAt = submittedAt;
   let previousEvidence = "";
@@ -1132,7 +1133,8 @@ export async function runCrewPollingLoop(
     const settled = status === "done" || status === "idle";
     const evidence = `${status}\n${output}`;
     const currentTime = now();
-    if (evidence !== previousEvidence) {
+    const evidenceChanged = evidence !== previousEvidence;
+    if (evidenceChanged) {
       previousEvidence = evidence;
       lastProgressAt = currentTime;
     }
@@ -1166,19 +1168,27 @@ export async function runCrewPollingLoop(
 
     heartbeatCount += 1;
     const dots = ".".repeat(((heartbeatCount - 1) % 3) + 1);
+    const observation = herdrObservation(currentAgent ?? lastKnownAgent);
     onUpdate?.({
       content: [{ type: "text", text: `Processing ${roleName}${dots}` }],
       details: {
+        launchId,
         role: roleName,
         agentName,
         paneId,
         status,
+        herdrStatus: observation.status,
+        sessionRef: observation.sessionRef,
+        piSessionId: observation.piSessionId,
+        stateChangeSeq: observation.stateChangeSeq,
+        revision: observation.revision,
         heartbeat: heartbeatCount,
         elapsedMs: currentTime - submittedAt,
+        progress: evidenceChanged || status === "working",
       },
     });
     const pollMs = observedWorking ? ROLE_POLL_MS : Math.min(1_000, ROLE_POLL_MS);
-    await delayFn(pollMs, signal);
+    if (!waitForState || !await waitForState(agentName, pollMs, signal)) await delayFn(pollMs, signal);
   }
 
   return {
@@ -1196,6 +1206,7 @@ type CrewLaunchParams = DelegationFields & {
   role?: string; task?: string; durable?: boolean; runId?: string; taskId?: string; attempt?: number; contractVersion?: string; baseSha?: string;
   managedAction?: "launch" | "status" | "wait" | "recover"; recoveryReason?: string; waitMs?: number;
   sourcePaths?: string[];
+  riskClass?: RiskClass; reviewTiming?: ReviewTiming; launchId?: string;
   allowContextLookup?: boolean; contextSource?: ParentContextSource; parentSessionDir?: string;
   contextMode?: ContextMode; checkpointFallback?: CheckpointFallback; recentTurns?: number; maxHandoffChars?: number;
   handoffText?: string; branch?: SessionEntryLike[];
@@ -1308,6 +1319,8 @@ export async function prepareDurableLaunch(options: {
   ownerSessionId?: string;
   stateRoot?: string;
   sourcePaths?: string[];
+  riskClass?: RiskClass;
+  reviewTiming?: ReviewTiming;
 }): Promise<{ access: RunAccess; taskToken: string; attempt: number; contractVersion?: string; baseSha?: string; reportArtifactId?: string; headSha?: string; sourcePaths?: string[]; sessionGeneration: string } | undefined> {
   if (!options.enabled) return undefined;
   if (options.baseCommand === "pic-proxy") {
@@ -1330,8 +1343,9 @@ export async function prepareDurableLaunch(options: {
     }
     if (options.role === "executor") {
       if (!options.contractVersion || !options.baseSha) throw new Error("Managed executor launch requires contractVersion and baseSha");
-      if (!existing) existing = await createTaskAttempt(access, { taskId: options.taskId, attempt, contractVersion: options.contractVersion, baseSha: options.baseSha, sourcePaths: options.sourcePaths, executorSessionGeneration: randomUUID() });
+      if (!existing) existing = await createTaskAttempt(access, { taskId: options.taskId, attempt, contractVersion: options.contractVersion, baseSha: options.baseSha, sourcePaths: options.sourcePaths, executorSessionGeneration: randomUUID(), riskClass: options.riskClass, reviewTiming: options.reviewTiming });
       if (existing.contractVersion !== options.contractVersion || existing.baseSha !== options.baseSha) throw new Error("Task attempt contract/base does not match the managed launch");
+      if ((existing.riskClass ?? "major") !== (options.riskClass ?? "major") || (existing.reviewTiming ?? "immediate") !== (options.reviewTiming ?? "immediate")) throw new Error("Task attempt risk/review policy does not match the managed launch");
       if (existing.status !== "ready") throw new Error(`Executor attempt is ${existing.status}; use managedAction=status or recover instead of starting a competing writer`);
     } else if (options.role === "reviewer") {
       if (!existing) throw new Error("Reviewer launch requires an existing submitted task attempt");
@@ -1422,6 +1436,7 @@ export async function executeCrewLaunch(
   const workspaceId = currentPane?.workspace_id || "";
   const tabId = currentPane?.tab_id || "";
   const taskId = params.taskId ?? `task-${(params.toolCallId ?? randomTaskId()).replace(/[^A-Za-z0-9._-]/g, "-").slice(-64)}`;
+  const launchId = params.launchId ?? `launch-${(params.toolCallId ?? randomTaskId()).replace(/[^A-Za-z0-9._-]/g, "-").slice(-64)}`;
   const attempt = params.attempt ?? 1;
   if (params.managedAction && params.managedAction !== "launch") {
     if (!params.runId || !params.taskId || !ownerSessionId) throw new Error("Managed status/recovery requires runId, taskId, and the originating owner session");
@@ -1440,17 +1455,27 @@ export async function executeCrewLaunch(
         }
       }
       const changed = currentState.updatedAt !== before.updatedAt;
+      const boundChild = currentState.childSession;
+      const liveAgent = boundChild?.agentName ? await getOrCorroborateAgent(pi, boundChild.agentName) : undefined;
+      const live = herdrObservation(liveAgent);
+      const liveSession = live.sessionRef as ChildSessionBinding["sessionRef"] | undefined;
+      const bindingMatches = !boundChild || !!liveAgent && liveAgent.pane_id === boundChild.paneId && (!boundChild.sessionRef || JSON.stringify(liveSession) === JSON.stringify(boundChild.sessionRef));
       const deliveredContextWarnings = await deliverManagedContextWarnings(pi, access);
-      return { content: [{ type: "text", text: JSON.stringify({ status: currentState.status, changed, updatedAt: currentState.updatedAt }) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: currentState.status, changed, complete: ["approved", "revision-needed", "blocked", "failed"].includes(currentState.status), deliveredContextWarnings } };
+      const status = { taskStatus: currentState.status, changed, updatedAt: currentState.updatedAt, childSession: boundChild ?? null, liveHerdr: liveAgent ? live : null, bindingMatches };
+      return { content: [{ type: "text", text: JSON.stringify(status) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: currentState.status, herdrStatus: live.status ?? null, childBindingMatches: bindingMatches, changed, complete: ["approved", "revision-needed", "blocked", "failed"].includes(currentState.status), deliveredContextWarnings } };
     }
     if (!params.recoveryReason?.trim()) throw new Error("Managed recovery requires recoveryReason");
-    const agents = before.writerAgentName ? await listAgents(pi) : [];
-    const agent = before.writerAgentName ? agents.find(item => item.name === before.writerAgentName) : undefined;
-    if (agent && before.writerPaneId && agent.pane_id !== before.writerPaneId) throw new Error("Recovery refused: writer name now points to a different pane; reconcile the original pane manually");
+    const boundAgentName = before.writerAgentName ?? before.childSession?.agentName;
+    const boundPaneId = before.writerPaneId ?? before.childSession?.paneId;
+    const agents = boundAgentName ? await listAgents(pi) : [];
+    const agent = boundAgentName ? agents.find(item => item.name === boundAgentName) : undefined;
+    if (agent && boundPaneId && agent.pane_id !== boundPaneId) throw new Error("Recovery refused: bound agent name now points to a different pane; reconcile the original pane manually");
     const liveness = classifyAgentStatus(agent?.agent_status ?? agent?.status);
-    if (agent && !["idle", "done", "failed"].includes(liveness)) throw new Error(`Recovery refused: writer ${before.writerAgentName} is ${liveness}; resolve or stop the live writer first`);
-    const recovered = await recoverTaskAttempt(access, params.taskId, attempt, true, params.recoveryReason.trim());
-    return { content: [{ type: "text", text: JSON.stringify(recovered) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: recovered.status, recovered: true, writerLiveness: agent ? liveness : "absent" } };
+    if (agent && !["idle", "done", "failed"].includes(liveness)) throw new Error(`Recovery refused: bound agent ${boundAgentName} is ${liveness}; resolve or stop the live agent first`);
+    const recovered = before.status === "reviewing"
+      ? await recoverTaskReview(access, params.taskId, attempt, true, params.recoveryReason.trim())
+      : await recoverTaskAttempt(access, params.taskId, attempt, true, params.recoveryReason.trim());
+    return { content: [{ type: "text", text: JSON.stringify(recovered) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: recovered.status, recovered: true, agentLiveness: agent ? liveness : "absent" } };
   }
   const { config, path: configPath } = loadModelTiers(params.configCwd ?? roleCwd);
   const ephemeral = params.ephemeral ?? config.lifecycle?.ephemeral ?? false;
@@ -1477,6 +1502,8 @@ export async function executeCrewLaunch(
     baseSha: params.baseSha,
     ownerSessionId,
     sourcePaths: params.sourcePaths,
+    riskClass: params.riskClass,
+    reviewTiming: params.reviewTiming,
   });
   const durableContext = durable ? [
     "Managed durable lifecycle is enabled. Terminal markers are only a status signal: managed completion requires a finalized, current artifact with every required Markdown section.",
@@ -1486,10 +1513,12 @@ export async function executeCrewLaunch(
     `attempt: ${durable.attempt}`,
     `contractVersion: ${durable.contractVersion}`,
     `baseSha: ${durable.baseSha}`,
+    `riskClass: ${params.riskClass ?? (roleName === "executor" ? "major" : "review-target")}`,
+    `reviewTiming: ${params.reviewTiming ?? (roleName === "executor" ? "immediate" : "review-target")}`,
     `sessionGeneration: ${durable.sessionGeneration}`,
     durable.sourcePaths?.length ? `sourceSnapshotPaths: ${durable.sourcePaths.join(", ")}` : "sourceSnapshotPaths: not configured (snapshot-bound review unavailable; disclose this limitation)",
     durable.headSha ? `exactReviewHeadSha: ${durable.headSha}` : "requiredReportSections: Summary, Validation, Assumptions, Risks",
-    durable.reportArtifactId ? `requiredExecutorReportArtifactId: ${durable.reportArtifactId}` : "Before publishing, call crew_control action=snapshot with this run/repository/task scope. Publish kind=report as executor and echo this exact contractVersion, baseSha, sourceSnapshotId, and resulting headSha.",
+    durable.reportArtifactId ? `requiredSubmittedReportArtifactId: ${durable.reportArtifactId}` : "Before publishing, call crew_control action=snapshot with this run/repository/task scope. Publish kind=report as executor and echo this exact contractVersion, baseSha, sourceSnapshotId, and resulting headSha.",
     roleName === "reviewer" ? "Publish kind=review with verdict PASS, REVISION_NEEDED, or BLOCKED and sections Verdict, Findings, Validation. The contract/base/head must exactly match the executor report." : "Check the addressed inbox before finalizing; unresolved blocking messages prevent submission.",
     `capabilityToken: ${durable.taskToken}`,
     "Publish in bounded chunks and finalize atomically. Use crew_read pagination to consume required evidence completely. Never include the capability token in reports, messages, final responses, details, or logs.",
@@ -1549,22 +1578,57 @@ export async function executeCrewLaunch(
     expectOk(rename, "herdr agent rename");
 
     const spawnLog = `crew: spawned ${roleName} in pane ${paneId} (${role.tier ?? role.model ?? "default model"}, workspace: ${workspaceId || "default"}, tab: ${tabId || "default"})`;
-    logLifecycle(pi, onUpdate, "spawn", spawnLog, { role: roleName, agentName, paneId, status: "spawned", workspaceId, tabId, model: role.model, tier: role.tier, ephemeral });
+    logLifecycle(pi, onUpdate, "spawn", spawnLog, { launchId, role: roleName, agentName, paneId, status: "spawned", workspaceId, tabId, model: role.model, tier: role.tier, ephemeral });
   }
 
-  onUpdate?.({ content: [{ type: "text", text: `Starting ${roleName}…` }], details: { role: roleName, agentName, paneId, status: "starting" } });
-  if (durable && roleName === "executor") await acquireWriterOwnership(durable.access, taskId, durable.attempt, agentName, paneId);
+  const boundAgent = await getOrCorroborateAgent(pi, agentName) ?? agents.find(agent => agent.pane_id === paneId);
+  const childObservation = herdrObservation(boundAgent);
+  const childBinding: ChildSessionBinding = {
+    launchId,
+    agentName,
+    paneId,
+    workspaceId: (childObservation.workspaceId as string | undefined) ?? workspaceId,
+    tabId: (childObservation.tabId as string | undefined) ?? tabId,
+    sessionRef: childObservation.sessionRef as ChildSessionBinding["sessionRef"],
+    piSessionId: childObservation.piSessionId as string | undefined,
+    stateChangeSeq: childObservation.stateChangeSeq as number | undefined,
+    herdrStatus: childObservation.status as string,
+    observedAt: new Date().toISOString(),
+  };
+  if (durable && roleName === "reviewer") await bindTaskChildSession(durable.access, taskId, durable.attempt, childBinding);
+  onUpdate?.({ content: [{ type: "text", text: `Starting ${roleName}…` }], details: { launchId, role: roleName, agentName, paneId, status: "starting", herdrStatus: childObservation.status, sessionRef: childObservation.sessionRef, piSessionId: childObservation.piSessionId, stateChangeSeq: childObservation.stateChangeSeq, revision: childObservation.revision, progress: true } });
+  if (durable && roleName === "executor") {
+    await acquireWriterOwnership(durable.access, taskId, durable.attempt, agentName, paneId);
+    await bindTaskChildSession(durable.access, taskId, durable.attempt, childBinding);
+  }
   const promptResult = await herdr(pi, ["agent", "prompt", agentName, prompt], 10_000);
   if (promptResult.code !== 0) {
-    if (durable && roleName === "executor") await recoverTaskAttempt(durable.access, taskId, durable.attempt, true, "Prompt submission failed before writer execution");
+    const liveAfterFailure = await getOrCorroborateAgent(pi, agentName);
+    const failureLiveness = classifyAgentStatus(liveAfterFailure?.agent_status ?? liveAfterFailure?.status);
+    const provenInactive = !liveAfterFailure || ["idle", "done", "failed"].includes(failureLiveness);
+    if (durable && provenInactive && roleName === "executor") await recoverTaskAttempt(durable.access, taskId, durable.attempt, true, "Prompt submission failed before writer execution");
+    if (durable && provenInactive && roleName === "reviewer") await recoverTaskReview(durable.access, taskId, durable.attempt, true, "Prompt submission failed before reviewer execution");
     const diagnostic = redactCapabilitySecrets(await readAgent(pi, agentName, FAILURE_READ_LINES), durable ? [durable.taskToken] : []);
-    throw new Error(`crew role prompt submission failed for ${agentName}: ${redactCapabilitySecrets(promptResult.stderr || promptResult.stdout, durable ? [durable.taskToken] : [])}\n\n${diagnostic}`);
+    const error = new Error(`crew role prompt submission failed for ${agentName}: ${redactCapabilitySecrets(promptResult.stderr || promptResult.stdout, durable ? [durable.taskToken] : [])}\n\n${diagnostic}`) as Error & { details?: unknown };
+    error.details = { paneId, status: failureLiveness === "blocked" ? "blocked" : failureLiveness === "working" ? "working" : "failed", agentContinues: !provenInactive };
+    throw error;
   }
   if (durable && roleName === "executor") await markWriterRunning(durable.access, taskId, durable.attempt);
+  onUpdate?.({
+    content: [{ type: "text", text: `Prompted ${roleName}; waiting for Herdr lifecycle updates…` }],
+    details: {
+      launchId, role: roleName, agentName, paneId, status: "working", herdrStatus: childObservation.status,
+      lifecycleStatus: durable ? roleName === "executor" ? "running" : roleName === "reviewer" ? "reviewing" : undefined : undefined,
+      runId: durable?.access.runId, repositoryId: durable?.access.repositoryId, taskId: durable ? taskId : undefined, attempt: durable?.attempt,
+      sessionRef: childObservation.sessionRef, piSessionId: childObservation.piSessionId,
+      stateChangeSeq: childObservation.stateChangeSeq, revision: childObservation.revision, progress: true,
+    },
+  });
 
   const submittedAt = Date.now();
   const pollingResult = await runCrewPollingLoop(
     {
+      launchId,
       roleName,
       agentName,
       paneId,
@@ -1582,6 +1646,7 @@ export async function executeCrewLaunch(
         curAgent ? readAgent(pi, name, lines) : readPane(pi, pId, lines),
       now: () => Date.now(),
       delay: (ms, sig) => delayFn(ms, sig),
+      waitForState: (name, ms, sig) => waitForAgentTransition(pi, name, ms, sig),
       onUpdate,
     }
   );
@@ -1601,6 +1666,19 @@ export async function executeCrewLaunch(
   let managedError: string | undefined;
   if (durable && ["executor", "reviewer"].includes(roleName)) {
     try {
+      const finalChild = herdrObservation(lastKnownAgent ?? boundAgent);
+      await bindTaskChildSession(durable.access, taskId, durable.attempt, {
+        launchId,
+        agentName,
+        paneId,
+        workspaceId: finalChild.workspaceId as string | undefined,
+        tabId: finalChild.tabId as string | undefined,
+        sessionRef: finalChild.sessionRef as ChildSessionBinding["sessionRef"],
+        piSessionId: finalChild.piSessionId as string | undefined,
+        stateChangeSeq: finalChild.stateChangeSeq as number | undefined,
+        herdrStatus: finalChild.status as string,
+        observedAt: new Date().toISOString(),
+      });
       if (!markerResult.settled) throw new Error(`Managed completion requires a quiescent role; observed ${status}`);
       if (durable.sourcePaths?.length) {
         const snapshot = captureSourceSnapshot(roleCwd, durable.sourcePaths);
@@ -1663,10 +1741,12 @@ export async function executeCrewLaunch(
   }
 
   const deliveredContextWarnings = durable ? await deliverManagedContextWarnings(pi, durable.access) : 0;
+  const finalObservation = herdrObservation(lastKnownAgent ?? boundAgent);
   return {
     content: [{ type: "text", text: compactOutput }],
     details: {
       version: VERSION,
+      launchId,
       role: roleName,
       agentName,
       tabId,
@@ -1687,12 +1767,19 @@ export async function executeCrewLaunch(
       actualModelKnown: !!(lastKnownAgent?.model ?? lastKnownAgent?.model_id),
       modelWarning: role.model && lastKnownAgent?.model && lastKnownAgent.model !== role.model ? `Running model ${lastKnownAgent.model} differs from requested ${role.model}.` : (!createdPane && role.model ? "Reused pane model was not queried." : null),
       status,
+      herdrStatus: finalObservation.status,
+      sessionRef: finalObservation.sessionRef ?? null,
+      piSessionId: finalObservation.piSessionId ?? null,
+      stateChangeSeq: finalObservation.stateChangeSeq ?? null,
+      revision: finalObservation.revision ?? null,
       complete,
       agentContinues,
       agentExited,
       heartbeatCount,
       elapsedMs: Date.now() - submittedAt,
       authority: role.authority ?? null,
+      riskClass: params.riskClass ?? null,
+      reviewTiming: params.reviewTiming ?? null,
       contextMode,
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
@@ -1785,6 +1872,65 @@ function managedCoordinates(branch: SessionEntryLike[] | undefined): { runId: st
  * @param pi Extension API used to register tools, commands, and lifecycle handlers.
  */
 export default function crewExtension(pi: ExtensionAPI) {
+  const childLaunches = new Map<string, ChildLaunchRecord>();
+
+  const updateCrewStatusUi = (ctx?: ToolContext) => {
+    if (!ctx?.ui?.setStatus) return;
+    const records = [...childLaunches.values()];
+    const running = records.filter(isActiveChild).length;
+    const blocked = records.filter(record => record.controllerStatus === "blocked").length;
+    const attention = records.filter(record =>
+      ["timed_out", "lost", "replaced", "failed"].includes(record.controllerStatus) ||
+      (record.controllerStatus === "settled" && !record.complete) ||
+      ["revision-needed", "blocked", "failed"].includes(record.taskStatus ?? "")
+    ).length;
+    const parts = [running ? `${running} running` : "", blocked ? `${blocked} blocked` : "", attention ? `${attention} attention` : ""].filter(Boolean);
+    ctx.ui.setStatus("crew", parts.length ? `crew: ${parts.join(" · ")}` : undefined);
+  };
+
+  const trackChild = (details: unknown, ctx?: ToolContext): ChildLaunchRecord | undefined => {
+    if (!details || typeof details !== "object") return undefined;
+    const input = details as Record<string, unknown>;
+    if (typeof input.launchId !== "string" || typeof input.role !== "string") return undefined;
+    const previous = childLaunches.get(input.launchId);
+    const { record, changed } = reconcileChildLaunch(previous, input);
+    childLaunches.set(record.launchId, record);
+    if (changed) pi.appendEntry?.("crew-child-lifecycle", record);
+    updateCrewStatusUi(ctx);
+    return record;
+  };
+
+  const childStatusSnapshot = async (query: { launchId?: string; runId?: string; taskId?: string; activeOnly?: boolean; refresh?: boolean }, ctx?: ToolContext) => {
+    let records = [...childLaunches.values()].filter(record =>
+      (!query.launchId || record.launchId === query.launchId) &&
+      (!query.runId || record.runId === query.runId) &&
+      (!query.taskId || record.taskId === query.taskId) &&
+      (!query.activeOnly || isActiveChild(record)));
+    if (query.refresh) {
+      for (const record of records) {
+        let lifecycleStatus = record.taskStatus;
+        if (ctx?.cwd && record.runId && record.repositoryId && record.taskId && record.attempt) {
+          try {
+            const access = resolveArtifactAccess(ctx.cwd, record.runId, record.repositoryId, undefined, ctx.sessionManager?.getSessionId?.());
+            lifecycleStatus = (await readTaskAttempt(access, record.taskId, record.attempt)).status;
+          } catch {
+            // Herdr status remains useful when durable owner state is unavailable.
+          }
+        }
+        const managedComplete = lifecycleStatus ? ["approved", "revision-needed", "blocked", "failed"].includes(lifecycleStatus) : false;
+        if (!record.agentName || !record.agentContinues) {
+          trackChild({ launchId: record.launchId, role: record.role, lifecycleStatus, complete: record.complete || managedComplete, agentContinues: record.agentContinues, status: record.controllerStatus, herdrStatus: record.herdrStatus }, ctx);
+          continue;
+        }
+        const agent = await getOrCorroborateAgent(pi, record.agentName);
+        const observation = agent ? herdrObservation(agent) : { status: "failed", agentExited: true };
+        trackChild({ ...observation, launchId: record.launchId, role: record.role, agentName: record.agentName, paneId: agent?.pane_id ?? record.paneId, runId: record.runId, repositoryId: record.repositoryId, taskId: record.taskId, attempt: record.attempt, lifecycleStatus, complete: record.complete || managedComplete, agentContinues: agent ? undefined : false }, ctx);
+      }
+      records = records.map(record => childLaunches.get(record.launchId) ?? record);
+    }
+    return records.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  };
+
   const parameters = { type: "object", required: ["role", "task"], properties: {
     role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
     task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
@@ -1799,6 +1945,9 @@ export default function crewExtension(pi: ExtensionAPI) {
     managedAction: { type: "string", enum: ["launch", "status", "wait", "recover"], description: "Launch (default), inspect/wait for resumable managed state without a model call, or recover after deterministic liveness reconciliation." },
     waitMs: { type: "number", description: "For managedAction=wait, deterministic non-model wait up to 30000ms." },
     sourcePaths: { type: "array", items: { type: "string" }, description: "Explicit repository-relative source paths included in the uncommitted review fingerprint." },
+    riskClass: { type: "string", enum: ["standard", "major"], description: "Planned phase risk. Standard work defers review; major work reviews immediately." },
+    reviewTiming: { type: "string", enum: ["final", "immediate"], description: "Review timing paired with riskClass." },
+    launchId: { type: "string", description: "Stable child-launch identity. Defaults to the crew_launch tool call ID." },
     allowContextLookup: { type: "boolean", description: "Opt in to bounded lookup of concrete missing facts from this frozen parent-session branch; never replays history automatically." },
     contextMode: { type: "string", enum: ["explicit", "since-last-crew"], description: "Parent context handoff mode: explicit (default, context-free) or since-last-crew (bounded automatic handoff from previous completed crew checkpoint)." },
     checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"], description: "Fallback strategy when no completed crew checkpoint is found: recent (default, serialize recent N user turns), explicit (use explicit context), or error." },
@@ -1811,6 +1960,7 @@ export default function crewExtension(pi: ExtensionAPI) {
   }, additionalProperties: false };
   const execute = async (toolCallId: string, rawParams: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate, ctx?: ToolContext) => {
     const params = { ...((rawParams ?? {}) as CrewLaunchParams), toolCallId };
+    params.launchId ??= `launch-${toolCallId.replace(/[^A-Za-z0-9._-]/g, "-").slice(-64)}`;
     if (params.allowContextLookup) {
       const parentSessionId = ctx?.sessionManager?.getSessionId?.(); const upperBoundEntryId = ctx?.sessionManager?.getLeafId?.(); const sessionFile = ctx?.sessionManager?.getSessionFile?.();
       if (!parentSessionId || !upperBoundEntryId || !sessionFile) throw new Error("allowContextLookup requires a persisted native parent session with a frozen branch leaf");
@@ -1842,9 +1992,42 @@ export default function crewExtension(pi: ExtensionAPI) {
       // herdr query is best-effort
     }
     const { key } = resolveQueueKey(params.role ?? "scout", executionCwd || ctx?.cwd || process.cwd());
-    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate, ctx?.sessionManager?.getSessionId?.()));
+    const trackedUpdate: ToolUpdate = partial => {
+      trackChild(partial.details, ctx);
+      onUpdate?.(partial);
+    };
+    return enqueueCrewLaunch(key, async () => {
+      try {
+        const result = await executeCrewLaunch(pi, params, signal, trackedUpdate, ctx?.sessionManager?.getSessionId?.());
+        trackChild((result as ToolResult).details, ctx);
+        return result;
+      } catch (error) {
+        const failure = error && typeof error === "object" && "details" in error && (error as any).details && typeof (error as any).details === "object" ? (error as any).details : {};
+        trackChild({ launchId: params.launchId, role: params.role ?? "scout", status: failure.status ?? "failed", paneId: failure.paneId, complete: false, agentContinues: failure.agentContinues === true }, ctx);
+        throw error;
+      }
+    });
   };
   pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible Herdr role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
+
+  pi.registerTool({
+    name: "crew_status",
+    label: "Crew Status",
+    description: "Read and optionally refresh normalized child-launch, Herdr-session, and managed-task status without prompting a model.",
+    promptSnippet: "Inspect active or recent crew child status by stable launch identity.",
+    parameters: {
+      type: "object",
+      properties: {
+        launchId: { type: "string" }, runId: { type: "string" }, taskId: { type: "string" },
+        activeOnly: { type: "boolean" }, refresh: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+      const records = await childStatusSnapshot((rawParams ?? {}) as any, ctx);
+      return { content: [{ type: "text", text: JSON.stringify({ count: records.length, records }) }], details: { count: records.length, records } };
+    },
+  });
 
   pi.registerTool({
     name: "crew_read_context",
@@ -1952,14 +2135,14 @@ export default function crewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "crew_control",
     label: "Crew Control",
-    description: "Manage compact phase plans/checkpoints, exact source snapshots, and ownership-scoped artifact cleanup.",
-    promptSnippet: "Manage compact crew phase state, source snapshots, and safe cleanup.",
+    description: "Manage compact phase plans/checkpoints, deferred review batches, exact source snapshots, and ownership-scoped artifact cleanup.",
+    promptSnippet: "Manage compact crew phase state, review batches, source snapshots, and safe cleanup.",
     parameters: {
       type: "object", required: ["action", "runId", "repositoryId"],
       properties: {
-        action: { type: "string", enum: ["plan-write", "plan-read", "contract-publish", "phase-read", "checkpoint-create", "checkpoint-read", "snapshot", "task-disposition", "cleanup-preview", "cleanup-finalize"] },
+        action: { type: "string", enum: ["plan-write", "plan-read", "contract-publish", "phase-read", "checkpoint-create", "checkpoint-read", "snapshot", "task-promote", "task-defer", "review-batch-create", "task-disposition", "cleanup-preview", "cleanup-finalize"] },
         runId: { type: "string" }, repositoryId: { type: "string" }, token: { type: "string" },
-        plan: { type: "object" }, phaseId: { type: "string" }, contractVersion: { type: "string" }, content: { type: "string" }, checkpoint: { type: "object" },
+        plan: { type: "object" }, phaseId: { type: "string" }, contractVersion: { type: "string" }, content: { type: "string" }, checkpoint: { type: "object" }, batch: { type: "object" },
         taskId: { type: "string" }, attempt: { type: "number" }, disposition: { type: "string", enum: ["finalized", "abandoned"] }, reason: { type: "string" }, sourcePaths: { type: "array", items: { type: "string" } }, artifactIds: { type: "array", items: { type: "string" } }, previewId: { type: "string" },
       }, additionalProperties: false,
     },
@@ -1977,6 +2160,15 @@ export default function crewExtension(pi: ExtensionAPI) {
       else if (params.action === "snapshot") {
         const task = params.taskId ? await readTaskAttempt(access, params.taskId, params.attempt ?? 1) : undefined;
         result = captureSourceSnapshot(ctx.cwd, params.sourcePaths ?? task?.sourcePaths ?? []);
+      } else if (params.action === "task-promote") {
+        if (!params.taskId) throw new Error("task-promote requires taskId");
+        result = await promoteTaskAttempt(access, params.taskId, params.attempt ?? 1);
+      } else if (params.action === "task-defer") {
+        if (!params.taskId) throw new Error("task-defer requires taskId");
+        result = await deferTaskAttempt(access, params.taskId, params.attempt ?? 1);
+      } else if (params.action === "review-batch-create") {
+        if (!params.batch) throw new Error("review-batch-create requires batch");
+        result = await createReviewBatch(access, params.batch);
       } else if (params.action === "task-disposition") {
         if (!params.taskId || !params.disposition || !params.reason) throw new Error("task-disposition requires taskId, disposition, and reason");
         result = await disposeTaskEvidence(access, params.taskId, params.attempt ?? 1, params.disposition, params.reason);
@@ -1987,6 +2179,31 @@ export default function crewExtension(pi: ExtensionAPI) {
       return { content: [{ type: "text", text: serialized }], details: { action: params.action, bytes: Buffer.byteLength(serialized) } };
     },
   });
+
+  pi.registerCommand?.("crew-status", {
+    description: "Show and refresh child Herdr session and lifecycle status.",
+    handler: async (_args, ctx) => {
+      const records = await childStatusSnapshot({ refresh: true }, ctx);
+      const summary = records.length ? records.map(record => `${record.launchId}: ${record.role} ${record.controllerStatus} (Herdr ${record.herdrStatus}${record.taskStatus ? `, task ${record.taskStatus}` : ""})`).join("\n") : "No crew child launches are recorded in this session.";
+      ctx.ui?.notify?.(summary, records.some(record => ["blocked", "timed_out", "lost", "replaced", "failed"].includes(record.controllerStatus)) ? "warning" : "info");
+    },
+  });
+
+  pi.on?.("session_start", (_event, ctx) => {
+    childLaunches.clear();
+    for (const entry of ctx.sessionManager?.getBranch?.() ?? []) {
+      if (entry.customType !== "crew-child-lifecycle" || !entry.data || typeof entry.data !== "object") continue;
+      try {
+        const data = entry.data as ChildLaunchRecord;
+        const restored = reconcileChildLaunch(childLaunches.get(data.launchId), data as unknown as Record<string, unknown>, data.observedAt);
+        childLaunches.set(restored.record.launchId, { ...restored.record, ...data });
+      } catch {
+        // Ignore malformed historical extension entries and keep restoring later valid records.
+      }
+    }
+    updateCrewStatusUi(ctx);
+  });
+  pi.on?.("session_shutdown", (_event, ctx) => ctx.ui?.setStatus?.("crew", undefined));
 
   // Safe interactive brain handoff. It is deliberately a user command: tools
   // cannot silently replace the active conversation.

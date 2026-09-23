@@ -63,10 +63,14 @@ import {
   beginTaskReview,
   completeTaskReview,
   acquireWriterOwnership,
+  bindTaskChildSession,
+  createReviewBatch,
+  deferTaskAttempt,
   discardCorruptArtifact,
   disposeTaskEvidence,
   markWriterRunning,
   recoverTaskAttempt,
+  recoverTaskReview,
   createRunState,
   createTaskAttempt,
   createTaskCapability,
@@ -81,6 +85,7 @@ import {
   createPhaseCheckpoint,
   finalizeArtifactCleanup,
   previewArtifactCleanup,
+  promoteTaskAttempt,
   publishPhaseContract,
   readCurrentPhase,
   readPhaseCheckpoint,
@@ -88,6 +93,7 @@ import {
   writePlanIndex,
 } from "./state.ts";
 import { assessPayload, captureSourceSnapshot, contextWarningLevel, normalizeUsage } from "./workflow.ts";
+import { herdrObservation, isActiveChild, reconcileChildLaunch } from "./herdr-session.ts";
 
 test("unresolved delegation references are rejected conservatively", () => {
   assert.throws(() => normalizeTask("implement it"), /incomplete/i);
@@ -110,6 +116,32 @@ test("blocked and timeout statuses are not completion", () => {
   assert.equal(classifyAgentStatus("blocked"), "blocked");
   assert.equal(classifyAgentStatus("timed_out"), "timed_out");
   assert.equal(classifyAgentStatus("working"), "working");
+});
+
+test("Herdr child reconciliation binds sessions monotonically and detects replacement", () => {
+  const agent = {
+    name: "executor",
+    pane_id: "w1:p2",
+    workspace_id: "w1",
+    tab_id: "w1:t1",
+    agent_status: "working",
+    state_change_seq: 12,
+    revision: 3,
+    agent_session: { source: "herdr:pi", agent: "pi", kind: "path", value: "/sessions/2026_session-a.jsonl" },
+  };
+  const observation = herdrObservation(agent);
+  const first = reconcileChildLaunch(undefined, { launchId: "launch-a", role: "executor", ...observation }, "2026-01-01T00:00:00.000Z").record;
+  assert.equal(first.controllerStatus, "running");
+  assert.equal(first.stateChangeSeq, 12);
+  assert.equal(isActiveChild(first), true);
+  const stale = reconcileChildLaunch(first, { launchId: "launch-a", role: "executor", status: "idle", stateChangeSeq: 11 }).record;
+  assert.equal(stale.controllerStatus, "running");
+  const replaced = reconcileChildLaunch(first, {
+    launchId: "launch-a", role: "executor", status: "working", paneId: "w1:p2", stateChangeSeq: 13,
+    sessionRef: { source: "herdr:pi", agent: "pi", kind: "path", value: "/sessions/2026_session-b.jsonl" },
+  }).record;
+  assert.equal(replaced.controllerStatus, "replaced");
+  assert.match(replaced.recoveryHint, /Do not attribute/);
 });
 
 function test(name: string, fn: () => void) {
@@ -846,6 +878,8 @@ await regressionTest("brain session reuses one managed run across independent ta
     assert.equal(retry!.taskToken, first!.taskToken, "a ready retry resumes the same scoped capability instead of creating concurrent credentials");
     const second = await prepareDurableLaunch({ enabled: true, baseCommand: "pi", cwd: repo, role: "executor", taskId: "task-beta", contractVersion: "v1", baseSha: "a".repeat(40), ownerSessionId: "reuse-owner", runId: first!.access.runId, stateRoot });
     assert.equal(second!.access.runId, first!.access.runId);
+    await prepareDurableLaunch({ enabled: true, baseCommand: "pi", cwd: repo, role: "executor", taskId: "task-policy", contractVersion: "v1", baseSha: "a".repeat(40), ownerSessionId: "reuse-owner", runId: first!.access.runId, stateRoot, riskClass: "standard", reviewTiming: "final" });
+    await assert.rejects(() => prepareDurableLaunch({ enabled: true, baseCommand: "pi", cwd: repo, role: "executor", taskId: "task-policy", contractVersion: "v1", baseSha: "a".repeat(40), ownerSessionId: "reuse-owner", runId: first!.access.runId, stateRoot }), /risk\/review policy/);
     assert.equal((await readTaskAttempt(first!.access, "task-alpha", 1)).status, "ready");
     assert.equal((await readTaskAttempt(first!.access, "task-beta", 1)).status, "ready");
   } finally {
@@ -908,6 +942,67 @@ await regressionTest("managed multi-task lifecycle gates executor to reviewer ha
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });
   }
+});
+
+await regressionTest("standard attempts defer into one exact review batch and share its verdict", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "crew-review-batch-repo-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "crew-review-batch-root-"));
+  const baseSha = "1".repeat(40); const headSha = "2".repeat(40); const snapshot = "3".repeat(64);
+  try {
+    execFileSync("git", ["init", "-q", repo]);
+    const owner = await createRunState({ cwd: repo, stateRoot, runId: "run-review-batch" });
+    await createTaskAttempt(owner, { taskId: "standard-one", attempt: 1, contractVersion: "v1", baseSha, riskClass: "standard", reviewTiming: "final" });
+    await transitionTaskAttempt(owner, "standard-one", 1, "ready", { status: "running" });
+    const executor = { ...owner, token: await createTaskCapability(owner, { role: "executor", taskId: "standard-one", attempt: 1 }) };
+    const reportId = await beginPublication(executor, { kind: "report", taskId: "standard-one", attempt: 1, contractVersion: "v1", baseSha, headSha, requiredSections: ["Summary", "Validation", "Assumptions", "Risks"] });
+    await appendPublicationChunk(executor, reportId, 0, "# Summary\ndone\n## Validation\npass\n## Assumptions\nnone\n## Risks\nnone\n");
+    await finalizePublication(executor, reportId, 1);
+    await submitTaskAttempt(owner, "standard-one", 1);
+    assert.equal((await deferTaskAttempt(owner, "standard-one", 1)).status, "deferred");
+
+    await createTaskAttempt(owner, { taskId: "standard-two", attempt: 1, contractVersion: "v1", baseSha, riskClass: "standard", reviewTiming: "final" });
+    await transitionTaskAttempt(owner, "standard-two", 1, "ready", { status: "running" });
+    const executorTwo = { ...owner, token: await createTaskCapability(owner, { role: "executor", taskId: "standard-two", attempt: 1 }) };
+    const reportTwo = await beginPublication(executorTwo, { kind: "report", taskId: "standard-two", attempt: 1, contractVersion: "v1", baseSha, headSha, requiredSections: ["Summary", "Validation", "Assumptions", "Risks"] });
+    await appendPublicationChunk(executorTwo, reportTwo, 0, "# Summary\ndone two\n## Validation\npass\n## Assumptions\nnone\n## Risks\nnone\n");
+    await finalizePublication(executorTwo, reportTwo, 1);
+    await submitTaskAttempt(owner, "standard-two", 1); await deferTaskAttempt(owner, "standard-two", 1);
+
+    await createTaskAttempt(owner, { taskId: "major-one", attempt: 1, contractVersion: "v1", baseSha });
+    await transitionTaskAttempt(owner, "major-one", 1, "ready", { status: "submitted" });
+    await assert.rejects(() => deferTaskAttempt(owner, "major-one", 1), /Only standard tasks/);
+    await createTaskAttempt(owner, { taskId: "promoted-one", attempt: 1, contractVersion: "v1", baseSha, riskClass: "standard", reviewTiming: "final" });
+    await transitionTaskAttempt(owner, "promoted-one", 1, "ready", { status: "submitted" });
+    const promoted = await promoteTaskAttempt(owner, "promoted-one", 1);
+    assert.equal(promoted.riskClass, "major"); assert.equal(promoted.reviewTiming, "immediate");
+    await assert.rejects(() => deferTaskAttempt(owner, "promoted-one", 1), /Only standard tasks/);
+    await bindTaskChildSession(owner, "major-one", 1, { launchId: "launch-major", agentName: "executor", paneId: "w1:p2", stateChangeSeq: 4, herdrStatus: "working", observedAt: new Date().toISOString() });
+    await assert.rejects(() => bindTaskChildSession(owner, "major-one", 1, { launchId: "launch-major", agentName: "executor", paneId: "w1:p2", stateChangeSeq: 3, observedAt: new Date().toISOString() }), /sequence regressed/);
+    await assert.rejects(() => bindTaskChildSession(owner, "major-one", 1, { launchId: "launch-major", agentName: "executor", paneId: "w1:p3", stateChangeSeq: 5, observedAt: new Date().toISOString() }), /identity changed/);
+    await transitionTaskAttempt(owner, "major-one", 1, "submitted", { status: "reviewing" });
+    await assert.rejects(() => recoverTaskReview(owner, "major-one", 1, false, "not proven"), /not been proven inactive/);
+    const resetReview = await recoverTaskReview(owner, "major-one", 1, true, "reviewer pane disappeared");
+    assert.equal(resetReview.status, "submitted"); assert.equal(resetReview.childSession, undefined);
+
+    const manifestId = await beginPublication(owner, { kind: "report", taskId: "final-batch", attempt: 1, contractVersion: "batch-v1", baseSha, headSha, sourceSnapshotId: snapshot, requiredSections: ["Summary", "Validation", "Assumptions", "Risks"] });
+    await appendPublicationChunk(owner, manifestId, 0, "# Summary\nstandard-one\nstandard-two\n## Validation\nmember reports linked\n## Assumptions\nnone\n## Risks\nnone\n");
+    await finalizePublication(owner, manifestId, 1);
+    await assert.rejects(() => createReviewBatch(owner, { taskId: "duplicate-batch", contractVersion: "batch-v1", baseSha, headSha, sourcePaths: ["source.ts"], sourceSnapshotId: snapshot, reportArtifactId: manifestId, members: [{ taskId: "standard-one", attempt: 1 }, { taskId: "standard-one", attempt: 1 }] }), /Duplicate review batch member/);
+    const batch = await createReviewBatch(owner, { taskId: "final-batch", contractVersion: "batch-v1", baseSha, headSha, sourcePaths: ["source.ts"], sourceSnapshotId: snapshot, reportArtifactId: manifestId, members: [{ taskId: "standard-one", attempt: 1 }, { taskId: "standard-two", attempt: 1 }] });
+    assert.equal(batch.status, "submitted"); assert.equal(batch.taskKind, "review-batch");
+    await beginTaskReview(owner, "final-batch", 1);
+    const reviewer = { ...owner, token: await createTaskCapability(owner, { role: "reviewer", taskId: "final-batch", attempt: 1 }) };
+    const reviewId = await beginPublication(reviewer, { kind: "review", verdict: "PASS", taskId: "final-batch", attempt: 1, contractVersion: "batch-v1", baseSha, headSha, sourceSnapshotId: snapshot, requiredSections: ["Verdict", "Findings", "Validation"] });
+    await appendPublicationChunk(reviewer, reviewId, 0, "# Verdict\nPASS\n## Findings\nnone\n## Validation\nbatch reviewed\n");
+    await finalizePublication(reviewer, reviewId, 1);
+    // Simulate a stopped process after one member write but before the batch write.
+    await transitionTaskAttempt(owner, "standard-one", 1, "deferred", { status: "approved", reviewArtifactId: reviewId });
+    assert.equal((await completeTaskReview(owner, "final-batch", 1)).status, "approved");
+    const approvedMember = await readTaskAttempt(owner, "standard-one", 1);
+    const approvedMemberTwo = await readTaskAttempt(owner, "standard-two", 1);
+    assert.equal(approvedMember.status, "approved"); assert.equal(approvedMember.reviewArtifactId, reviewId);
+    assert.equal(approvedMemberTwo.status, "approved"); assert.equal(approvedMemberTwo.reviewArtifactId, reviewId);
+  } finally { rmSync(repo, { recursive: true, force: true }); rmSync(stateRoot, { recursive: true, force: true }); }
 });
 
 await regressionTest("managed lifecycle rejects missing, invalid, stale, and blocked submissions", async () => {
@@ -1164,13 +1259,16 @@ await regressionTest("compact plan index, immutable contracts, and approved chec
     await writePlanIndex(access, { revision: 1, currentPhaseId: "r2", phases: [{ id: "r2", summary: "Bound context", status: "current", contractVersion: "v1" }, { id: "r3", summary: "Models", status: "pending", contractVersion: "v1" }] });
     const current = await readCurrentPhase(access);
     assert.equal(current.index.phases.length, 2);
+    assert.equal(current.index.phases[0].riskClass, "major", "legacy plan entries default to immediate major review");
     assert.match(current.contract, /Preserve blockers/);
+    await assert.rejects(() => writePlanIndex(access, { revision: 2, currentPhaseId: "r3", phases: [{ id: "r2", summary: "Bound context", status: "implemented", contractVersion: "v1", riskClass: "standard", reviewTiming: "immediate" }, { id: "r3", summary: "Models", status: "current", contractVersion: "v1" }] }), /inconsistent risk/);
+    await writePlanIndex(access, { revision: 2, currentPhaseId: "r3", phases: [{ id: "r2", summary: "Bound context", status: "implemented", contractVersion: "v1", riskClass: "standard", reviewTiming: "final" }, { id: "r3", summary: "Models", status: "current", contractVersion: "v1", riskClass: "major", reviewTiming: "immediate" }] });
     await assert.rejects(() => publishPhaseContract(access, "r2", "v1", "overwrite"), /EEXIST/);
     const snapshot = "a".repeat(64);
     const checkpoint = await createPhaseCheckpoint(access, { phaseId: "r2", contractVersion: "v1", sourceSnapshotId: snapshot, summary: "R2 passed", decisions: ["fresh sessions"], remainingPhaseIds: ["r3"], unresolvedBlockerIds: ["finding-1"], approvalState: "approved", evidenceArtifactIds: [] });
     assert.equal((await readPhaseCheckpoint(access, "r2")).unresolvedBlockerIds[0], "finding-1");
     assert.equal(checkpoint.approvalState, "approved");
-    assert.equal((await readPlanIndex(access)).revision, 1);
+    assert.equal((await readPlanIndex(access)).revision, 2);
   } finally { rmSync(repo, { recursive: true, force: true }); rmSync(stateRoot, { recursive: true, force: true }); }
 });
 
@@ -1273,7 +1371,6 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
       scout: ["medium", "medium", "read-only"],
       oracle: ["frontier", "xhigh", "read-only"],
       executor: ["small", "medium", "can-edit"],
-      "executor-escalation": ["medium", "medium", "can-edit"],
       reviewer: ["frontier", "xhigh", "read-only"],
     }
   );
@@ -1292,6 +1389,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   const executorRole = resolveRole("executor", permanent);
   assert.equal(executorRole.model, "google/gemini-3.8-flash");
   assert.equal(executorRole.reasoning, "medium");
+  assert.throws(() => resolveRole("executor-escalation", permanent), /Unknown crew role/);
 
   const reviewerRole = resolveRole("reviewer", permanent);
   assert.equal(reviewerRole.model, "anthropic/claude-opus-5");

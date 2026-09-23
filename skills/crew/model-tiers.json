@@ -20,11 +20,6 @@
       "reasoning": "medium",
       "authority": "can-edit"
     },
-    "executor-escalation": {
-      "model": "medium",
-      "reasoning": "medium",
-      "authority": "can-edit"
-    },
     "reviewer": {
       "model": "frontier",
       "reasoning": "xhigh",

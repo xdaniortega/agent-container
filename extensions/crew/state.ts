@@ -62,6 +62,22 @@ export type PublicationMetadata = {
   verdict?: "PASS" | "REVISION_NEEDED" | "BLOCKED";
 };
 
+export type RiskClass = "standard" | "major";
+export type ReviewTiming = "final" | "immediate";
+export type ChildSessionBinding = {
+  launchId: string;
+  agentName: string;
+  paneId: string;
+  workspaceId?: string;
+  tabId?: string;
+  sessionRef?: { source: string; agent: string; kind: string; value: string };
+  piSessionId?: string;
+  stateChangeSeq?: number;
+  herdrStatus?: string;
+  observedAt: string;
+};
+export type ReviewBatchMember = { taskId: string; attempt: number; reportArtifactId: string };
+
 export type TaskAttemptState = {
   schemaVersion: 1;
   taskId: string;
@@ -69,9 +85,13 @@ export type TaskAttemptState = {
   contractVersion: string;
   baseSha: string;
   headSha?: string;
-  status: "ready" | "starting" | "running" | "submitted" | "reviewing" | "approved" | "revision-needed" | "blocked" | "failed";
+  taskKind?: "execution" | "review-batch";
+  riskClass?: RiskClass;
+  reviewTiming?: ReviewTiming;
+  status: "ready" | "starting" | "running" | "submitted" | "deferred" | "reviewing" | "approved" | "revision-needed" | "blocked" | "failed";
   reportArtifactId?: string;
   reviewArtifactId?: string;
+  reviewBatchMembers?: ReviewBatchMember[];
   writerAgentName?: string;
   writerPaneId?: string;
   failureReason?: string;
@@ -79,11 +99,13 @@ export type TaskAttemptState = {
   sourceSnapshotId?: string;
   executorSessionGeneration?: string;
   reviewerSessionGeneration?: string;
+  childSession?: ChildSessionBinding;
+  reviewRecovery?: { reason: string; recoveredAt: string };
   evidenceDisposition?: { action: "finalized" | "abandoned"; reason: string; disposedAt: string };
   updatedAt: string;
 };
 
-export type PlanPhase = { id: string; summary: string; status: "pending" | "current" | "completed" | "blocked"; contractVersion: string };
+export type PlanPhase = { id: string; summary: string; status: "pending" | "current" | "implemented" | "completed" | "blocked"; contractVersion: string; riskClass?: RiskClass; reviewTiming?: ReviewTiming };
 export type PlanIndex = { schemaVersion: 1; revision: number; currentPhaseId: string | null; phases: PlanPhase[]; updatedAt: string };
 export type PhaseCheckpoint = { schemaVersion: 1; phaseId: string; contractVersion: string; sourceSnapshotId: string; summary: string; decisions: string[]; remainingPhaseIds: string[]; unresolvedBlockerIds: string[]; approvalState: "approved" | "provisional"; evidenceArtifactIds: string[]; createdAt: string };
 
@@ -313,6 +335,16 @@ function taskAttemptPath(access: RunAccess, taskId: string, attempt: number): st
   return join(access.runDir, "tasks", taskId, `attempt-${attempt}.json`);
 }
 
+function taskLockName(taskId: string, attempt: number): string {
+  return `task-${createHash("sha256").update(`${taskId}/${attempt}`).digest("hex").slice(0, 32)}`;
+}
+
+async function withTaskLocks<T>(access: RunAccess, tasks: Array<{ taskId: string; attempt: number }>, work: () => Promise<T>): Promise<T> {
+  const names = [...new Set(tasks.map(task => taskLockName(task.taskId, task.attempt)))].sort();
+  const acquire = (index: number): Promise<T> => index === names.length ? work() : withStateLock(access, names[index], () => acquire(index + 1));
+  return acquire(0);
+}
+
 async function writeReplacement(path: string, value: unknown): Promise<void> {
   const nextPath = `${path}.${randomUUID()}.next`;
   await writeExclusive(nextPath, `${JSON.stringify(value, null, 2)}\n`);
@@ -324,24 +356,27 @@ async function writeReplacement(path: string, value: unknown): Promise<void> {
  * @param options Contract, base revision, and optional source-snapshot scope.
  * @returns The initial task-attempt state.
  */
-export async function createTaskAttempt(access: RunAccess, options: { taskId: string; attempt: number; contractVersion: string; baseSha: string; sourcePaths?: string[]; executorSessionGeneration?: string }): Promise<TaskAttemptState> {
+export async function createTaskAttempt(access: RunAccess, options: { taskId: string; attempt: number; contractVersion: string; baseSha: string; sourcePaths?: string[]; executorSessionGeneration?: string; riskClass?: RiskClass; reviewTiming?: ReviewTiming }): Promise<TaskAttemptState> {
   const { capability } = await authenticate(access.runDir, access.token);
   if (!capability.owner) throw new Error("Only the run owner may create task attempts");
   assertId(options.contractVersion, "contractVersion");
   assertOptionalSha(options.baseSha, "baseSha");
-  return withStateLock(access, `task-${createHash("sha256").update(`${options.taskId}/${options.attempt}`).digest("hex").slice(0, 32)}`, async () => {
+  const riskClass = options.riskClass ?? "major";
+  const reviewTiming = options.reviewTiming ?? "immediate";
+  if ((riskClass === "major") !== (reviewTiming === "immediate")) throw new Error("Major tasks require immediate review and standard tasks require final review");
+  return withStateLock(access, taskLockName(options.taskId, options.attempt), async () => {
     const path = taskAttemptPath(access, options.taskId, options.attempt);
     await mkdirSafe(access.stateRoot, dirname(path));
     if (existsSync(path)) {
       const existing = await readTaskAttempt(access, options.taskId, options.attempt);
-      if (existing.status === "ready" && existing.contractVersion === options.contractVersion && existing.baseSha === options.baseSha) return existing;
+      if (existing.status === "ready" && existing.contractVersion === options.contractVersion && existing.baseSha === options.baseSha && (existing.riskClass ?? "major") === riskClass && (existing.reviewTiming ?? "immediate") === reviewTiming) return existing;
       throw new Error(`Task attempt already exists in ${existing.status} state with a different or active launch contract`);
     }
     if (options.attempt > 1) {
       const previous = await readTaskAttempt(access, options.taskId, options.attempt - 1);
       if (!["revision-needed", "blocked", "failed"].includes(previous.status)) throw new Error("A new attempt requires the previous attempt to need revision, be blocked, or fail");
     }
-    const state: TaskAttemptState = { schemaVersion: 1, ...options, status: "ready", updatedAt: new Date().toISOString() };
+    const state: TaskAttemptState = { schemaVersion: 1, ...options, taskKind: "execution", riskClass, reviewTiming, status: "ready", updatedAt: new Date().toISOString() };
     await publishExclusive(path, `${JSON.stringify(state, null, 2)}\n`);
     return state;
   });
@@ -367,10 +402,10 @@ export async function readTaskAttempt(access: RunAccess, taskId: string, attempt
  * @param update Lifecycle fields to merge into the attempt.
  * @returns The updated task-attempt state.
  */
-export async function transitionTaskAttempt(access: RunAccess, taskId: string, attempt: number, expected: TaskAttemptState["status"], update: Partial<Pick<TaskAttemptState, "status" | "headSha" | "reportArtifactId" | "reviewArtifactId" | "writerAgentName" | "writerPaneId" | "failureReason" | "sourceSnapshotId" | "reviewerSessionGeneration">>): Promise<TaskAttemptState> {
+export async function transitionTaskAttempt(access: RunAccess, taskId: string, attempt: number, expected: TaskAttemptState["status"], update: Partial<Pick<TaskAttemptState, "status" | "headSha" | "reportArtifactId" | "reviewArtifactId" | "writerAgentName" | "writerPaneId" | "failureReason" | "sourceSnapshotId" | "reviewerSessionGeneration" | "childSession" | "reviewRecovery" | "riskClass" | "reviewTiming">>): Promise<TaskAttemptState> {
   const { capability } = await authenticate(access.runDir, access.token);
   if (!capability.owner) throw new Error("Only the run owner may transition task attempts");
-  return withStateLock(access, `task-${createHash("sha256").update(`${taskId}/${attempt}`).digest("hex").slice(0, 32)}`, async () => {
+  return withStateLock(access, taskLockName(taskId, attempt), async () => {
     const current = await readTaskAttempt(access, taskId, attempt);
     if (current.status !== expected) throw new Error(`Task ${taskId} attempt ${attempt} is ${current.status}, expected ${expected}`);
     if (update.headSha) assertOptionalSha(update.headSha, "headSha");
@@ -378,6 +413,27 @@ export async function transitionTaskAttempt(access: RunAccess, taskId: string, a
     await writeReplacement(taskAttemptPath(access, taskId, attempt), next);
     return next;
   });
+}
+
+/**
+ * @notice Binds a managed attempt to the exact Herdr child launch currently hosting it.
+ * @param binding Normalized pane, agent, session, and observed lifecycle identity.
+ * @returns The attempt with its latest child-session binding.
+ */
+export async function bindTaskChildSession(access: RunAccess, taskId: string, attempt: number, binding: ChildSessionBinding): Promise<TaskAttemptState> {
+  const current = await readTaskAttempt(access, taskId, attempt);
+  const previous = current.childSession;
+  const previousSeq = previous?.stateChangeSeq;
+  if (previousSeq !== undefined && binding.stateChangeSeq !== undefined && binding.stateChangeSeq < previousSeq) {
+    throw new Error("Child-session binding sequence regressed");
+  }
+  if (previous && (previous.launchId !== binding.launchId || previous.paneId !== binding.paneId || previous.agentName !== binding.agentName)) {
+    throw new Error("Managed child launch identity changed");
+  }
+  if (previous?.sessionRef && binding.sessionRef && JSON.stringify(previous.sessionRef) !== JSON.stringify(binding.sessionRef)) {
+    throw new Error("Managed child agent session was replaced");
+  }
+  return transitionTaskAttempt(access, taskId, attempt, current.status, { childSession: binding });
 }
 
 function writerOwnershipPath(access: RunAccess): string {
@@ -447,6 +503,20 @@ export async function recoverTaskAttempt(access: RunAccess, taskId: string, atte
 }
 
 /**
+ * @notice Returns an orphaned reviewer launch to its submitted gate after liveness proof.
+ * @param confirmedReviewerInactive Whether Herdr corroborated that the bound reviewer is inactive.
+ * @param reason Audit reason recorded for the reset.
+ * @returns The submitted task ready for a fresh reviewer session.
+ */
+export async function recoverTaskReview(access: RunAccess, taskId: string, attempt: number, confirmedReviewerInactive: boolean, reason: string): Promise<TaskAttemptState> {
+  if (!confirmedReviewerInactive) throw new Error("Review recovery refused: reviewer liveness has not been proven inactive");
+  if (!reason?.trim() || Buffer.byteLength(reason.trim(), "utf8") > 1_000) throw new Error("Review recovery requires a non-blank reason of at most 1000 bytes");
+  const current = await readTaskAttempt(access, taskId, attempt);
+  if (current.status !== "reviewing") throw new Error(`Review recovery requires reviewing state, found ${current.status}`);
+  return transitionTaskAttempt(access, taskId, attempt, "reviewing", { status: "submitted", childSession: undefined, reviewerSessionGeneration: undefined, reviewRecovery: { reason: reason.trim(), recoveredAt: new Date().toISOString() } });
+}
+
+/**
  * @notice Records explicit run-level disposition of terminal task evidence.
  * @param action Finalize approved evidence or abandon unsuccessful evidence.
  * @param reason Audit reason for the disposition.
@@ -456,7 +526,7 @@ export async function disposeTaskEvidence(access: RunAccess, taskId: string, att
   const { capability } = await authenticate(access.runDir, access.token);
   if (!capability.owner) throw new Error("Only the run owner may dispose task evidence");
   if (!reason?.trim() || Buffer.byteLength(reason.trim(), "utf8") > 1_000) throw new Error("Evidence disposition requires a non-blank reason of at most 1000 bytes");
-  return withStateLock(access, `task-${createHash("sha256").update(`${taskId}/${attempt}`).digest("hex").slice(0, 32)}`, async () => {
+  return withStateLock(access, taskLockName(taskId, attempt), async () => {
     const current = await readTaskAttempt(access, taskId, attempt);
     if (!["approved", "revision-needed", "blocked", "failed"].includes(current.status)) throw new Error(`Evidence disposition requires approved, revision-needed, blocked, or failed status, found ${current.status}`);
     if (current.status === "approved" && action !== "finalized") throw new Error("Approved task evidence may only be disposed by explicit finalization");
@@ -772,6 +842,105 @@ export async function submitTaskAttempt(access: RunAccess, taskId: string, attem
 }
 
 /**
+ * @notice Promotes an actually major submitted task to the immediate review gate.
+ * @returns The submitted attempt with irreversible major/immediate classification.
+ */
+export async function promoteTaskAttempt(access: RunAccess, taskId: string, attempt: number): Promise<TaskAttemptState> {
+  const task = await readTaskAttempt(access, taskId, attempt);
+  if ((task.taskKind ?? "execution") !== "execution") throw new Error("Only execution attempts may be promoted");
+  if ((task.riskClass ?? "major") === "major") return task;
+  return transitionTaskAttempt(access, taskId, attempt, "submitted", { riskClass: "major", reviewTiming: "immediate" });
+}
+
+/**
+ * @notice Defers a submitted standard task into the final review batch.
+ * @returns The deferred task-attempt state.
+ */
+export async function deferTaskAttempt(access: RunAccess, taskId: string, attempt: number): Promise<TaskAttemptState> {
+  const task = await readTaskAttempt(access, taskId, attempt);
+  if ((task.taskKind ?? "execution") !== "execution") throw new Error("Only execution attempts may be deferred");
+  if ((task.riskClass ?? "major") !== "standard" || (task.reviewTiming ?? "immediate") !== "final") {
+    throw new Error("Only standard tasks with final review timing may be deferred");
+  }
+  return transitionTaskAttempt(access, taskId, attempt, "submitted", { status: "deferred" });
+}
+
+/**
+ * @notice Creates a submitted synthetic task representing one exact final review batch.
+ * @param options Batch identity, immutable manifest evidence, source snapshot, and deferred members.
+ * @returns The review-batch task ready for an independent reviewer.
+ */
+export async function createReviewBatch(access: RunAccess, options: {
+  taskId: string;
+  attempt?: number;
+  contractVersion: string;
+  baseSha: string;
+  headSha: string;
+  sourcePaths: string[];
+  sourceSnapshotId: string;
+  reportArtifactId: string;
+  members: Array<{ taskId: string; attempt: number }>;
+}): Promise<TaskAttemptState> {
+  const { capability } = await authenticate(access.runDir, access.token);
+  if (!capability.owner) throw new Error("Only the run owner may create review batches");
+  const attempt = options.attempt ?? 1;
+  assertId(options.taskId, "taskId"); assertId(options.contractVersion, "contractVersion"); assertId(options.reportArtifactId, "reportArtifactId");
+  assertOptionalSha(options.baseSha, "baseSha"); assertOptionalSha(options.headSha, "headSha");
+  if (!/^[a-f0-9]{64}$/i.test(options.sourceSnapshotId)) throw new Error("Review batch requires an exact SHA-256 source snapshot");
+  if (!options.sourcePaths.length) throw new Error("Review batch requires source paths");
+  if (!options.members.length) throw new Error("Review batch requires at least one deferred member");
+  const sourcePaths = [...new Set(options.sourcePaths)].sort();
+  const sourcePathSet = new Set(sourcePaths);
+  const memberKeys = new Set<string>(); const members: ReviewBatchMember[] = [];
+  for (const member of options.members) {
+    const key = `${member.taskId}/${member.attempt}`;
+    if (memberKeys.has(key)) throw new Error(`Duplicate review batch member: ${key}`);
+    memberKeys.add(key);
+    const task = await readTaskAttempt(access, member.taskId, member.attempt);
+    if (task.status !== "deferred") throw new Error(`Review batch member ${key} is ${task.status}, expected deferred`);
+    if ((task.riskClass ?? "major") !== "standard" || (task.reviewTiming ?? "immediate") !== "final") throw new Error(`Review batch member ${key} is not standard deferred work`);
+    if (!task.reportArtifactId) throw new Error(`Review batch member ${key} has no executor report`);
+    if ((task.sourcePaths ?? []).some(path => !sourcePathSet.has(path))) throw new Error(`Review batch source paths do not cover member ${key}`);
+    const blockers = [...await unresolvedBlockersFor(access, "executor", member.taskId, member.attempt), ...await unresolvedBlockersFor(access, "reviewer", member.taskId, member.attempt)];
+    if (blockers.length) throw new Error(`Review batch member ${key} has unresolved blockers: ${blockers.map(item => item.artifactId).join(", ")}`);
+    await loadArtifact(access.runDir, access.stateRoot, task.reportArtifactId);
+    members.push({ taskId: member.taskId, attempt: member.attempt, reportArtifactId: task.reportArtifactId });
+  }
+  const report = await loadArtifact(access.runDir, access.stateRoot, options.reportArtifactId);
+  if (report.kind !== "report" || report.authorRole !== "brain" || report.taskId !== options.taskId || report.attempt !== attempt || report.contractVersion !== options.contractVersion || report.baseSha !== options.baseSha || report.headSha !== options.headSha || report.sourceSnapshotId !== options.sourceSnapshotId) {
+    throw new Error("Review batch manifest must be one exact brain-authored report for the batch identity and snapshot");
+  }
+  for (const section of ["Summary", "Validation", "Assumptions", "Risks"]) {
+    if (!(report.requiredSections ?? []).includes(section) || !hasMarkdownSection(report.content, section)) throw new Error(`Review batch manifest is missing required section: ${section}`);
+  }
+  for (const member of members) if (!report.content.includes(member.taskId)) throw new Error(`Review batch manifest does not identify member ${member.taskId}`);
+  return withStateLock(access, taskLockName(options.taskId, attempt), async () => {
+    const path = taskAttemptPath(access, options.taskId, attempt);
+    await mkdirSafe(access.stateRoot, dirname(path));
+    if (existsSync(path)) throw new Error(`Review batch task already exists: ${options.taskId}/attempt-${attempt}`);
+    const state: TaskAttemptState = {
+      schemaVersion: 1,
+      taskId: options.taskId,
+      attempt,
+      contractVersion: options.contractVersion,
+      baseSha: options.baseSha,
+      headSha: options.headSha,
+      taskKind: "review-batch",
+      riskClass: "major",
+      reviewTiming: "immediate",
+      status: "submitted",
+      reportArtifactId: options.reportArtifactId,
+      reviewBatchMembers: members,
+      sourcePaths,
+      sourceSnapshotId: options.sourceSnapshotId,
+      updatedAt: new Date().toISOString(),
+    };
+    await publishExclusive(path, `${JSON.stringify(state, null, 2)}\n`);
+    return state;
+  });
+}
+
+/**
  * @notice Starts review only for an artifact-gated submitted attempt.
  * @param reviewerSessionGeneration Optional reviewer-session generation marker.
  * @returns The attempt transitioned to review.
@@ -795,7 +964,34 @@ export async function completeTaskReview(access: RunAccess, taskId: string, atte
   if (blockers.length) throw new Error(`Review completion is blocked by unresolved messages: ${blockers.map(item => item.artifactId).join(", ")}`);
   const review = await matchingHandoff(access, { kind: "review", authorRole: "reviewer", task, headSha: task.headSha, sourceSnapshotId: task.sourceSnapshotId, requiredSections });
   const status = review.verdict === "PASS" ? "approved" : review.verdict === "BLOCKED" ? "blocked" : "revision-needed";
-  return transitionTaskAttempt(access, taskId, attempt, "reviewing", { status, reviewArtifactId: review.artifactId });
+  if ((task.taskKind ?? "execution") !== "review-batch") {
+    return transitionTaskAttempt(access, taskId, attempt, "reviewing", { status, reviewArtifactId: review.artifactId });
+  }
+  const { capability } = await authenticate(access.runDir, access.token);
+  if (!capability.owner) throw new Error("Only the run owner may complete a review batch");
+  const members = task.reviewBatchMembers ?? [];
+  if (!members.length) throw new Error("Review batch has no deferred members");
+  return withTaskLocks(access, [{ taskId, attempt }, ...members], async () => {
+    const currentBatch = await readTaskAttempt(access, taskId, attempt);
+    if (currentBatch.status !== "reviewing") throw new Error(`Review batch is ${currentBatch.status}, expected reviewing`);
+    const currentMembers = [] as TaskAttemptState[];
+    for (const member of members) {
+      const current = await readTaskAttempt(access, member.taskId, member.attempt);
+      const alreadyApplied = current.status === status && current.reviewArtifactId === review.artifactId;
+      if (current.status !== "deferred" && !alreadyApplied) throw new Error(`Review batch member ${member.taskId}/${member.attempt} is ${current.status}, expected deferred or the same applied verdict`);
+      if (current.reportArtifactId !== member.reportArtifactId) throw new Error(`Review batch member ${member.taskId}/${member.attempt} report changed`);
+      if (!alreadyApplied) currentMembers.push(current);
+    }
+    const updatedAt = new Date().toISOString();
+    for (const member of currentMembers) {
+      // The batch record is written last. If the process stops mid-fan-out,
+      // retrying accepts members that already carry this exact verdict.
+      await writeReplacement(taskAttemptPath(access, member.taskId, member.attempt), { ...member, status, reviewArtifactId: review.artifactId, updatedAt });
+    }
+    const completed = { ...currentBatch, status, reviewArtifactId: review.artifactId, updatedAt };
+    await writeReplacement(taskAttemptPath(access, taskId, attempt), completed);
+    return completed;
+  });
 }
 
 function acknowledgementPath(access: RunAccess, capability: Capability, artifactId: string): string {
@@ -901,14 +1097,19 @@ export async function writePlanIndex(access: RunAccess, input: Omit<PlanIndex, "
   if (!Number.isInteger(input.revision) || input.revision < 1) throw new Error("Plan revision must be a positive integer");
   if (!Array.isArray(input.phases) || input.phases.length > 100) throw new Error("Plan index must contain at most 100 phases");
   const ids = new Set<string>();
-  for (const phase of input.phases) {
+  const phases = input.phases.map(phase => {
     assertId(phase.id, "phase id"); assertId(phase.contractVersion, "contractVersion");
     if (!phase.summary.trim() || Buffer.byteLength(phase.summary, "utf8") > 512) throw new Error("Phase summaries must be non-empty and at most 512 bytes");
+    if (!["pending", "current", "implemented", "completed", "blocked"].includes(phase.status)) throw new Error(`Invalid phase status: ${phase.status}`);
     if (ids.has(phase.id)) throw new Error(`Duplicate phase id: ${phase.id}`); ids.add(phase.id);
-  }
+    const riskClass = phase.riskClass ?? "major";
+    const reviewTiming = phase.reviewTiming ?? "immediate";
+    if ((riskClass === "major") !== (reviewTiming === "immediate")) throw new Error(`Phase ${phase.id} has inconsistent risk and review timing`);
+    return { ...phase, riskClass, reviewTiming };
+  });
   if (input.currentPhaseId !== null && !ids.has(input.currentPhaseId)) throw new Error("currentPhaseId must name an indexed phase");
-  if (input.phases.filter(phase => phase.status === "current").length !== (input.currentPhaseId ? 1 : 0)) throw new Error("Exactly the current phase must have current status");
-  const value: PlanIndex = { schemaVersion: 1, ...input, updatedAt: new Date().toISOString() };
+  if (phases.filter(phase => phase.status === "current").length !== (input.currentPhaseId ? 1 : 0)) throw new Error("Exactly the current phase must have current status");
+  const value: PlanIndex = { schemaVersion: 1, ...input, phases, updatedAt: new Date().toISOString() };
   return withStateLock(access, "plan-index", async () => {
     const path = join(access.runDir, "plan", "index.json");
     await mkdirSafe(access.stateRoot, dirname(path));
@@ -932,7 +1133,10 @@ export async function readPlanIndex(access: RunAccess): Promise<PlanIndex> {
   await authenticate(access.runDir, access.token);
   const value = JSON.parse(await readFile(join(access.runDir, "plan", "index.json"), "utf8")) as PlanIndex;
   if (value.schemaVersion !== 1) throw new Error("Invalid plan index");
-  return value;
+  return {
+    ...value,
+    phases: value.phases.map(phase => ({ ...phase, riskClass: phase.riskClass ?? "major", reviewTiming: phase.reviewTiming ?? "immediate" })),
+  };
 }
 
 /**
