@@ -1,8 +1,8 @@
 {
   "models": {
-    "frontier": "anthropic/claude-opus-5",
-    "medium": "anthropic/claude-opus-4-8",
-    "small": "google/gemini-3.8-flash"
+    "frontier": "anthropic/claude-opus-5-5",
+    "medium": "anthropic/claude-sonnet-5-5",
+    "small": "anthropic/claude-sonnet-5-5"
   },
   "crewRoles": {
     "scout": {

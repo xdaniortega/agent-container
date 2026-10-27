@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import crewExtension, { rememberOwnerAccess } from "./index.ts";
-import { appendPublicationChunk, beginPublication, createRunState, createTaskAttempt, createTaskCapability, finalizePublication, readInbox } from "./state.ts";
+import { appendPublicationChunk, beginPublication, bindTaskChildSession, createRunState, createTaskAttempt, createTaskCapability, finalizePublication, readInbox, transitionTaskAttempt } from "./state.ts";
 
 const repo = mkdtempSync(join(tmpdir(), "crew-fresh-runtime-repo-"));
 const stateRoot = mkdtempSync(join(tmpdir(), "crew-fresh-runtime-state-"));
@@ -27,7 +27,7 @@ try {
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
     sendMessage(message: unknown, options: unknown) { modelMessages.push({ message, options }); },
   } as any);
-  assert.deepEqual([...tools.keys()], ["crew_launch", "crew_status", "crew_read_context", "crew_publish", "crew_read", "crew_control", "crew_rules"]);
+  assert.deepEqual([...tools.keys()], ["crew_launch", "crew_status", "crew_read_context", "crew_publish", "crew_read", "crew_control", "self_compact", "crew_compact_decide", "crew_rules"]);
   assert.ok(commands.has("crew-status"));
   assert.ok(commands.has("crew-handoff"));
 
@@ -53,7 +53,7 @@ try {
   const cleanup = JSON.parse((await call({ action: "cleanup-finalize", previewId: preview.previewId })).content[0].text); assert.deepEqual(cleanup.retainedArtifactIds, [evidence.artifactId]);
 
   const messageEnd = events.get("message_end")![0];
-  const warningCtx = { cwd: repo, getContextUsage: () => ({ tokens: 126000 }), sessionManager: { getSessionId: () => sessionId, getBranch: () => [] }, ui: { notify: (...args: any[]) => notices.push(args) } };
+  const warningCtx = { cwd: repo, getContextUsage: () => ({ tokens: 510000, contextWindow: 1000000 }), sessionManager: { getSessionId: () => sessionId, getBranch: () => [] }, ui: { notify: (...args: any[]) => notices.push(args) } };
   await messageEnd({ message: { role: "assistant", usage: { input: 1000, cacheRead: 125000, output: 10, cost: { total: 2 } } } }, warningCtx);
   await messageEnd({ message: { role: "assistant", usage: { input: 1000, cacheRead: 125000, output: 10 } } }, warningCtx);
   assert.equal(notices.length, 1); assert.equal(entries.filter(entry => entry.type === "crew-context-warning").length, 1); assert.equal(entries.filter(entry => entry.type === "crew-usage").length, 2);
@@ -62,17 +62,19 @@ try {
   await createTaskAttempt(access, { taskId: "runtime-child", attempt: 1, contractVersion: "v1", baseSha: "a".repeat(40) });
   const childToken = await createTaskCapability(access, { role: "executor", taskId: "runtime-child", attempt: 1 });
   const childPrompt = `Managed durable lifecycle is enabled.\nrunId: ${access.runId}\nrepositoryId: ${access.repositoryId}\ntaskId: runtime-child\nattempt: 1\ncapabilityToken: ${childToken}`;
-  const childEvents = new Map<string, any[]>(); const childModelMessages: any[] = [];
+  const childEvents = new Map<string, any[]>(); const childTools = new Map<string, any>(); const childModelMessages: any[] = [];
+  const childBranch: any[] = [{ type: "message", id: "child-prompt", parentId: null, message: { role: "user", content: childPrompt } }];
   crewExtension({
-    exec: async () => ({ code: 0, stdout: "", stderr: "" }), registerTool() {},
+    exec: async () => ({ code: 0, stdout: "", stderr: "" }), registerTool(tool: any) { childTools.set(tool.name, tool); },
     on(name: string, handler: any) { childEvents.set(name, [...(childEvents.get(name) ?? []), handler]); },
-    appendEntry() {}, sendMessage(message: unknown, options: unknown) { childModelMessages.push({ message, options }); },
+    appendEntry(customType: string, data: unknown) { childBranch.push({ type: "custom", customType, data }); }, sendMessage(message: unknown, options: unknown) { childModelMessages.push({ message, options }); },
   } as any);
-  const childCtx = { cwd: repo, getContextUsage: () => ({ tokens: 76000 }), sessionManager: { getSessionId: () => "runtime-child-session", getBranch: () => [{ type: "message", id: "child-prompt", parentId: null, message: { role: "user", content: childPrompt } }] }, ui: { notify: (...args: any[]) => notices.push(args) } };
+  let childTokens = 210000; let compactCalls = 0;
+  const childCtx = { cwd: repo, getContextUsage: () => ({ tokens: childTokens, contextWindow: 1000000 }), compact: (options: any) => { compactCalls++; options.onComplete(); }, sessionManager: { getSessionId: () => "runtime-child-session", getBranch: () => childBranch }, ui: { notify: (...args: any[]) => notices.push(args) } };
   for (const handler of childEvents.get("session_start") ?? []) await handler({}, childCtx);
   await childEvents.get("message_end")![0]({ message: { role: "assistant", usage: { input: 76000, output: 1 } } }, childCtx);
   let inbox = await readInbox(access); assert.equal(inbox.messages.filter(message => message.category === "notification" && message.taskId === "runtime-child").length, 1);
-  assert.equal(childModelMessages.length, 1, "child queues only its local warning"); assert.equal(modelMessages.length, 1, "parent instance has not shared the child's sendMessage mock");
+  assert.equal(childModelMessages.length, 1, "child queues only its local warning"); assert.equal(childModelMessages[0].options.deliverAs, "steer"); assert.equal(modelMessages.length, 1, "parent instance has not shared the child's sendMessage mock");
   const lookalikeDraft = await beginPublication(access, { kind: "message", taskId: "runtime-child", attempt: 1, recipient: "executor", category: "notification", blocking: false });
   await appendPublicationChunk(access, lookalikeDraft, 0, "Crew context warn: non-brain lookalike");
   const lookalike = await finalizePublication(access, lookalikeDraft, 1);
@@ -87,6 +89,35 @@ try {
   assert.equal(inbox.messages.find(message => message.artifactId === lookalike.artifactId)?.acknowledged, false, "non-brain warning lookalike remains unacknowledged");
   await launch.execute("runtime-wait-2", waitParams, undefined, undefined, ctx); assert.equal(modelMessages.length, 2, "acknowledged child warning is not queued twice and non-brain lookalike is not forwarded");
   inbox = await readInbox(access); assert.equal(inbox.messages.find(message => message.artifactId === lookalike.artifactId)?.acknowledged, false);
+
+  const compact = childTools.get("self_compact");
+  const decide = tools.get("crew_compact_decide");
+  const compactArgs = { reason: "Old research fills context; preserve current phase and evidence." };
+  await assert.rejects(() => compact.execute("child-no-approval", compactArgs, undefined, undefined, childCtx), /No brain decision/);
+  const requestId = childBranch.find(entry => entry.customType === "crew-context-request").data.artifactId;
+  await bindTaskChildSession(access, "runtime-child", 1, { launchId: "launch-child", agentName: "executor", paneId: "pane-child", piSessionId: "runtime-child-session", observedAt: new Date().toISOString() });
+  await transitionTaskAttempt(access, "runtime-child", 1, "ready", { status: "running" });
+  const decideArgs = { runId: access.runId, repositoryId: access.repositoryId, taskId: "runtime-child", attempt: 1, requestId, approve: false, reason: "Still need full research context." };
+  const decline = await decide.execute("brain-decline", decideArgs, undefined, undefined, ctx);
+  assert.equal(decline.details.approved, false);
+  assert.match((await compact.execute("child-declined", compactArgs, undefined, undefined, childCtx)).content[0].text, /declined/);
+  assert.equal(compactCalls, 0);
+  await assert.rejects(() => decide.execute("brain-duplicate", { ...decideArgs, approve: true }, undefined, undefined, ctx), /already decided/);
+  childTokens = 510000;
+  await childEvents.get("message_end")![0]({ message: { role: "assistant", usage: { input: 510000, output: 1 } } }, childCtx);
+  const nextRequestId = childBranch.filter(entry => entry.customType === "crew-context-request").at(-1).data.artifactId;
+  await assert.rejects(() => decide.execute("brain-stale", { ...decideArgs, approve: true }, undefined, undefined, ctx), /already decided|supersedes/);
+  await decide.execute("brain-approve", { ...decideArgs, requestId: nextRequestId, approve: true, reason: "Checkpoint captured; safe to summarize old research." }, undefined, undefined, ctx);
+  assert.equal((await compact.execute("child-approved", compactArgs, undefined, undefined, childCtx)).details.scheduled, true);
+  assert.equal(compactCalls, 1);
+  await assert.rejects(() => compact.execute("child-reuse", compactArgs, undefined, undefined, childCtx), /already used/);
+  const brainCtx = { cwd: repo, getContextUsage: () => ({ tokens: 250000, contextWindow: 1000000 }), compact: (options: any) => { compactCalls++; options.onComplete(); }, sessionManager: { getSessionId: () => sessionId, getBranch: () => [] } };
+  assert.equal((await tools.get("self_compact").execute("brain-self", { reason: "The plan and checkpoint preserve prior research." }, undefined, undefined, brainCtx)).details.scheduled, true);
+  assert.equal(compactCalls, 2);
+  const legacyCtx = { ...childCtx, sessionManager: { getSessionId: () => "legacy-child", getBranch: () => [{ message: { role: "user", content: "You are scout. Authority: read-only. Task: inspect\n\n## Role\nscout\n\n## Working directory\n/tmp" } }] } };
+  await assert.rejects(() => compact.execute("legacy-child", compactArgs, undefined, undefined, legacyCtx), /no authenticated brain-decision channel/);
+  console.log("ok - brain self-compacts locally while legacy children retain native-only compaction");
+  console.log("ok - managed child compaction requires an exact, current brain decision; decline and replay cannot compact");
   console.log("ok - distinct parent/child extension runtimes deliver brain warnings once while ignoring and not acknowledging non-brain lookalikes");
   console.log("ok - isolated fresh extension runtime exercises compact restore, exact snapshot, warning propagation, hysteresis, and cleanup revalidation");
 } finally {

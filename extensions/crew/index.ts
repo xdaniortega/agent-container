@@ -44,7 +44,7 @@ import {
   type ReviewTiming,
   type RiskClass,
 } from "./state.ts";
-import { assessPayload, captureSourceSnapshot, contextWarningLevel, normalizeUsage, THINKING_LEVELS, type ThinkingLevel } from "./workflow.ts";
+import { assessPayload, captureSourceSnapshot, contextWarningLevel, DEFAULT_CONTEXT_WINDOW, normalizeUsage, THINKING_LEVELS, type ThinkingLevel } from "./workflow.ts";
 import { herdrObservation, isActiveChild, reconcileChildLaunch, type ChildLaunchRecord, type HerdrAgentLike } from "./herdr-session.ts";
 
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
@@ -53,7 +53,7 @@ type ToolUpdate = (partialResult: ToolResult) => void;
 type SessionMessage = { role?: string; toolName?: string; toolCallId?: string; isError?: boolean; content?: unknown; details?: Record<string, unknown> };
 export type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; message?: SessionMessage; customType?: string; data?: unknown; content?: unknown };
 type SessionManagerLike = { getSessionId?(): string; getSessionFile?(): string | undefined; getSessionDir?(): string; getLeafId?(): string | null; getBranch?(): SessionEntryLike[] };
-type ToolContext = { cwd: string; mode?: string; hasUI?: boolean; ui?: { setStatus?(id: string, text?: string): void; notify?(message: string, level?: "info" | "warning" | "error"): void }; sessionManager?: SessionManagerLike };
+type ToolContext = { cwd: string; mode?: string; hasUI?: boolean; ui?: { setStatus?(id: string, text?: string): void; notify?(message: string, level?: "info" | "warning" | "error"): void }; sessionManager?: SessionManagerLike; model?: { contextWindow?: number }; getContextUsage?(): { tokens: number | null; contextWindow: number } | undefined; compact?(options?: { customInstructions?: string; onComplete?: () => void; onError?: (error: Error) => void }): void };
 type ExtensionAPI = {
   exec(command: string, args?: string[], options?: { timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
   registerTool(tool: {
@@ -160,7 +160,7 @@ function shellQuote(value: string): string { return `'${value.replace(/'/g, `'"'
  * @returns A shell-safe role launch command.
  */
 export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string, authority?: RoleAuthority, stateRoot?: string, effort?: ThinkingLevel, sessionDir?: string): string {
-  const tools = authority === "read-only" ? " --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context" : "";
+  const tools = authority === "read-only" ? " --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context,self_compact" : "";
   const command = `${baseCommand} --approve${tools}${launchModel ? ` --model ${launchModel}` : ""}${effort ? ` --thinking ${effort}` : ""}${sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : ""}`;
   return stateRoot ? `env CREW_STATE_ROOT=${shellQuote(stateRoot)} ${command}` : command;
 }
@@ -1061,6 +1061,7 @@ export type PollingDependencies = {
   now: () => number;
   delay: (ms: number, signal?: AbortSignal) => Promise<void>;
   waitForState?: (agentName: string, timeoutMs: number, signal?: AbortSignal) => Promise<boolean>;
+  shouldYield?: () => Promise<boolean>;
   onUpdate?: ToolUpdate;
 };
 
@@ -1115,6 +1116,7 @@ export async function runCrewPollingLoop(
   let agentExited = false;
   let status: CrewStatus = "unknown";
   let markerOutput = extractMarkerOutput("", markers);
+  let lastDecisionCheckAt = submittedAt - 5_000;
 
   while (true) {
     if (signal?.aborted) throw new Error("crew_launch was cancelled");
@@ -1151,6 +1153,10 @@ export async function runCrewPollingLoop(
 
     if (markerOutput.mode === "marker-pair" && settled) break;
     if (status === "blocked" || status === "failed") break;
+    if (status === "working" && deps.shouldYield && currentTime - lastDecisionCheckAt >= 5_000) {
+      lastDecisionCheckAt = currentTime;
+      if (await deps.shouldYield()) { status = "timed_out"; break; }
+    }
     if (observedWorking && settled) break;
     if (!reusedPane && !observedWorking && settled && currentTime - submittedAt >= PROMPT_START_GRACE_MS) break;
     if (reusedPane && !observedWorking && settled && currentTime - submittedAt >= REUSED_IDLE_GRACE_MS) {
@@ -1522,6 +1528,7 @@ export async function executeCrewLaunch(
     roleName === "reviewer" ? "Publish kind=review with verdict PASS, REVISION_NEEDED, or BLOCKED and sections Verdict, Findings, Validation. The contract/base/head must exactly match the executor report." : "Check the addressed inbox before finalizing; unresolved blocking messages prevent submission.",
     `capabilityToken: ${durable.taskToken}`,
     "Publish in bounded chunks and finalize atomically. Use crew_read pagination to consume required evidence completely. Never include the capability token in reports, messages, final responses, details, or logs.",
+    "At 20% and 50% active context usage, notify the brain; never call self_compact until a brain approval for the latest warning arrives. Check the managed inbox when waiting; Pi's native auto-compaction remains enabled.",
     "These are API-level authorization guardrails, not a same-user OS sandbox: built-in filesystem reads can access local crew state, so do not use durable artifacts for confidentiality from local roles.",
   ].join("\n") : undefined;
   const prompt = appendMarkerInstruction(durableContext ? `${basePrompt}\n\n## Durable coordination\n${durableContext}` : basePrompt, markers);
@@ -1647,6 +1654,10 @@ export async function executeCrewLaunch(
       now: () => Date.now(),
       delay: (ms, sig) => delayFn(ms, sig),
       waitForState: (name, ms, sig) => waitForAgentTransition(pi, name, ms, sig),
+      shouldYield: durable ? async () => {
+        const inbox = await readInbox(durable.access, { limit: 100 });
+        return inbox.messages.some(message => message.sender === roleName && message.taskId === taskId && message.category === "notification" && !message.acknowledged && /^Crew context (?:warn|checkpoint):/.test(message.preview));
+      } : undefined,
       onUpdate,
     }
   );
@@ -1852,6 +1863,15 @@ async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) 
     content: [{ type: "text", text: JSON.stringify({ configPath: configPath ?? null, roles }, null, 2) }],
     details: { version: VERSION, configPath: configPath ?? null, roles },
   };
+}
+
+function isCrewChildSession(branch: SessionEntryLike[] | undefined): boolean {
+  return !!branch?.some(entry => {
+    if (entry.message?.role !== "user") return false;
+    const content = entry.message.content;
+    const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((part: any) => part?.type === "text" ? part.text : "").join("\n") : "";
+    return /^You are [a-zA-Z0-9_-]+\..*\n\n## Role\n/m.test(text) && text.includes("\n\n## Working directory\n");
+  });
 }
 
 function managedCoordinates(branch: SessionEntryLike[] | undefined): { runId: string; repositoryId: string; taskId: string; attempt: number; token: string } | undefined {
@@ -2224,39 +2244,157 @@ export default function crewExtension(pi: ExtensionAPI) {
   });
 
   let warningLevel: "none" | "warn" | "checkpoint" = "none";
+  let warningWindow = DEFAULT_CONTEXT_WINDOW;
   pi.on?.("session_start", (_event, ctx) => {
-    const saved = [...(ctx.sessionManager?.getBranch?.() ?? [])].reverse().find((entry: SessionEntryLike) => entry.customType === "crew-context-warning-state")?.data as { level?: unknown } | undefined;
+    const saved = [...(ctx.sessionManager?.getBranch?.() ?? [])].reverse().find((entry: SessionEntryLike) => entry.customType === "crew-context-warning-state")?.data as { level?: unknown; window?: unknown } | undefined;
     warningLevel = saved?.level === "warn" || saved?.level === "checkpoint" ? saved.level : "none";
+    warningWindow = typeof saved?.window === "number" ? saved.window : DEFAULT_CONTEXT_WINDOW;
+  });
+  pi.on?.("session_compact", (_event, ctx) => {
+    warningLevel = "none";
+    pi.appendEntry?.("crew-context-warning-state", { level: "none", sessionId: ctx.sessionManager?.getSessionId?.(), recordedAt: new Date().toISOString() });
   });
   pi.on?.("message_end", async (event, ctx) => {
     if (event.message?.role !== "assistant") return;
     const normalized = normalizeUsage(event.message.usage);
     pi.appendEntry?.("crew-usage", { ...normalized, recordedAt: new Date().toISOString(), semantics: "current request, not cumulative session usage" });
-    const observed = ctx.getContextUsage?.()?.tokens; const tokens = observed ?? normalized.currentContextTokens;
-    const next = contextWarningLevel(tokens, warningLevel);
+    const usage = ctx.getContextUsage?.();
+    const observed = usage?.tokens;
+    const tokens = observed ?? normalized.currentContextTokens;
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    const window = (typeof usage?.contextWindow === "number" && usage.contextWindow > 0 ? usage.contextWindow : ctx.model?.contextWindow) || DEFAULT_CONTEXT_WINDOW;
+    if (window !== warningWindow) warningLevel = "none";
+    warningWindow = window;
+    const next = contextWarningLevel(tokens, warningLevel, window);
     if (next !== "none" && next !== warningLevel) {
       const sessionId = ctx.sessionManager?.getSessionId?.() ?? "unknown-session";
       const managed = managedCoordinates(ctx.sessionManager?.getBranch?.());
       const runId = managed?.runId ?? "parent-local"; const taskId = managed?.taskId ?? "parent-session";
-      const action = next === "checkpoint" ? "Checkpoint before another long delegation; at a safe idle boundary use /crew-handoff or supported compaction." : "Keep handoffs selective and prepare a compact checkpoint.";
-      const text = `Crew context ${next}: session=${sessionId} run=${runId} task=${taskId}; ${observed === undefined ? "estimated" : "observed"} current context=${tokens} tokens, threshold=${next === "checkpoint" ? 125000 : 75000}. ${action}`;
+      const percent = next === "checkpoint" ? 50 : 20;
+      const action = managed ? "Ask the brain to decide yes/no before self_compact; native Pi auto-compaction remains enabled." : isCrewChildSession(ctx.sessionManager?.getBranch?.()) ? "No authenticated brain-decision channel in legacy/proxy mode; voluntary self_compact unavailable, native Pi auto-compaction remains enabled." : "Decide whether to call self_compact at a safe boundary; native Pi auto-compaction remains enabled.";
+      const text = `Crew context ${next}: session=${sessionId} run=${runId} task=${taskId}; ${observed == null ? "estimated" : "observed"} current context=${tokens}/${window} tokens (${percent}% threshold). ${action}`;
       ctx.ui?.notify?.(text, "warning");
-      pi.appendEntry?.("crew-context-warning", { level: next, tokens, sessionId, runId, taskId, measured: observed !== undefined, text, recordedAt: new Date().toISOString() });
-      // Model-visible but non-autonomous: nextTurn waits for the next real user
-      // prompt and cannot interrupt tools or create a reminder-response loop.
-      pi.sendMessage?.({ customType: "crew-context-warning", content: text, display: false, details: { level: next, tokens, sessionId, runId, taskId } }, { deliverAs: "nextTurn", triggerTurn: false });
+      pi.appendEntry?.("crew-context-warning", { level: next, tokens, window, sessionId, runId, taskId, measured: observed != null, text, recordedAt: new Date().toISOString() });
+      // Model-visible on the next turn; never interrupt tools or create a reminder loop.
+      pi.sendMessage?.({ customType: "crew-context-warning", content: text, display: false, details: { level: next, tokens, window, sessionId, runId, taskId } }, { deliverAs: managed ? "steer" : "nextTurn", triggerTurn: false });
       if (managed) {
         try {
           const access = resolveArtifactAccess(ctx.cwd, managed.runId, managed.repositoryId, managed.token);
           const publicationId = await beginPublication(access, { kind: "message", taskId: managed.taskId, attempt: managed.attempt, recipient: "brain", category: "notification", blocking: false });
-          await appendPublicationChunk(access, publicationId, 0, text); await finalizePublication(access, publicationId, 1);
+          await appendPublicationChunk(access, publicationId, 0, text);
+          const artifact = await finalizePublication(access, publicationId, 1);
+          pi.appendEntry?.("crew-context-request", { artifactId: artifact.artifactId, level: next, window, sessionId });
         } catch (error) {
           pi.appendEntry?.("crew-context-warning-propagation", { status: "failed", sessionId, runId, taskId, error: error instanceof Error ? error.message : String(error), recordedAt: new Date().toISOString() });
         }
       }
     }
-    if (next !== warningLevel) pi.appendEntry?.("crew-context-warning-state", { level: next, sessionId: ctx.sessionManager?.getSessionId?.() ?? "unknown-session", recordedAt: new Date().toISOString() });
+    if (next !== warningLevel) pi.appendEntry?.("crew-context-warning-state", { level: next, window, sessionId: ctx.sessionManager?.getSessionId?.() ?? "unknown-session", recordedAt: new Date().toISOString() });
     warningLevel = next;
+  });
+
+  const compactionsInFlight = new Set<string>();
+  pi.registerTool({
+    name: "self_compact",
+    label: "Self Compact",
+    description: "Schedule Pi compaction for this session only. A managed child requires a current brain approval for its latest context warning; the brain can compact itself without child approval.",
+    parameters: { type: "object", properties: { reason: { type: "string", description: "Why compaction is useful for the current task." }, customInstructions: { type: "string", description: "Short summary focus; preserve current plan, decisions, blockers, and evidence references." } }, additionalProperties: false },
+    async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+      if (!ctx?.compact || !ctx.sessionManager?.getSessionId) throw new Error("self_compact requires a live Pi session with native compaction support");
+      const params = (rawParams ?? {}) as { reason?: string; customInstructions?: string };
+      if (typeof params.reason !== "string" || !params.reason.trim() || params.reason.length > 1000) throw new Error("Provide a short, specific reason for compaction");
+      if (params.customInstructions !== undefined && (typeof params.customInstructions !== "string" || params.customInstructions.length > 2000)) throw new Error("customInstructions must be at most 2000 characters");
+      const branch = ctx.sessionManager.getBranch?.() ?? [];
+      const managed = managedCoordinates(branch);
+      if (isCrewChildSession(branch) && !managed) throw new Error("Legacy/proxy child compaction has no authenticated brain-decision channel; voluntary self_compact is disabled. Pi's native auto-compaction remains enabled");
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (compactionsInFlight.has(sessionId)) throw new Error("Compaction already pending for this session");
+      const usage = ctx.getContextUsage?.();
+      const tokens = usage?.tokens;
+      const window = (usage?.contextWindow && usage.contextWindow > 0 ? usage.contextWindow : ctx.model?.contextWindow) || DEFAULT_CONTEXT_WINDOW;
+      if (tokens == null || !Number.isFinite(tokens) || tokens < Math.max(20_000, window * 0.2)) throw new Error("Current observed context is below the 20% threshold or usage is unavailable; skip costly early compaction");
+      let approvalId: string | undefined;
+      let requestId: string | undefined;
+      if (managed) {
+        const request = [...branch].reverse().find(entry => entry.customType === "crew-context-request")?.data as { artifactId?: string; sessionId?: string; level?: string; window?: number } | undefined;
+        if (!request?.artifactId || request.sessionId !== sessionId || request.window !== window) throw new Error("No current context request for this child session and model window; await a brain decision");
+        const requestIndex = branch.findLastIndex(entry => entry.customType === "crew-context-request" && (entry.data as any)?.artifactId === request.artifactId);
+        if (branch.slice(requestIndex + 1).some(entry => entry.type === "compaction" || entry.customType === "crew-context-warning-state" && (entry.data as any)?.level === "none")) throw new Error("The child already compacted since this context request; await a new warning");
+        if (branch.some(entry => entry.customType === "crew-self-compact" && (entry.data as any)?.requestId === request.artifactId)) throw new Error("This context request was already used for a compaction");
+        const access = resolveArtifactAccess(ctx.cwd, managed.runId, managed.repositoryId, managed.token);
+        let after: string | undefined;
+        let decision: { artifactId: string; content: string } | undefined;
+        for (;;) {
+          const page = await readInbox(access, { after, limit: 100 });
+          for (const message of page.messages) {
+            if (message.sender !== "brain" || message.category !== "answer" || message.replyTo !== request.artifactId) continue;
+            const artifact = await readArtifact(access, message.artifactId);
+            if (!artifact.complete || artifact.metadata.authorRole !== "brain") continue;
+            decision = { artifactId: message.artifactId, content: artifact.content };
+          }
+          if (!page.messages.length || page.nextCursor === after) break;
+          after = page.nextCursor ?? undefined;
+        }
+        if (!decision) throw new Error("No brain decision for the latest child context warning; continue safely and check the managed inbox");
+        const parsed = JSON.parse(decision.content) as { requestId?: string; sessionId?: string; approve?: boolean };
+        if (parsed.requestId !== request.artifactId || parsed.sessionId !== sessionId) throw new Error("Brain decision targets a different context request or child session");
+        if (parsed.approve !== true) return { content: [{ type: "text", text: "Brain declined compaction for this warning; continue work. Native Pi auto-compaction is unaffected." }], details: { approved: false, decisionId: decision.artifactId } };
+        approvalId = decision.artifactId;
+        requestId = request.artifactId;
+      }
+      const instructions = `${params.customInstructions?.trim() || "Preserve current goal, plan, accepted decisions, phase, constraints, open blockers, and immutable evidence references; do not copy capability tokens."}`;
+      compactionsInFlight.add(sessionId);
+      try {
+        ctx.compact({ customInstructions: instructions, onComplete: () => {
+          compactionsInFlight.delete(sessionId);
+          pi.appendEntry?.("crew-self-compact", { sessionId, requestId, decisionId: approvalId, status: "completed", reason: params.reason });
+        }, onError: (error) => {
+          compactionsInFlight.delete(sessionId);
+          pi.appendEntry?.("crew-self-compact-failed", { sessionId, decisionId: approvalId, error: error.message });
+        } });
+      } catch (error) { compactionsInFlight.delete(sessionId); throw error; }
+      return { content: [{ type: "text", text: "Pi self-compaction scheduled for this session. Wait for completion; this is not a success verdict and does not close any Herdr pane." }], details: { scheduled: true, sessionId, decisionId: approvalId } };
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_compact_decide",
+    label: "Crew Compact Decide",
+    description: "Brain answers yes/no to one managed child context request; this never compacts another process directly.",
+    parameters: { type: "object", required: ["runId", "repositoryId", "taskId", "attempt", "requestId", "approve", "reason"], properties: {
+      runId: { type: "string" }, repositoryId: { type: "string" }, taskId: { type: "string" }, attempt: { type: "number" }, requestId: { type: "string" }, approve: { type: "boolean" }, reason: { type: "string" },
+    }, additionalProperties: false },
+    async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+      if (!ctx?.cwd || !ctx.sessionManager?.getSessionId) throw new Error("Brain decision requires an owner session");
+      if (managedCoordinates(ctx.sessionManager.getBranch?.())) throw new Error("Only the brain can approve child compaction");
+      const p = rawParams as { runId: string; repositoryId: string; taskId: string; attempt: number; requestId: string; approve: boolean; reason: string };
+      if (!p.reason?.trim() || p.reason.length > 1000 || typeof p.approve !== "boolean") throw new Error("A short reason and explicit boolean decision are required");
+      const access = resolveArtifactAccess(ctx.cwd, p.runId, p.repositoryId, undefined, ctx.sessionManager.getSessionId());
+      const request = await readArtifact(access, p.requestId);
+      if (!request.complete || request.metadata.kind !== "message" || request.metadata.recipient !== "brain" || request.metadata.taskId !== p.taskId || request.metadata.attempt !== p.attempt || !/^Crew context (?:warn|checkpoint): session=/.test(request.content)) throw new Error("Request is not a complete child context warning for this task attempt");
+      const childSessionId = /^Crew context (?:warn|checkpoint): session=(\S+)/.exec(request.content)?.[1];
+      const state = await readTaskAttempt(access, p.taskId, p.attempt);
+      if (!childSessionId || state.childSession?.piSessionId !== childSessionId || !state.childSession.agentName || !["starting", "running", "reviewing"].includes(state.status)) throw new Error("Warning is not bound to an active current child session");
+      let after: string | undefined;
+      let newestWarningId: string | undefined;
+      for (;;) {
+        const page = await readInbox(access, { after, limit: 100 });
+        for (const item of page.messages) {
+          if (item.taskId !== p.taskId) continue;
+          const artifact = await readArtifact(access, item.artifactId);
+          if (artifact.complete && artifact.metadata.attempt === p.attempt && artifact.metadata.recipient === "brain" && artifact.metadata.authorRole === request.metadata.authorRole && /^Crew context (?:warn|checkpoint): session=/.test(artifact.content)) newestWarningId = item.artifactId;
+          if (item.category === "answer" && item.replyTo === p.requestId && item.sender === "brain") throw new Error("Brain already decided this child context request");
+        }
+        if (!page.messages.length || page.nextCursor === after) break;
+        after = page.nextCursor ?? undefined;
+      }
+      if (newestWarningId !== p.requestId) throw new Error("A newer child context warning supersedes this request");
+      const content = JSON.stringify({ requestId: p.requestId, sessionId: childSessionId, approve: p.approve, reason: p.reason.trim() });
+      const publicationId = await beginPublication(access, { kind: "message", taskId: p.taskId, attempt: p.attempt, recipient: request.metadata.authorRole, category: "answer", replyTo: p.requestId, blocking: false });
+      await appendPublicationChunk(access, publicationId, 0, content);
+      const result = await finalizePublication(access, publicationId, 1);
+      return { content: [{ type: "text", text: JSON.stringify({ decisionId: result.artifactId, approved: p.approve, childSessionId }) }], details: { decisionId: result.artifactId, approved: p.approve } };
+    },
   });
 
   pi.registerTool({

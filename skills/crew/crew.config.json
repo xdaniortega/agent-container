@@ -1,13 +1,13 @@
 {
   "models": {
-    "frontier": "anthropic/claude-opus-5",
-    "medium": "anthropic/claude-opus-4-8",
+    "frontier": "anthropic/claude-opus-5-5",
+    "medium": "anthropic/claude-sonnet-5-5",
     "small": "google/gemini-3.8-flash"
   },
   "roles": {
     "scout": {
       "description": "Finds targeted local and online context. Read only the current phase contract and explicitly required evidence; return a bounded context map with references, facts, risks, and suggested next steps.",
-      "model": "small",
+      "model": "medium",
       "effort": "medium",
       "authority": "read-only"
     },

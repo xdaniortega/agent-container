@@ -49,9 +49,9 @@ Config shape:
 ```json
 {
   "models": {
-    "frontier": "anthropic/claude-opus-5",
-    "medium": "anthropic/claude-opus-4-8",
-    "small": "google/gemini-3.8-flash"
+    "frontier": "anthropic/claude-opus-5-5",
+    "medium": "anthropic/claude-sonnet-5-5",
+    "small": "anthropic/claude-sonnet-5-5"
   },
   "crewRoles": {
     "executor": {
@@ -78,17 +78,39 @@ Each role names an abstract model tier (`frontier`, `medium`, or `small`) or an 
 
 Use `crew_rules` to inspect resolved configuration when needed.
 
-## Normalize every implementation request into phases
+## Plan-first scope for every feature or change
 
-Before code execution, the brain converts the request into one explicit phase plan.
+The brain must have a written plan before delegating implementation or making changes to code, configuration, or documentation. The plan is the source of truth for scope and decisions; phase contracts are derived from it, not substitutes for it. Keep the plan current when the user approves scope changes. Never let scout, oracle, or executor silently redefine it.
 
-### Raw prompt
+Store the plan in a Markdown file named after the change, ending in `-plan.md` (for example, `feature-to-implement-plan.md`). All files ending in `plan.md`, including `plan.md`, are gitignored by this repository. Do not force-add them to Git. Tell the user the path so the plan remains available locally.
 
-Derive the goal, constraints, affected areas, acceptance criteria, validation, dependencies, and ordered phases. Use scout or oracle only when they materially reduce uncertainty.
+Use these sections, in this order, in every plan:
 
-### User-supplied plan
+```markdown
+# <Change name>
 
-Preserve the user's intent and accepted decisions. Add only missing phase IDs, dependencies, source boundaries, acceptance criteria, validation, architecture references, and review metadata. Do not silently redesign the plan. Ask for approval only when normalization changes meaning or unresolved ambiguity would affect implementation.
+## Problem
+## Solution
+## Variables
+## Constraints/Invariants
+## Implementation Notes
+## Workflow
+## Deliverables
+## Definition of Done
+## Validation
+```
+
+Describe unknowns as explicit variables or open decisions, not invented facts. The workflow should give the brain enough information to derive ordered phases, dependencies, file boundaries, acceptance criteria, and checks.
+
+### No plan supplied
+
+1. The brain derives initial scope from the user's request and repo instructions. Use `scout` for focused repository facts or `oracle` for architecture/tradeoffs when they materially reduce uncertainty. Incorporate relevant feedback into the draft.
+2. Write the named plan document using the template above. Show the path and summarize its scope, open decisions, and proposed workflow to the user.
+3. **Ask for explicit human confirmation of the plan before applying it.** Stop here; do not start implementation, launch the executor, or make planned code/config/documentation changes until confirmation. A request to implement a feature is not itself approval of a newly drafted plan.
+
+### Plan supplied
+
+Read the provided Markdown plan instead of generating a replacement. Check it against every template section and check that its decisions, deliverables, and validation are internally consistent and feasible in the repository. Use scout or oracle only if needed to resolve uncertainty. Preserve the user's accepted decisions; propose missing sections or material corrections for human confirmation rather than silently changing meaning. Once the supplied plan is complete and actionable, derive phases from it. No additional approval is required solely because the brain normalized an already supplied plan; ask if ambiguity or changes to its meaning remain.
 
 ### Phase contract
 
@@ -229,13 +251,16 @@ Preserve detailed reviewer/oracle/scout findings unless the user asks for a summ
 - Standard implemented phases receive provisional checkpoints.
 - A fresh-session `/crew-handoff` is allowed only after a passed major phase boundary or a passed final review batch.
 - Keep immutable contracts and evidence referenced rather than replaying transcripts.
-- Treat 75K current-context tokens as a warning and 125K as a checkpoint recommendation.
+- Context warnings use 20% and 50% of the active model's context window (1,000,000 tokens when unavailable), measured from current context rather than cumulative billed tokens. At each warning, decide based on the plan, phase, remaining work, blockers, and evidence whether compaction would save useful context; do not compact reflexively.
+- The brain can call `self_compact` on its own Pi session with a concrete reason and short summary instructions. It schedules Pi's native compaction and does not replace the session or close a pane. Verify completion/failure before proceeding.
+- For a managed child's warning, inspect the delivered notification and the current child identity/status. Use `crew_compact_decide` with run/repository/task/attempt/request ID, explicit `approve: true|false`, and a scope-aware reason. The child checks its inbox and may call `self_compact` only for its latest brain-approved request. A 50% warning permits reconsidering an earlier 20% decline; do not respond to stale or replaced sessions.
+- Legacy and `pic-proxy` children have no authenticated brain-to-child decision channel, so voluntary child self-compaction is disabled there; Pi's native automatic compaction/overflow recovery remains enabled. If needed, use a fresh managed direct-mode launch. Never paste a slash command into a Herdr pane to force compaction.
 - Preview cleanup and delete only owner-scoped obsolete evidence after a replacing approved checkpoint exists.
 - Never delete live blockers, source, Git objects, user panes, or sole report/review evidence.
 
 ## Minimal operating principle
 
-1. Normalize the request into phases.
+1. Read and check the supplied plan, or draft a named plan and wait for human confirmation; then normalize it into phases.
 2. Delegate one focused phase.
 3. Track the exact Herdr child/session and read the detailed result.
 4. Review major phases immediately; defer standard phases.

@@ -167,8 +167,8 @@ test("role bootstrap approves the project before selecting the model and enforce
   assert.equal(buildRoleCommand("pi", "provider/model"), "pi --approve --model provider/model");
   assert.equal(buildRoleCommand("pic-proxy", "provider/model"), "pic-proxy --approve --model provider/model");
   assert.equal(buildRoleCommand("pi"), "pi --approve");
-  assert.equal(buildRoleCommand("pi", "provider/model", "read-only"), "pi --approve --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context --model provider/model");
-  assert.equal(buildRoleCommand("pi", undefined, "read-only"), "pi --approve --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context");
+  assert.equal(buildRoleCommand("pi", "provider/model", "read-only"), "pi --approve --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context,self_compact --model provider/model");
+  assert.equal(buildRoleCommand("pi", undefined, "read-only"), "pi --approve --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context,self_compact");
   assert.equal(buildRoleCommand("pi", "provider/model", "can-edit"), "pi --approve --model provider/model");
   assert.equal(buildRoleCommand("pi", undefined, "can-edit", "/tmp/custom crew-state"), "env CREW_STATE_ROOT='/tmp/custom crew-state' pi --approve");
   assert.equal(buildRoleCommand("pi", undefined, "can-edit", "/tmp/$unsafe'root"), "env CREW_STATE_ROOT='/tmp/$unsafe'\"'\"'root' pi --approve");
@@ -494,6 +494,17 @@ await regressionTest("polling loop: hard cap bounds runtime even when agent keep
   const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
   assert.equal(classification.agentContinues, true);
   assert.equal(classification.complete, false);
+});
+
+await regressionTest("polling loop yields to brain on a managed child context request without closing the live pane", async () => {
+  let checks = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "executor", agentName: "executor-w", paneId: "p1", markers: buildCrewMarkers("context-request"), reusedPane: false, submittedAt: 1000, timeoutMs: 10000, hardCapMs: 30000, readLines: 200 },
+    { getAgent: async () => ({ agent_status: "working" }), readOutput: async () => "working", now: () => 1000, delay: async () => {}, shouldYield: async () => { checks++; return true; } }
+  );
+  assert.equal(checks, 1);
+  assert.equal(result.status, "timed_out");
+  assert.equal(classifyDelegationResult(result.status, result.markerOutput.mode).agentContinues, true);
 });
 
 await regressionTest("polling loop: transient agent get failure with agent in list keeps polling", async () => {
@@ -1356,8 +1367,8 @@ await regressionTest("cleanup preview retains live blockers and finalization is 
 test("model effort, advisory budgets, and normalized current-context warnings are explicit", () => {
   const permanent = JSON.parse(readFileSync(join(process.cwd(), "skills", "crew", "model-tiers.json"), "utf8"));
   assert.deepEqual(permanent.models, {
-    frontier: "anthropic/claude-opus-5",
-    medium: "anthropic/claude-opus-4-8",
+    frontier: "anthropic/claude-opus-5-5",
+    medium: "anthropic/claude-sonnet-5-5",
     small: "google/gemini-3.8-flash",
   });
   assert.deepEqual(
@@ -1375,15 +1386,15 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
     }
   );
 
-  // resolveRole resolves tiers to concrete Opus5/Opus4.8/Gemini + correct reasoning:
+  // resolveRole resolves tiers to concrete Opus5.5/Sonnet5.5/Gemini + correct reasoning:
   const scoutRole = resolveRole("scout", permanent);
-  assert.equal(scoutRole.model, "anthropic/claude-opus-4-8");
+  assert.equal(scoutRole.model, "anthropic/claude-sonnet-5-5");
   assert.equal(scoutRole.reasoning, "medium");
   assert.equal(scoutRole.effort, "medium");
   assert.equal(scoutRole.tier, "medium");
 
   const oracleRole = resolveRole("oracle", permanent);
-  assert.equal(oracleRole.model, "anthropic/claude-opus-5");
+  assert.equal(oracleRole.model, "anthropic/claude-opus-5-5");
   assert.equal(oracleRole.reasoning, "xhigh");
 
   const executorRole = resolveRole("executor", permanent);
@@ -1392,7 +1403,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.throws(() => resolveRole("executor-escalation", permanent), /Unknown crew role/);
 
   const reviewerRole = resolveRole("reviewer", permanent);
-  assert.equal(reviewerRole.model, "anthropic/claude-opus-5");
+  assert.equal(reviewerRole.model, "anthropic/claude-opus-5-5");
   assert.equal(reviewerRole.reasoning, "xhigh");
 
   // Parallel review agent resolution:
@@ -1400,7 +1411,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.deepEqual(reviewTiers.synthesis, { model: "medium", reasoning: "medium" });
   assert.equal(reviewTiers.testRunner.reasoning, "low");
   const resolvedSynthesis = resolveParallelReviewAgent("synthesis", permanent);
-  assert.equal(resolvedSynthesis.model, "anthropic/claude-opus-4-8");
+  assert.equal(resolvedSynthesis.model, "anthropic/claude-sonnet-5-5");
   assert.equal(resolvedSynthesis.reasoning, "medium");
   const resolvedTestRunner = resolveParallelReviewAgent("testRunner", permanent);
   assert.equal(resolvedTestRunner.model, "google/gemini-3.8-flash");
@@ -1457,7 +1468,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.equal(buildRoleCommand("pi", "provider/model", "can-edit", undefined, "medium"), "pi --approve --model provider/model --thinking medium");
   assert.equal(assessPayload("x".repeat(9000), "delegation").overBudget, true);
   assert.deepEqual(normalizeUsage({ input: 10, cacheRead: 20, cacheWrite: 30, output: 5, reasoning: 999, cost: { total: 1.25 } }), { inputTokens: 10, outputTokens: 5, cacheReadTokens: 20, cacheWriteTokens: 30, currentContextTokens: 60, cost: 1.25 });
-  assert.equal(contextWarningLevel(74999), "none"); assert.equal(contextWarningLevel(75000), "warn"); assert.equal(contextWarningLevel(70000, "warn"), "warn"); assert.equal(contextWarningLevel(64999, "warn"), "none"); assert.equal(contextWarningLevel(125000), "checkpoint"); assert.equal(contextWarningLevel(116000, "checkpoint"), "checkpoint");
+  assert.equal(contextWarningLevel(199999), "none"); assert.equal(contextWarningLevel(200000), "warn"); assert.equal(contextWarningLevel(170000, "warn"), "warn"); assert.equal(contextWarningLevel(149999, "warn"), "none"); assert.equal(contextWarningLevel(500000), "checkpoint"); assert.equal(contextWarningLevel(460000, "checkpoint"), "checkpoint"); assert.equal(contextWarningLevel(40000, "none", 200000), "warn"); assert.equal(contextWarningLevel(100000, "none", 200000), "checkpoint");
 });
 
 await regressionTest("snapshot-bound submission rejects stale reviewer launch before entering review", async () => {
@@ -1776,7 +1787,7 @@ function createMockHerdr(options: {
     appendEntry() {},
     async exec(command: string, args: string[] = []) {
       if (command === "pi" && args[0] === "--list-models") {
-        return { code: 0, stdout: "anthropic/claude-opus-4-8\nanthropic/claude-opus-5\ngoogle/gemini-3.8-flash", stderr: "" };
+        return { code: 0, stdout: "anthropic/claude-sonnet-5-5\nanthropic/claude-opus-5-5\ngoogle/gemini-3.8-flash", stderr: "" };
       }
       assert.equal(command, "herdr");
       if (args[0] === "pane" && args[1] === "current") {
@@ -2043,7 +2054,7 @@ test("teardown of a reused/writer pane is refused/never attempted", async () => 
       appendEntry() {},
       async exec(command: string, args: string[] = []) {
         if (command === "pi" && args[0] === "--list-models") {
-          return { code: 0, stdout: "anthropic/claude-opus-4-8\nanthropic/claude-opus-5\ngoogle/gemini-3.8-flash", stderr: "" };
+          return { code: 0, stdout: "anthropic/claude-sonnet-5-5\nanthropic/claude-opus-5-5\ngoogle/gemini-3.8-flash", stderr: "" };
         }
         assert.equal(command, "herdr");
         if (args[0] === "pane" && args[1] === "current") {

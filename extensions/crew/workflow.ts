@@ -6,8 +6,9 @@ import { relative, resolve } from "node:path";
 export const ADVISORY_DELEGATION_BYTES = 8_000;
 export const ADVISORY_SUMMARY_BYTES = 3_200;
 export const ADVISORY_CHECKPOINT_BYTES = 8_000;
-export const CONTEXT_WARN_TOKENS = 75_000;
-export const CONTEXT_CHECKPOINT_TOKENS = 125_000;
+export const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+export const CONTEXT_WARN_FRACTION = 0.2;
+export const CONTEXT_CHECKPOINT_FRACTION = 0.5;
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 
@@ -62,14 +63,20 @@ export function normalizeUsage(usage: any): NormalizedUsage {
 /**
  * @notice Selects a context-pressure warning level with threshold hysteresis.
  * @param previous Previously emitted level used to prevent threshold flapping.
+ * @param window Active model context window, falling back to one million tokens.
  * @returns The current warning level.
  */
-export function contextWarningLevel(tokens: number, previous: "none" | "warn" | "checkpoint" = "none"): "none" | "warn" | "checkpoint" {
-  // 10K-token hysteresis prevents repeated notices when estimates hover near a threshold.
-  if (previous === "checkpoint" && tokens >= CONTEXT_CHECKPOINT_TOKENS - 10_000) return "checkpoint";
-  if (tokens >= CONTEXT_CHECKPOINT_TOKENS) return "checkpoint";
-  if (previous === "warn" && tokens >= CONTEXT_WARN_TOKENS - 10_000) return "warn";
-  if (tokens >= CONTEXT_WARN_TOKENS) return "warn";
+export function contextWarningLevel(tokens: number, previous: "none" | "warn" | "checkpoint" = "none", window = DEFAULT_CONTEXT_WINDOW): "none" | "warn" | "checkpoint" {
+  if (!Number.isFinite(tokens) || tokens < 0) return "none";
+  const size = Number.isFinite(window) && window > 0 ? window : DEFAULT_CONTEXT_WINDOW;
+  const warn = Math.ceil(size * CONTEXT_WARN_FRACTION);
+  const checkpoint = Math.ceil(size * CONTEXT_CHECKPOINT_FRACTION);
+  // Five percent of the active window prevents repeated notices near a boundary.
+  const hysteresis = size * 0.05;
+  if (previous === "checkpoint" && tokens >= checkpoint - hysteresis) return "checkpoint";
+  if (tokens >= checkpoint) return "checkpoint";
+  if (previous === "warn" && tokens >= warn - hysteresis) return "warn";
+  if (tokens >= warn) return "warn";
   return "none";
 }
 
