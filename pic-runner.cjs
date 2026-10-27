@@ -7,19 +7,28 @@ const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 const {
   buildPicMountArgs,
+  buildExtensionRefreshScript,
   createStagedPiConfigInstanceDir,
+  detectContainerGateway,
   getProjectSessionsNamespace,
+  parseContainerImageDigest,
   parseContainerRunnerArgs,
+  parseImageInspectDigest,
   proxyEnvironmentArgs: buildProxyEnvironmentArgs,
   pruneStagedPiConfigDirs,
+  redactSensitiveArgs,
+  replaceDirAtomically,
   runChildProcess,
   stageHostPiConfig,
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
 
-const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
+const explicitHost = process.env.PIC_PROXY_HOST;
+let detectedGateway = !explicitHost ? detectContainerGateway() : null;
+let host = explicitHost || detectedGateway || '192.168.64.1';
+let hostDetected = Boolean(!explicitHost && detectedGateway);
 const port = Number(process.env.PIC_PROXY_PORT || 8888);
-const proxyUrl = `http://${host}:${port}`;
+let proxyUrl = `http://${host}:${port}`;
 const verbose = process.env.PIC_PROXY_VERBOSE === '1';
 const workdir = process.env.PIC_WORKDIR || process.cwd();
 const home = process.env.HOME;
@@ -76,7 +85,7 @@ const herdrSessionDetected = process.env.HERDR_ENV === '1'
   && Boolean(process.env.HERDR_PANE_ID)
   && fs.existsSync(herdrSocketPath);
 const herdrBridgeEnabled = herdrBridgeEnv === '1' || (herdrBridgeEnv !== '0' && herdrSessionDetected);
-const herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
+let herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
 const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
 const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
 
@@ -93,6 +102,8 @@ const anthropicEnvironmentNames = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 
 // command given by PI_ANTHROPIC_KEY_CMD (e.g. an `op read` 1Password lookup)
 // on the host and use its stdout as ANTHROPIC_API_KEY. The repo never contains
 // the secret or the command itself — only this indirection.
+let cachedAnthropicKey = undefined;
+
 function runAnthropicKeyCommand(cmd) {
   try {
     const result = spawnSync(cmd, { shell: true, encoding: 'utf8' });
@@ -106,6 +117,31 @@ function runAnthropicKeyCommand(cmd) {
     log(`warning: PI_ANTHROPIC_KEY_CMD failed: ${err.message}`);
   }
   return '';
+}
+
+function getAnthropicKeyFromCmd() {
+  if (cachedAnthropicKey !== undefined) return cachedAnthropicKey;
+  const cmd = process.env.PI_ANTHROPIC_KEY_CMD;
+  if (!cmd) {
+    cachedAnthropicKey = '';
+    return '';
+  }
+  cachedAnthropicKey = runAnthropicKeyCommand(cmd);
+  return cachedAnthropicKey;
+}
+
+function isAuthExcluded() {
+  if (process.env.PIC_EXCLUDE_AUTH === '1') return true;
+  if (anthropicEnabled) {
+    for (const name of anthropicEnvironmentNames) {
+      if (process.env[name]) return true;
+    }
+    if (process.env.PI_ANTHROPIC_KEY_CMD) {
+      const key = getAnthropicKeyFromCmd();
+      if (key) return true;
+    }
+  }
+  return false;
 }
 
 function anthropicEnvironmentArgs({ useAnthropic } = {}) {
@@ -122,7 +158,7 @@ function anthropicEnvironmentArgs({ useAnthropic } = {}) {
   if (!any) {
     const cmd = process.env.PI_ANTHROPIC_KEY_CMD;
     if (cmd) {
-      const key = runAnthropicKeyCommand(cmd);
+      const key = getAnthropicKeyFromCmd();
       if (key) {
         args.push('-e', `ANTHROPIC_API_KEY=${key}`);
         any = true;
@@ -135,8 +171,8 @@ function anthropicEnvironmentArgs({ useAnthropic } = {}) {
   }
   // When an Anthropic key is in play, ignore the host's stored auth.json:
   // Pi resolves stored credentials before env keys, so a copied auth.json would
-  // shadow ANTHROPIC_API_KEY. entrypoint.sh honors PIC_EXCLUDE_AUTH=1 to skip it.
-  if (any) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
+  // shadow ANTHROPIC_API_KEY. PIC_EXCLUDE_AUTH=1 (added via isAuthExcluded() in
+  // main) makes entrypoint.sh skip/remove it.
   return args;
 }
 
@@ -209,58 +245,88 @@ function log(message) {
   console.log(`[${commandName}] ${message}`);
 }
 
-function stageHostSkills() {
-  fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
-  fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
-
-  // Skills can live under both host roots that the desktop agent reads from.
-  // Earlier entries win on name collisions, so `~/.pi/agent/skills` takes
-  // precedence over `~/.agents/skills`.
-  const sourceDirs = [
-    path.join(home, '.pi', 'agent', 'skills'),
-    path.join(home, '.agents', 'skills'),
-  ];
-
-  const staged = new Set();
-  for (const sourceDir of sourceDirs) {
-    if (!fs.existsSync(sourceDir)) continue;
-
-    for (const name of fs.readdirSync(sourceDir)) {
-      if (staged.has(name)) continue;
-      const source = path.join(sourceDir, name);
-      const skillFile = path.join(source, 'SKILL.md');
-      if (!fs.existsSync(skillFile)) {
-        const stat = fs.lstatSync(source);
-        if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
-        continue;
-      }
-
-      try {
-        fs.cpSync(source, path.join(stagedHostSkillsDir, name), {
-          recursive: true,
-          dereference: true,
-          force: true,
-        });
-        staged.add(name);
-      } catch (error) {
-        log(`warning: failed to stage host skill "${name}": ${error.message}`);
-      }
+function detectHostHerdrVersion() {
+  const herdrBin = process.env.HERDR_BIN_PATH || 'herdr';
+  try {
+    const res = spawnSync(herdrBin, ['--version'], { encoding: 'utf8', timeout: 3000 });
+    if (res.status === 0 && res.stdout) {
+      const match = res.stdout.match(/\b(\d+\.\d+\.\d+)\b/);
+      return match ? match[1] : null;
     }
+  } catch {}
+  return null;
+}
+
+function getCurrentImageDigest() {
+  try {
+    const res = spawnSync('container', ['image', 'inspect', 'agentic-coding-node:24'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'inherit'],
+    });
+    if (res.status === 0 && res.stdout) return parseImageInspectDigest(res.stdout);
+  } catch {}
+  return null;
+}
+
+function stageHostSkills() {
+  try {
+    replaceDirAtomically(stagedHostSkillsDir, (tempDir) => {
+      // Skills can live under both host roots that the desktop agent reads from.
+      // Earlier entries win on name collisions, so `~/.pi/agent/skills` takes
+      // precedence over `~/.agents/skills`.
+      const sourceDirs = [
+        path.join(home, '.pi', 'agent', 'skills'),
+        path.join(home, '.agents', 'skills'),
+      ];
+
+      const staged = new Set();
+      for (const sourceDir of sourceDirs) {
+        if (!fs.existsSync(sourceDir)) continue;
+
+        for (const name of fs.readdirSync(sourceDir)) {
+          if (staged.has(name)) continue;
+          const source = path.join(sourceDir, name);
+          const skillFile = path.join(source, 'SKILL.md');
+          if (!fs.existsSync(skillFile)) {
+            const stat = fs.lstatSync(source);
+            if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
+            continue;
+          }
+
+          try {
+            fs.cpSync(source, path.join(tempDir, name), {
+              recursive: true,
+              dereference: true,
+              force: true,
+            });
+            staged.add(name);
+          } catch (error) {
+            log(`warning: failed to stage host skill "${name}": ${error.message}`);
+          }
+        }
+      }
+    });
+  } catch (err) {
+    log(`warning: failed to stage host skills: ${err.message}`);
   }
 }
 
 function stageHostExtensions() {
-  const sourceDir = path.join(home, '.pi', 'agent', 'extensions');
-  fs.rmSync(stagedHostExtensionsDir, { recursive: true, force: true });
-  fs.mkdirSync(stagedHostExtensionsDir, { recursive: true });
-  if (!fs.existsSync(sourceDir)) return;
-  for (const name of fs.readdirSync(sourceDir)) {
-    const source = path.join(sourceDir, name);
-    try {
-      fs.cpSync(source, path.join(stagedHostExtensionsDir, name), { recursive: true, dereference: true, force: true });
-    } catch (error) {
-      log(`warning: failed to stage host extension "${name}": ${error.message}`);
-    }
+  try {
+    replaceDirAtomically(stagedHostExtensionsDir, (tempDir) => {
+      const sourceDir = path.join(home, '.pi', 'agent', 'extensions');
+      if (!fs.existsSync(sourceDir)) return;
+      for (const name of fs.readdirSync(sourceDir)) {
+        const source = path.join(sourceDir, name);
+        try {
+          fs.cpSync(source, path.join(tempDir, name), { recursive: true, dereference: true, force: true });
+        } catch (error) {
+          log(`warning: failed to stage host extension "${name}": ${error.message}`);
+        }
+      }
+    });
+  } catch (err) {
+    log(`warning: failed to stage host extensions: ${err.message}`);
   }
 }
 
@@ -319,8 +385,16 @@ function startHerdrHostBridge() {
 
     server.once('error', (error) => {
       if (error && error.code === 'EADDRNOTAVAIL' && herdrBridgeHost !== '0.0.0.0') {
-        log(`Herdr bridge address ${herdrBridgeHost} is not available, falling back to 0.0.0.0`);
-        listen('0.0.0.0', herdrBridgeHost);
+        if (process.env.PIC_ALLOW_WILDCARD_BIND === '1') {
+          log(`warning: Herdr bridge address ${herdrBridgeHost} is not available, falling back to 0.0.0.0 because PIC_ALLOW_WILDCARD_BIND=1`);
+          listen('0.0.0.0', herdrBridgeHost);
+        } else {
+          const msg = `Herdr bridge address ${herdrBridgeHost} is not available. Set PIC_HERDR_BRIDGE_HOST or PIC_PROXY_HOST to a valid host address, or set PIC_ALLOW_WILDCARD_BIND=1 to allow binding to 0.0.0.0.`;
+          log(`error: ${msg}`);
+          const err = new Error(msg);
+          err.code = 'EADDRNOTAVAIL';
+          reject(err);
+        }
       } else {
         reject(error);
       }
@@ -404,10 +478,12 @@ function listContainersJson() {
 function refreshContainerExtensions(containerId) {
   const stagedCrew = path.join(stagedHostExtensionsDir, 'crew', 'index.ts');
   if (!fs.existsSync(stagedCrew)) return true;
-  const command = `mkdir -p /root/.pi/agent/extensions && rm -rf /root/.pi/agent/extensions/crew && cp -aL ${workspaceTarget}/.pi/host-agent-extensions/crew /root/.pi/agent/extensions/crew && test -f /root/.pi/agent/extensions/crew/index.ts`;
+  const src = `${workspaceTarget}/.pi/host-agent-extensions/crew`;
+  const dest = '/root/.pi/agent/extensions/crew';
+  const command = buildExtensionRefreshScript({ src, dest });
   const result = spawnSync('container', ['exec', containerId, 'sh', '-lc', command], { stdio: verbose ? 'inherit' : 'pipe', encoding: 'utf8' });
   if (result.status !== 0) {
-    log(`container "${containerId}" has no usable staged Crew extension; it will not be reused`);
+    log(`container "${containerId}" has no usable Crew extension (index.ts missing after refresh); it will not be reused`);
     return false;
   }
   log(`verified Crew extension in reused container "${containerId}"`);
@@ -471,6 +547,11 @@ function findContainerWithMount(workdirPath) {
 
   log(`checking for running container with mount source "${normalizedWorkdir}"`);
 
+  const currentImageDigest = getCurrentImageDigest();
+  if (!currentImageDigest) {
+    log('could not determine the agentic-coding-node:24 image digest; skipping the stale-image reuse guard');
+  }
+
   const listResult = listContainersJson();
 
   if (listResult.status !== 0) {
@@ -517,6 +598,12 @@ function findContainerWithMount(workdirPath) {
           log(`container "${containerId}" uses image "${imageName || 'unknown'}", will not reuse`);
           continue;
         }
+
+        const candidateDigest = parseContainerImageDigest(item);
+        if (currentImageDigest && candidateDigest && candidateDigest !== currentImageDigest) {
+          log(`container "${containerId}" runs an older agentic-coding-node image; not reusing (stop it with: container stop ${containerId})`);
+          continue;
+        }
         let hasWorkdirMount = false;
         let hasPiConfigMount = false;
         let hasSessionsMount = false;
@@ -555,8 +642,10 @@ function findContainerWithMount(workdirPath) {
           }
         }
         if (hasWorkdirMount && hasPiConfigMount && hasSessionsMount && hasNodeModulesMount && hasHerdrSocketMount && hasNpmMount && hasGitMount) {
+          // Auth-mode differences are reconciled inside the container by the entrypoint
+          // (installing or atomically removing only auth.json); never skip reuse for them.
           if (!refreshContainerExtensions(containerId)) {
-            spawnSync('container', ['stop', containerId], { stdio: verbose ? 'inherit' : 'ignore' });
+            // Never stop it: a shared container may host a running Pi/brain session.
             continue;
           }
           log(`found compatible running container "${containerId}" with ${workspaceTarget} mounted`);
@@ -578,6 +667,8 @@ function findContainerWithMount(workdirPath) {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
+  log(`proxy host: ${host} (${hostDetected ? 'detected from container network' : (explicitHost ? 'from PIC_PROXY_HOST' : 'default fallback')})`);
+
   fs.mkdirSync(hostSessionsDir, { recursive: true });
   stageHostSkills();
   stageHostExtensions();
@@ -586,6 +677,19 @@ async function main() {
 
   // Check if a container is already running with our workdir mounted
   const existingContainerId = findContainerWithMount(workdir);
+
+  if (!explicitHost && !hostDetected) {
+    const reDetected = detectContainerGateway();
+    if (reDetected) {
+      host = reDetected;
+      hostDetected = true;
+      proxyUrl = `http://${host}:${port}`;
+      if (!process.env.PIC_HERDR_BRIDGE_HOST) {
+        herdrBridgeHost = host;
+      }
+      log(`re-detected proxy host after container system startup: ${host}`);
+    }
+  }
 
   // Only a fresh container needs staged host config; reusing a container must not
   // touch the staged directory it already has mounted.
@@ -628,18 +732,27 @@ async function main() {
   }
 
   const sessionEnvArgs = ['-e', `PI_CODING_AGENT_SESSION_DIR=${containerSessionsDir}`];
+  const hostHerdrVersion = detectHostHerdrVersion();
+  const commonEnvArgs = [
+    '-e', `PIC_PROXY_MODE=${proxyEnabled ? '1' : '0'}`,
+    // Single source of truth for auth exclusion (host PIC_EXCLUDE_AUTH=1 or an Anthropic key in play).
+    ...(isAuthExcluded() ? ['-e', 'PIC_EXCLUDE_AUTH=1'] : []),
+    ...(hostHerdrVersion ? ['-e', `PIC_HOST_HERDR_VERSION=${hostHerdrVersion}`] : []),
+    ...proxyEnvironmentArgs(),
+    ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+    ...gitIdentityEnvironmentArgs(),
+    ...sessionEnvArgs,
+  ];
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [
-      ...proxyEnvironmentArgs(),
-      ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-      ...gitIdentityEnvironmentArgs(),
-      ...sessionEnvArgs,
-    ];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
+      const envArgs = [
+        '-e', 'PIC_CONTAINER_REUSE=1',
+        ...commonEnvArgs,
+      ];
       const args = containerExecArgs(existingContainerId, shellArgs, { envArgs });
 
       log(`attach: container exec ${existingContainerId} ${shellArgs.join(' ')}`);
@@ -647,7 +760,7 @@ async function main() {
       return;
     }
 
-    const args = containerRunArgs(shellArgs, { envArgs });
+    const args = containerRunArgs(shellArgs, { envArgs: commonEnvArgs });
 
     log(`attach: starting shell in new container at ${workspaceTarget}`);
     runChildProcess('container', args, { cleanup });
@@ -667,25 +780,20 @@ async function main() {
     const commandArgs = containerExecPiCommand(piArgs);
     const args = containerExecArgs(existingContainerId, commandArgs, {
       envArgs: [
-        ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-        ...gitIdentityEnvironmentArgs(),
-        ...sessionEnvArgs,
+        '-e', 'PIC_CONTAINER_REUSE=1',
+        ...commonEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
     });
 
-    log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
+    log(`exec: container ${redactSensitiveArgs(args.slice(1, -piArgs.length - 1)).join(' ')} ... pi --session-dir ...`);
     runChildProcess('container', args, { cleanup });
   } else {
     const args = containerRunArgs(containerRunPiCommand(piArgs), {
       includeHerdrSocket: true,
       envArgs: [
-        ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-        ...gitIdentityEnvironmentArgs(),
-        ...sessionEnvArgs,
+        ...commonEnvArgs,
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],

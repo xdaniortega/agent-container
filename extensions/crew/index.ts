@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   acknowledgeInbox,
   appendPublicationChunk,
@@ -122,7 +122,12 @@ const STARTUP_POLL_MS = 500;
 const MARKER_READ_LINES = 2_000;
 const ROLE_POLL_MS = 15_000;
 export const PROMPT_START_GRACE_MS = 5_000;
-export const REUSED_IDLE_GRACE_MS = 15_000;
+export const PROMPT_PICKUP_TIMEOUT_MS = 30_000;
+export const SESSION_MAX_BYTES = 8 * 1024 * 1024; // tail window read from large session files
+export const ANSWER_MAX_CHARS = 60_000;
+export const SESSION_ERROR_FINAL_GRACE_MS = 10_000;
+/** Tunable lifecycle timings (exported so tests can shrink them). */
+export const crewLifecycleTimings = { quitTimeoutMs: 10_000, quitPollMs: 250, sweepDelayMs: 3_000, deliveryFallbackMs: 30_000 };
 const KNOWN_ROLES = new Set(["scout", "oracle", "executor", "reviewer"]);
 
 const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authority">>> = {
@@ -144,8 +149,13 @@ const DEFAULT_ROLES: Record<string, Required<Pick<Role, "description" | "authori
   },
 };
 
-export function selectLaunchCommand(env: NodeJS.ProcessEnv = process.env): "pic-proxy" | "pi" {
-  return env.PIC_HERDR_BRIDGE === "1" || !!env.PIC_HERDR_BRIDGE_HOST ? "pic-proxy" : "pi";
+export type LaunchCommand = "pic-proxy" | "pic" | "pi";
+
+/** Children inherit the brain's proxy mode; an unset PIC_PROXY_MODE (older containers) means proxy. */
+export function selectLaunchCommand(env: NodeJS.ProcessEnv = process.env): LaunchCommand {
+  const bridge = env.PIC_HERDR_BRIDGE === "1" || !!env.PIC_HERDR_BRIDGE_HOST;
+  if (!bridge) return "pi";
+  return env.PIC_PROXY_MODE === "0" ? "pic" : "pic-proxy";
 }
 
 export function selectDiscoveryCommand(): "pi" { return "pi"; }
@@ -159,7 +169,7 @@ function shellQuote(value: string): string { return `'${value.replace(/'/g, `'"'
  * @param sessionDir Optional native session directory used for bounded context lookup.
  * @returns A shell-safe role launch command.
  */
-export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string, authority?: RoleAuthority, stateRoot?: string, effort?: ThinkingLevel, sessionDir?: string): string {
+export function buildRoleCommand(baseCommand: LaunchCommand, launchModel?: string, authority?: RoleAuthority, stateRoot?: string, effort?: ThinkingLevel, sessionDir?: string): string {
   const tools = authority === "read-only" ? " --tools read,grep,find,ls,crew_publish,crew_read,crew_read_context,self_compact" : "";
   const command = `${baseCommand} --approve${tools}${launchModel ? ` --model ${launchModel}` : ""}${effort ? ` --thinking ${effort}` : ""}${sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : ""}`;
   return stateRoot ? `env CREW_STATE_ROOT=${shellQuote(stateRoot)} ${command}` : command;
@@ -217,6 +227,48 @@ export function loadModelTiers(cwd = process.cwd(), home = homedir(), agentDir =
 }
 
 export const loadCrewConfig = loadModelTiers;
+
+export const DEFAULT_COMPACTION_RESERVE_TOKENS = 16_384;
+export type CompactionInfo = { enabled: boolean; reserveTokens: number; triggerTokens: number };
+
+function readCompactionObject(path: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    const compaction = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).compaction : undefined;
+    return compaction && typeof compaction === "object" && !Array.isArray(compaction) ? compaction as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+const validReserve = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/** Effective Pi compaction settings (global merged with project) for one model. Never throws. */
+export function readCompactionInfo(cwd: string | undefined, model: { provider?: string; id?: string } | undefined, contextWindow: number, agentDir: string = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent")): CompactionInfo {
+  try {
+    const global = readCompactionObject(join(agentDir, "settings.json"));
+    const project = cwd ? readCompactionObject(join(cwd, ".pi", "settings.json")) : {};
+    const merged: Record<string, unknown> = { ...global, ...project };
+    const globalOverrides = isPlainObject(global.modelOverrides) ? global.modelOverrides : {};
+    const projectOverrides = isPlainObject(project.modelOverrides) ? project.modelOverrides : {};
+    const key = model?.provider && model?.id ? `${model.provider}/${model.id}` : undefined;
+    let override: unknown;
+    if (key) {
+      const g = isPlainObject(globalOverrides[key]) ? (globalOverrides[key] as Record<string, unknown>) : {};
+      const p = isPlainObject(projectOverrides[key]) ? (projectOverrides[key] as Record<string, unknown>) : {};
+      override = { ...g, ...p }.reserveTokens;
+    }
+    const reserveTokens = validReserve(override) ? override : validReserve(merged.reserveTokens) ? merged.reserveTokens : DEFAULT_COMPACTION_RESERVE_TOKENS;
+    return { enabled: merged.enabled !== false, reserveTokens, triggerTokens: Math.max(0, contextWindow - reserveTokens) };
+  } catch {
+    return { enabled: true, reserveTokens: DEFAULT_COMPACTION_RESERVE_TOKENS, triggerTokens: Math.max(0, contextWindow - DEFAULT_COMPACTION_RESERVE_TOKENS) };
+  }
+}
+
+export function compactionStatusText(info: CompactionInfo, contextWindow: number): string {
+  if (!info.enabled) return "Native Pi auto-compaction is DISABLED in settings (compaction.enabled=false); overflow recovery is also off.";
+  const percent = contextWindow > 0 ? Math.round(info.triggerTokens / contextWindow * 100) : 0;
+  return `Native Pi auto-compaction is enabled and triggers near ${info.triggerTokens} tokens (${percent}%).`;
+}
 
 function assertValidAuthority(authority: unknown, roleName: string): asserts authority is Role["authority"] | undefined {
   if (authority === undefined) return;
@@ -690,12 +742,12 @@ export function buildRolePrompt(
 }
 
 export function buildCrewMarkers(toolCallId: string): { start: string; end: string } {
-  const safe = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_").slice(-48) || `${Date.now()}`;
-  return { start: `CREW_RESULT_START_${safe}`, end: `CREW_RESULT_END_${safe}` };
+  const id = createHash("sha256").update(toolCallId).digest("hex").slice(0, 12);
+  return { start: `CREW_RESULT_START_${id}`, end: `CREW_RESULT_END_${id}` };
 }
 
 export function appendMarkerInstruction(prompt: string, markers: { start: string; end: string }): string {
-  return `${prompt}\n\nFor your final answer, print ${markers.start} on its own line, then your answer, then ${markers.end} on its own line.`;
+  return `${prompt}\n\nFor your final answer, print \`${markers.start}\` alone on its own line, then your answer, then \`${markers.end}\` alone on its own line. The markers in your final answer must be the bare tokens without backticks.`;
 }
 
 function boundedLines(text: string, maxLines?: number): string {
@@ -714,10 +766,14 @@ export type MarkerOutput = {
   warning?: string | null;
 };
 
-export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): MarkerOutput {
+/** Text that follows a marker in the echoed prompt instruction (word-wrapped by the TUI). */
+const ECHOED_INSTRUCTION_RE = /^\s*(?:alone\s+)?on\s+its\s+own\s+line/i;
+
+function strictMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): MarkerOutput {
   const lines = output.replace(/\r\n/g, "\n").split("\n");
   for (let startLine = lines.length - 1; startLine >= 0; startLine -= 1) {
     if (lines[startLine].trim() !== markers.start) continue;
+    if (ECHOED_INSTRUCTION_RE.test(lines.slice(startLine + 1, startLine + 3).join("\n"))) continue;
     const endOffset = lines.slice(startLine + 1).findIndex(line => line.trim() === markers.end);
     if (endOffset >= 0) {
       const endLine = startLine + 1 + endOffset;
@@ -726,6 +782,150 @@ export function extractMarkerOutput(output: string, markers: { start: string; en
     return { text: boundedLines(lines.slice(startLine + 1).join("\n"), maxLines), mode: "marker-start" };
   }
   return { text: "", mode: "missing" };
+}
+
+function tolerantMarkerPattern(marker: string, lineAnchored: boolean): RegExp {
+  const body = marker.split("").map(ch => ch.replace(/[^A-Za-z0-9_]/g, "\\$&")).join("\\s*");
+  return new RegExp(lineAnchored ? `^[ \\t]*${body}[ \\t]*$` : body, lineAnchored ? "gm" : "g");
+}
+
+function lastMatchPair(text: string, markers: { start: string; end: string }, lineAnchored: boolean): { startEnd: number; endStart: number | null } | undefined {
+  const startRe = tolerantMarkerPattern(markers.start, lineAnchored);
+  let last: RegExpExecArray | null = null;
+  for (let m = startRe.exec(text); m; m = startRe.exec(text)) {
+    last = m;
+    if (m[0].length === 0) startRe.lastIndex += 1;
+  }
+  if (!last) return undefined;
+  const startEnd = last.index + last[0].length;
+  const endRe = tolerantMarkerPattern(markers.end, lineAnchored);
+  endRe.lastIndex = startEnd;
+  const end = endRe.exec(text);
+  return { startEnd, endStart: end ? end.index : null };
+}
+
+/**
+ * Whitespace-tolerant terminal extraction. Markers must occupy their own (possibly wrapped)
+ * line(s), so the echoed prompt instruction ("print MARKER on its own line...") never matches.
+ */
+function tolerantMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): MarkerOutput {
+  const text = output.replace(/\r\n/g, "\n");
+  const pair = lastMatchPair(text, markers, true);
+  if (!pair) return { text: "", mode: "missing" };
+  if (ECHOED_INSTRUCTION_RE.test(text.slice(pair.startEnd, pair.startEnd + 64))) return { text: "", mode: "missing" };
+  if (pair.endStart !== null) return { text: boundedLines(text.slice(pair.startEnd, pair.endStart), maxLines), mode: "marker-pair" };
+  return { text: boundedLines(text.slice(pair.startEnd), maxLines), mode: "marker-start" };
+}
+
+export function extractMarkerOutput(output: string, markers: { start: string; end: string }, maxLines?: number): MarkerOutput {
+  const strict = strictMarkerOutput(output, markers, maxLines);
+  if (strict.mode === "marker-pair") return strict;
+  const tolerant = tolerantMarkerOutput(output, markers, maxLines);
+  if (tolerant.mode === "marker-pair") return tolerant;
+  return strict.mode === "missing" ? tolerant : strict;
+}
+
+export type SessionCompletion = {
+  promptSeen: boolean;
+  finalSeen: boolean;
+  mode: "marker-pair" | "marker-start" | "missing";
+  text: string;
+  source: "session";
+  /** Set only when the last assistant message ended with stopReason error/length (may be retried by Pi). */
+  errorFinal?: boolean;
+};
+
+function sessionMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: string; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
+    .map(part => part.text)
+    .join("\n");
+}
+
+/**
+ * Reads the child's Pi session JSONL and extracts the final marker-delimited answer.
+ * Never throws; unreadable or partial files report promptSeen:false.
+ */
+export function readSessionCompletion(sessionPath: string | undefined, markers: { start: string; end: string }, options: { maxBytes?: number } = {}): SessionCompletion {
+  const empty: SessionCompletion = { promptSeen: false, finalSeen: false, mode: "missing", text: "", source: "session" };
+  let fd: number | undefined;
+  try {
+    if (!sessionPath || !isAbsolute(sessionPath) || !sessionPath.endsWith(".jsonl")) return empty;
+    fd = openSync(sessionPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return empty;
+    const cacheKey = `${sessionPath}|${markers.start}|${markers.end}|${options.maxBytes ?? ""}`;
+    const cached = sessionReadCache.get(cacheKey);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.result;
+    const window = Math.min(stat.size, options.maxBytes ?? SESSION_MAX_BYTES);
+    const start = stat.size - window;
+    let buf = Buffer.alloc(window);
+    let got = 0;
+    while (got < window) {
+      const n = readSync(fd, buf, got, window - got, start + got);
+      if (n <= 0) break;
+      got += n;
+    }
+    buf = buf.subarray(0, got);
+    if (start > 0) {
+      const nl = buf.indexOf(10);
+      buf = nl < 0 ? buf.subarray(buf.length) : buf.subarray(nl + 1);
+    }
+    const result = parseSessionMessages(buf.toString("utf8"), markers);
+    if (sessionReadCache.size > 16) sessionReadCache.clear();
+    sessionReadCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, result });
+    return result;
+  } catch {
+    return empty;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
+const sessionReadCache = new Map<string, { mtimeMs: number; size: number; result: SessionCompletion }>();
+
+function parseSessionMessages(raw: string, markers: { start: string; end: string }): SessionCompletion {
+  const empty: SessionCompletion = { promptSeen: false, finalSeen: false, mode: "missing", text: "", source: "session" };
+  const messages: { role: string; text: string; stopReason?: string }[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let entry: any;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry?.type !== "message" || !entry.message || typeof entry.message.role !== "string") continue;
+    messages.push({ role: entry.message.role, text: sessionMessageText(entry.message.content), stopReason: entry.message.stopReason });
+  }
+  let promptIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "user" && messages[i].text.includes(markers.end)) { promptIndex = i; break; }
+  }
+  if (promptIndex < 0) return empty;
+  const assistant = messages.slice(promptIndex + 1).filter(m => m.role === "assistant");
+  const finalSeen = assistant.some(m => m.stopReason === "stop" || m.stopReason === "aborted");
+  const lastStop = assistant.length ? assistant[assistant.length - 1].stopReason : undefined;
+  const errorFinal = !finalSeen && (lastStop === "error" || lastStop === "length");
+  const flag = errorFinal ? { errorFinal: true } : {};
+  const text = assistant.map(m => m.text).join("\n");
+  const pair = lastMatchPair(text, markers, false);
+  if (!pair) return { promptSeen: true, finalSeen, mode: "missing", text: "", source: "session", ...flag };
+  if (pair.endStart === null) return { promptSeen: true, finalSeen, mode: "marker-start", text: text.slice(pair.startEnd).trim(), source: "session", ...flag };
+  return { promptSeen: true, finalSeen, mode: "marker-pair", text: text.slice(pair.startEnd, pair.endStart).trim(), source: "session", ...flag };
+}
+
+/** Caps answer text, keeping head and tail with a pointer to the full session. */
+export function capAnswerText(text: string, sessionPath?: string | null, max = ANSWER_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max / 2);
+  const tail = max - head;
+  const where = sessionPath ? `see details.childSessionPath (${sessionPath})` : "full text unavailable";
+  return `${text.slice(0, head)}\n\n[... answer truncated: ${text.length - max} chars omitted; ${where} for the full answer ...]\n\n${text.slice(text.length - tail)}`;
+}
+
+/** Resolves an absolute child session JSONL path from a Herdr agent's session reference. */
+export function sessionPathFromAgent(agent: AgentLike | undefined): string | undefined {
+  const ref = herdrObservation(agent).sessionRef as { kind?: string; value?: string } | undefined;
+  return ref?.kind === "path" && typeof ref.value === "string" && isAbsolute(ref.value) && ref.value.endsWith(".jsonl") ? ref.value : undefined;
 }
 
 function mergeOverlappingText(previous: string, next: string): { text: string; overlapped: boolean } {
@@ -817,51 +1017,16 @@ function isKnownCrewAgentName(name: string, roleNames: Set<string>): boolean {
 }
 
 /**
- * @notice Verifies that an idle agent matches role, workspace, location, model, and effort constraints.
- * @returns Whether the agent can safely serve the requested delegation.
+ * @notice Chooses an unused, collision-free agent name within Herdr naming limits: role, then scoped role, then scoped-N.
+ * @returns A name not used by any listed agent.
  */
-export function isReusableRoleAgent(agent: AgentLike, role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string, requestedEffort?: ThinkingLevel): boolean {
-  const status = normalizedAgentStatus(agent);
-  return (
-    agent.name === role &&
-    (status === "idle" || status === "done") &&
-    agent.workspace_id === workspaceId &&
-    (!tabId || !agent.tab_id || agent.tab_id === tabId) &&
-    (normalizedCwd(agent.foreground_cwd || agent.cwd || "") === normalizedCwd(cwd)) &&
-    (!requestedModel || agent.model === requestedModel || agent.model_id === requestedModel) &&
-    (!requestedEffort || agent.thinking_level === requestedEffort || agent.reasoning_level === requestedEffort) &&
-    typeof agent.pane_id === "string" &&
-    agent.pane_id.length > 0
-  );
-}
-
-/**
- * @notice Selects the pane of a reusable candidate when all launch constraints match.
- * @returns The matching pane identifier, if available.
- */
-export function findReusableRolePane(agent: AgentLike | undefined, role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string, requestedEffort?: ThinkingLevel): string | undefined {
-  return agent && isReusableRoleAgent(agent, role, workspaceId, cwd, tabId, requestedModel, requestedEffort) ? agent.pane_id : undefined;
-}
-
-/**
- * @notice Finds a reusable pane among currently known Herdr agents.
- * @returns The first matching pane identifier, if available.
- */
-export function findReusableRolePaneInList(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string, requestedEffort?: ThinkingLevel): string | undefined {
-  return agents.find((agent) => isReusableRoleAgent(agent, role, workspaceId, cwd, tabId, requestedModel, requestedEffort))?.pane_id;
-}
-
-/**
- * @notice Chooses a reusable or collision-free role name within Herdr naming limits.
- * @returns The agent name to reuse or assign.
- */
-export function chooseAgentName(agents: AgentLike[], role: string, workspaceId: string, cwd: string, tabId?: string, requestedModel?: string, requestedEffort?: ThinkingLevel): string {
-  if (findReusableRolePaneInList(agents, role, workspaceId, cwd, tabId, requestedModel, requestedEffort)) return role;
-  const baseName = roleNameInUse(agents, role) ? scopedRoleName(role, workspaceId, tabId) : role;
-  if (findReusableRolePaneInList(agents, baseName, workspaceId, cwd, tabId, requestedModel, requestedEffort)) return baseName;
+export function chooseAgentName(agents: AgentLike[], role: string, workspaceId: string, _cwd?: string, tabId?: string): string {
+  if (!roleNameInUse(agents, role)) return role;
+  const baseName = scopedRoleName(role, workspaceId, tabId);
   if (!roleNameInUse(agents, baseName)) return baseName;
   for (let i = 2; i < 100; i += 1) {
-    const candidate = `${baseName}-${i}`;
+    const suffix = `-${i}`;
+    const candidate = `${baseName.slice(0, 32 - suffix.length)}${suffix}`;
     if (!roleNameInUse(agents, candidate)) return candidate;
   }
   throw new Error(`Could not choose an unused crew agent name for role ${role}`);
@@ -980,10 +1145,22 @@ export function classifyAgentStatus(value: unknown): CrewStatus {
   return "unknown";
 }
 
-async function maybeGetAgent(pi: ExtensionAPI, role: string): Promise<AgentLike | undefined> {
-  const result = await herdr(pi, ["agent", "get", role]);
-  if (result.code !== 0) return undefined;
-  return parseJson(result.stdout, "herdr agent get").result?.agent;
+const NOT_FOUND_PATTERN = /agent_not_found|pane_not_found/;
+
+/** Agent observation: `unknown` means the bridge failed and nothing may be concluded about the agent. */
+export type AgentObservation = { state: "found"; agent: AgentLike } | { state: "missing" } | { state: "unknown"; error: string };
+
+async function maybeGetAgent(pi: ExtensionAPI, role: string): Promise<AgentObservation> {
+  let result: ExecResult;
+  try { result = await herdr(pi, ["agent", "get", role]); } catch (error) { return { state: "unknown", error: error instanceof Error ? error.message : String(error) }; }
+  if (result.code !== 0) {
+    const text = result.stderr || result.stdout;
+    return NOT_FOUND_PATTERN.test(text) ? { state: "missing" } : { state: "unknown", error: text };
+  }
+  try {
+    const agent = parseJson(result.stdout, "herdr agent get").result?.agent;
+    return agent ? { state: "found", agent } : { state: "missing" };
+  } catch (error) { return { state: "unknown", error: error instanceof Error ? error.message : String(error) }; }
 }
 
 async function listAgents(pi: ExtensionAPI): Promise<AgentLike[]> {
@@ -992,15 +1169,36 @@ async function listAgents(pi: ExtensionAPI): Promise<AgentLike[]> {
   return parseJson(result.stdout, "herdr agent list").result?.agents ?? [];
 }
 
-export async function getOrCorroborateAgent(pi: ExtensionAPI, agentName: string): Promise<AgentLike | undefined> {
-  const agent = await maybeGetAgent(pi, agentName);
-  if (agent) return agent;
+/**
+ * @notice Observes one agent. Only a not-found error, or a successful list lacking the agent, means missing;
+ * any other failure is `unknown` so a transient bridge error never reads as an exit.
+ */
+export async function observeAgent(pi: ExtensionAPI, agentName: string): Promise<AgentObservation> {
+  const first = await maybeGetAgent(pi, agentName);
+  if (first.state === "found") return first;
   try {
-    const agents = await listAgents(pi);
-    return agents.find(a => a.name === agentName);
-  } catch {
-    return undefined;
+    const agent = (await listAgents(pi)).find(a => a.name === agentName);
+    return agent ? { state: "found", agent } : { state: "missing" };
+  } catch (error) {
+    return { state: "unknown", error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Legacy accessor: undefined for both missing and unknown. Use observeAgent where the distinction matters. */
+export async function getOrCorroborateAgent(pi: ExtensionAPI, agentName: string): Promise<AgentLike | undefined> {
+  const observation = await observeAgent(pi, agentName);
+  return observation.state === "found" ? observation.agent : undefined;
+}
+
+/** Looks up Herdr's terminal identity for a pane; `missing` when the pane no longer exists. */
+async function paneTerminal(pi: ExtensionAPI, paneId: string): Promise<{ state: "found"; terminalId?: string } | { state: "missing" }> {
+  const result = await herdr(pi, ["pane", "get", paneId]);
+  if (result.code !== 0) {
+    if (/pane_not_found/.test(result.stderr || result.stdout)) return { state: "missing" };
+    throw new Error(`herdr pane get failed with code ${result.code}: ${result.stderr || result.stdout}`);
+  }
+  const terminalId = parseJson(result.stdout, "herdr pane get").result?.pane?.terminal_id;
+  return { state: "found", terminalId: typeof terminalId === "string" && terminalId ? terminalId : undefined };
 }
 
 async function waitForAgentTransition(pi: ExtensionAPI, agentName: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -1063,6 +1261,7 @@ export type PollingDependencies = {
   waitForState?: (agentName: string, timeoutMs: number, signal?: AbortSignal) => Promise<boolean>;
   shouldYield?: () => Promise<boolean>;
   onUpdate?: ToolUpdate;
+  readSessionResult?: () => Promise<SessionCompletion | undefined>;
 };
 
 export async function runCrewPollingLoop(
@@ -1072,12 +1271,15 @@ export async function runCrewPollingLoop(
     agentName: string;
     paneId: string;
     markers: { start: string; end: string };
-    reusedPane: boolean;
+    /** Deprecated and ignored: panes are never reused. */
+    reusedPane?: boolean;
     submittedAt: number;
     timeoutMs: number;
     hardCapMs: number;
     readLines: number;
     signal?: AbortSignal;
+    /** Agent observed right after spawn; seeds lastKnownAgent so early transient lookup errors are not a missing agent. */
+    initialAgent?: AgentLike;
   },
   deps: PollingDependencies
 ): Promise<{
@@ -1088,6 +1290,8 @@ export async function runCrewPollingLoop(
   heartbeatCount: number;
   agentExited: boolean;
   lastKnownAgent?: AgentLike;
+  sessionCompletion?: SessionCompletion;
+  sessionFinal: boolean;
 }> {
   const {
     launchId,
@@ -1095,7 +1299,6 @@ export async function runCrewPollingLoop(
     agentName,
     paneId,
     markers,
-    reusedPane,
     submittedAt,
     timeoutMs,
     hardCapMs,
@@ -1110,17 +1313,37 @@ export async function runCrewPollingLoop(
   let heartbeatCount = 0;
   let output = "";
   let currentAgent: AgentLike | undefined;
-  let lastKnownAgent: AgentLike | undefined;
+  let lastKnownAgent: AgentLike | undefined = params.initialAgent;
   let missingAgentSince: number | undefined;
   let consecutiveMissingCount = 0;
   let agentExited = false;
   let status: CrewStatus = "unknown";
   let markerOutput = extractMarkerOutput("", markers);
   let lastDecisionCheckAt = submittedAt - 5_000;
+  let sessionCompletion: SessionCompletion | undefined;
+  let settledSince: number | undefined;
+  let sessionFinal = false;
 
   while (true) {
     if (signal?.aborted) throw new Error("crew_launch was cancelled");
-    currentAgent = await getAgent(agentName);
+    try {
+      currentAgent = await getAgent(agentName);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // Unknown (transient bridge error): keep the last observation rather than treating the agent as gone.
+      currentAgent = lastKnownAgent;
+    }
+    try {
+      output = await readOutput(agentName, paneId, Math.max(readLines, MARKER_READ_LINES), currentAgent);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // Only an explicit not-found counts as a missing agent; transient errors keep the last snapshot and observation.
+      if (/pane_not_found|agent_not_found/.test(error instanceof Error ? error.message : String(error))) currentAgent = undefined;
+    }
+    // Only parse the session when the child is not actively working.
+    if (deps.readSessionResult && (currentAgent?.agent_status || currentAgent?.status ? classifyAgentStatus(currentAgent?.agent_status || currentAgent?.status) !== "working" : true)) {
+      try { sessionCompletion = await deps.readSessionResult() ?? sessionCompletion; } catch { /* session is best-effort */ }
+    }
     if (currentAgent) {
       lastKnownAgent = currentAgent;
       missingAgentSince = undefined;
@@ -1130,11 +1353,15 @@ export async function runCrewPollingLoop(
       consecutiveMissingCount += 1;
     }
     status = classifyAgentStatus(currentAgent?.agent_status || currentAgent?.status);
-    output = await readOutput(agentName, paneId, Math.max(readLines, MARKER_READ_LINES), currentAgent);
     markerOutput = updateMarkerOutput(markerOutput, output, markers);
     const settled = status === "done" || status === "idle";
     const evidence = `${status}\n${output}`;
     const currentTime = now();
+    if (settled) settledSince ??= currentTime; else settledSince = undefined;
+    // "aborted"/"stop" are final at once; "error"/"length" only after status stays settled past a grace (Pi may auto-retry).
+    const errorGraceElapsed = settledSince !== undefined && currentTime - settledSince >= SESSION_ERROR_FINAL_GRACE_MS;
+    sessionFinal = !!sessionCompletion?.promptSeen && (sessionCompletion.finalSeen || (!!sessionCompletion.errorFinal && errorGraceElapsed));
+    const errorPending = !!sessionCompletion?.promptSeen && !!sessionCompletion.errorFinal && !sessionCompletion.finalSeen && !errorGraceElapsed;
     const evidenceChanged = evidence !== previousEvidence;
     if (evidenceChanged) {
       previousEvidence = evidence;
@@ -1151,17 +1378,22 @@ export async function runCrewPollingLoop(
       break;
     }
 
-    if (markerOutput.mode === "marker-pair" && settled) break;
+    // A readable session that saw the prompt but no final reply overrides a terminal marker pair (may be the echoed prompt).
+    const sessionUnfinished = !!sessionCompletion?.promptSeen && !sessionCompletion.finalSeen;
+    if ((sessionCompletion?.mode === "marker-pair" || (markerOutput.mode === "marker-pair" && !sessionUnfinished)) && settled) break;
     if (status === "blocked" || status === "failed") break;
     if (status === "working" && deps.shouldYield && currentTime - lastDecisionCheckAt >= 5_000) {
       lastDecisionCheckAt = currentTime;
       if (await deps.shouldYield()) { status = "timed_out"; break; }
     }
-    if (observedWorking && settled) break;
-    if (!reusedPane && !observedWorking && settled && currentTime - submittedAt >= PROMPT_START_GRACE_MS) break;
-    if (reusedPane && !observedWorking && settled && currentTime - submittedAt >= REUSED_IDLE_GRACE_MS) {
-      status = "timed_out";
-      break;
+    if (observedWorking && settled && !errorPending) break;
+    if (!observedWorking && settled && currentTime - submittedAt >= PROMPT_START_GRACE_MS) {
+      const waitForSession = !!deps.readSessionResult && !!sessionCompletion && (
+        sessionCompletion.promptSeen
+          ? !sessionFinal
+          : currentTime - submittedAt < PROMPT_PICKUP_TIMEOUT_MS
+      );
+      if (!waitForSession) break;
     }
     if (currentTime - submittedAt >= hardCapMs) {
       status = "timed_out";
@@ -1205,7 +1437,104 @@ export async function runCrewPollingLoop(
     heartbeatCount,
     agentExited,
     lastKnownAgent,
+    sessionCompletion,
+    sessionFinal,
   };
+}
+
+const spawnLocks = new Map<string, Promise<void>>();
+/** In-process async mutex: serializes spawn critical sections that share a Herdr workspace+tab. */
+export async function withSpawnLock<T>(key: string, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const previous = spawnLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.then(() => gate);
+  spawnLocks.set(key, tail);
+  try {
+    // Wait for the predecessor, but give up promptly when cancelled; the gate is released in finally either way.
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(new Error("crew_launch was cancelled"));
+      const onAbort = () => reject(new Error("crew_launch was cancelled"));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      previous.then(() => { signal?.removeEventListener("abort", onAbort); resolve(); });
+    });
+    if (signal?.aborted) throw new Error("crew_launch was cancelled");
+    return await work();
+  } finally {
+    release();
+    // Delete the key only once this entry's tail has resolved AND the map still points at it (no later waiter queued behind us).
+    void tail.then(() => { if (spawnLocks.get(key) === tail) spawnLocks.delete(key); });
+  }
+}
+
+const MAX_RENAME_ATTEMPTS = 5;
+
+export type PendingClose = { launchId: string; role: string; agentName: string; paneId: string; terminalId?: string; sessionValue?: string; delayMs: number };
+export type CloseOutcome = { closed: boolean; skipped?: string };
+
+async function waitAgentGone(pi: ExtensionAPI, agentName: string, paneId: string): Promise<boolean> {
+  const deadline = Date.now() + crewLifecycleTimings.quitTimeoutMs;
+  while (true) {
+    const current = await listAgents(pi);
+    if (!current.some(agent => agent.name === agentName && agent.pane_id === paneId)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, crewLifecycleTimings.quitPollMs));
+  }
+}
+
+/**
+ * @notice Best-effort cleanup of a pane we created but never prompted: /quit whatever Pi is running in it, then close it.
+ * The pane is kept when Pi cannot be confirmed gone, because closing would orphan a container process.
+ */
+async function discardNeverPromptedPane(pi: ExtensionAPI, paneId: string): Promise<void> {
+  try {
+    const current = (await listAgents(pi)).find(agent => agent.pane_id === paneId);
+    if (current?.name) {
+      const quit = await herdr(pi, ["agent", "prompt", current.name, "/quit"], 10_000);
+      if (quit.code !== 0 && !NOT_FOUND_PATTERN.test(quit.stderr || quit.stdout)) return;
+      if (!await waitAgentGone(pi, current.name, paneId)) return;
+    }
+    await herdr(pi, ["pane", "close", paneId]);
+  } catch { /* best effort */ }
+}
+
+/**
+ * @notice Identity-checked, graceful child pane close. Never closes a pane whose agent name, session, or status changed.
+ * Pi is asked to /quit first because closing a pane does not stop a container-exec'd process.
+ * @throws Only on Herdr failures the caller should log as teardown-failed.
+ */
+export async function closeChildPane(pi: ExtensionAPI, target: { agentName: string; paneId: string; terminalId?: string; sessionValue?: string }): Promise<CloseOutcome> {
+  const { agentName, paneId, sessionValue, terminalId } = target;
+  const agents = await listAgents(pi);
+  const byName = agents.find(agent => agent.name === agentName);
+  if (byName) {
+    if (byName.pane_id !== paneId) return { closed: false, skipped: "agent-moved-to-different-pane" };
+    const observedSession = herdrObservation(byName).sessionRef as { value?: string } | undefined;
+    if (sessionValue && observedSession?.value !== sessionValue) return { closed: false, skipped: "session-mismatch" };
+    if (terminalId && byName.terminal_id !== terminalId) return { closed: false, skipped: "terminal-mismatch" };
+    const status = classifyAgentStatus(byName.agent_status ?? byName.status);
+    if (status !== "idle" && status !== "done") return { closed: false, skipped: `status-${status}` };
+    const quit = await herdr(pi, ["agent", "prompt", agentName, "/quit"], 10_000);
+    if (quit.code !== 0 && !/agent_not_found|pane_not_found/.test(quit.stderr || quit.stdout)) {
+      return { closed: false, skipped: "quit-failed" };
+    }
+    if (!await waitAgentGone(pi, agentName, paneId)) return { closed: false, skipped: "quit-timeout" };
+  } else if (agents.some(agent => agent.pane_id === paneId)) {
+    return { closed: false, skipped: "different-agent-in-pane" };
+  }
+  // The pane id alone is not identity (Herdr may reuse ids); Herdr's terminal_id must still match when recorded,
+  // and it is mandatory when the agent is absent.
+  if (!byName && !terminalId) return { closed: false, skipped: "agent-absent-identity-unproven" };
+  if (terminalId) {
+    const pane = await paneTerminal(pi, paneId);
+    if (pane.state === "missing") return { closed: true };
+    if (pane.terminalId !== terminalId) return { closed: false, skipped: byName ? "terminal-mismatch" : "agent-absent-identity-unproven" };
+  }
+  const close = await herdr(pi, ["pane", "close", paneId]);
+  if (close.code !== 0 && !/pane_not_found/.test(close.stderr || close.stdout)) {
+    throw new Error(`herdr pane close failed with code ${close.code}: ${close.stderr || close.stdout}`);
+  }
+  return { closed: true };
 }
 
 type CrewLaunchParams = DelegationFields & {
@@ -1314,7 +1643,7 @@ export async function deliverManagedContextWarnings(pi: ExtensionAPI, access: Ru
  */
 export async function prepareDurableLaunch(options: {
   enabled: boolean;
-  baseCommand: "pic-proxy" | "pi";
+  baseCommand: LaunchCommand;
   cwd: string;
   role: string;
   taskId: string;
@@ -1329,8 +1658,8 @@ export async function prepareDurableLaunch(options: {
   reviewTiming?: ReviewTiming;
 }): Promise<{ access: RunAccess; taskToken: string; attempt: number; contractVersion?: string; baseSha?: string; reportArtifactId?: string; headSha?: string; sourcePaths?: string[]; sessionGeneration: string } | undefined> {
   if (!options.enabled) return undefined;
-  if (options.baseCommand === "pic-proxy") {
-    throw new Error("Managed durable coordination is not supported through pic-proxy yet because host state and repository identity are not mounted. Retry with durable omitted/false, or launch in direct pi mode.");
+  if (options.baseCommand === "pic-proxy" || options.baseCommand === "pic") {
+    throw new Error(`Managed durable coordination is not supported through ${options.baseCommand} yet because host state and repository identity are not mounted. Retry with durable omitted/false, or launch in direct pi mode.`);
   }
   if (!options.ownerSessionId) throw new Error("Managed durable coordination requires an active session ID; retry with durable omitted/false");
   const attempt = options.attempt ?? 1;
@@ -1462,7 +1791,7 @@ export async function executeCrewLaunch(
       }
       const changed = currentState.updatedAt !== before.updatedAt;
       const boundChild = currentState.childSession;
-      const liveAgent = boundChild?.agentName ? await getOrCorroborateAgent(pi, boundChild.agentName) : undefined;
+      const liveAgent = boundChild?.agentName ? await getOrCorroborateAgent(pi, boundChild.agentName) : undefined; // unknown reads as unbound here; status only
       const live = herdrObservation(liveAgent);
       const liveSession = live.sessionRef as ChildSessionBinding["sessionRef"] | undefined;
       const bindingMatches = !boundChild || !!liveAgent && liveAgent.pane_id === boundChild.paneId && (!boundChild.sessionRef || JSON.stringify(liveSession) === JSON.stringify(boundChild.sessionRef));
@@ -1484,7 +1813,7 @@ export async function executeCrewLaunch(
     return { content: [{ type: "text", text: JSON.stringify(recovered) }], details: { durableMode: "managed", runId: params.runId, taskId: params.taskId, attempt, lifecycleStatus: recovered.status, recovered: true, agentLiveness: agent ? liveness : "absent" } };
   }
   const { config, path: configPath } = loadModelTiers(params.configCwd ?? roleCwd);
-  const ephemeral = params.ephemeral ?? config.lifecycle?.ephemeral ?? false;
+  const ephemeral = params.ephemeral ?? config.lifecycle?.ephemeral ?? true;
   const teardownGraceMs = positiveInteger(
     params.teardownGraceMs ?? config.lifecycle?.teardownGraceMs,
     5_000,
@@ -1528,7 +1857,7 @@ export async function executeCrewLaunch(
     roleName === "reviewer" ? "Publish kind=review with verdict PASS, REVISION_NEEDED, or BLOCKED and sections Verdict, Findings, Validation. The contract/base/head must exactly match the executor report." : "Check the addressed inbox before finalizing; unresolved blocking messages prevent submission.",
     `capabilityToken: ${durable.taskToken}`,
     "Publish in bounded chunks and finalize atomically. Use crew_read pagination to consume required evidence completely. Never include the capability token in reports, messages, final responses, details, or logs.",
-    "At 20% and 50% active context usage, notify the brain; never call self_compact until a brain approval for the latest warning arrives. Check the managed inbox when waiting; Pi's native auto-compaction remains enabled.",
+    "At 20% and 50% active context usage, notify the brain; never call self_compact until a brain approval for the latest warning arrives. Check the managed inbox when waiting; native Pi auto-compaction follows the user's compaction settings (the context warning states whether it is enabled).",
     "These are API-level authorization guardrails, not a same-user OS sandbox: built-in filesystem reads can access local crew state, so do not use durable artifacts for confidentiality from local roles.",
   ].join("\n") : undefined;
   const prompt = appendMarkerInstruction(durableContext ? `${basePrompt}\n\n## Durable coordination\n${durableContext}` : basePrompt, markers);
@@ -1543,54 +1872,80 @@ export async function executeCrewLaunch(
   }
   const roleCommand = buildRoleCommand(baseCommand, launchModel, role.authority, durable?.access.stateRoot, role.effort, params.parentSessionDir);
 
-  let agents = await listAgents(pi);
-  // Managed or ephemeral panes must be freshly bootstrapped with the resolved state-root/lifecycle environment
-  const namingAgents = (durable || ephemeral) ? agents.map(agent => ({ ...agent, agent_status: "working", status: "working" })) : agents;
-  let agentName = chooseAgentName(namingAgents, roleName, workspaceId, roleCwd, tabId, role.model, role.effort);
-  let paneId = (durable || ephemeral) ? undefined : findReusableRolePaneInList(agents, agentName, workspaceId, roleCwd, tabId, role.model, role.effort);
-  let createdPane: string | undefined;
+  // Serialize spawning per tab so concurrent launches see each other's renamed panes and never choose the same split/name.
+  let agents: AgentLike[] = [];
+  let agentName = roleName;
   let splitPolicy: string | undefined;
   let renameConflictRecovered = false;
-
-  if (!paneId) {
+  let createdTerminalId: string | undefined;
+  const cancelled = () => { if (signal?.aborted) throw new Error("crew_launch was cancelled"); };
+  const createdPane: string = await withSpawnLock(`${workspaceId}|${tabId}`, async () => {
+    cancelled();
+    agents = await listAgents(pi);
+    agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
     const split = chooseSplitTarget(agents, workspaceId, roleCwd, tabId, roleNames);
     splitPolicy = split.policy;
     const splitResult = await herdr(pi, split.args);
     expectOk(splitResult, "herdr pane split");
-    paneId = parseJson(splitResult.stdout, "herdr pane split").result?.pane?.pane_id;
-    if (!paneId) throw new Error("herdr pane split did not return pane_id");
-    createdPane = paneId;
+    const newPane: string | undefined = parseJson(splitResult.stdout, "herdr pane split").result?.pane?.pane_id;
+    if (!newPane) throw new Error("herdr pane split did not return pane_id");
+    try {
+      createdTerminalId = parseJson(splitResult.stdout, "herdr pane split").result?.pane?.terminal_id;
+      if (!createdTerminalId) {
+        try { const pane = await paneTerminal(pi, newPane); if (pane.state === "found") createdTerminalId = pane.terminalId; } catch { /* identity recorded later from the agent, if available */ }
+      }
+      cancelled();
+      const runResult = await herdr(pi, ["pane", "run", newPane, roleCommand]);
+      expectOk(runResult, "herdr pane run");
+      cancelled();
 
-    const runResult = await herdr(pi, ["pane", "run", paneId, roleCommand]);
-    expectOk(runResult, "herdr pane run");
+      const startup = await waitForAgentReady(pi, newPane, startupTimeoutMs, (params as any).startupReadyStableMs ?? STARTUP_READY_STABLE_MS);
+      cancelled();
+      if (startup.status !== "ready") {
+        const output = startup.output ?? await readPane(pi, newPane, FAILURE_READ_LINES);
+        const message = startup.status === "blocked"
+          ? `agent startup is blocked in pane ${newPane}; inspect the pane and resolve the interactive prompt before retrying.`
+          : `agent was not ready in pane ${newPane} within startupTimeoutMs=${startupTimeoutMs}; the process may still be loading.`;
+        const error = new Error(`${message}\n\n${output}`) as Error & { details?: unknown };
+        error.details = { paneId: newPane, status: startup.status === "blocked" ? "startup_blocked" : "startup_timeout", startupTimeoutMs, agentContinues: true, output };
+        (error as any).retainPane = true;
+        throw error;
+      }
 
-    const startup = await waitForAgentReady(pi, paneId, startupTimeoutMs, (params as any).startupReadyStableMs ?? STARTUP_READY_STABLE_MS);
-    if (startup.status !== "ready") {
-      const output = startup.output ?? await readPane(pi, paneId, FAILURE_READ_LINES);
-      const message = startup.status === "blocked"
-        ? `agent startup is blocked in pane ${paneId}; inspect the pane and resolve the interactive prompt before retrying.`
-        : `agent was not ready in pane ${paneId} within startupTimeoutMs=${startupTimeoutMs}; the process may still be loading.`;
-      const error = new Error(`${message}\n\n${output}`) as Error & { details?: unknown };
-      error.details = { paneId, status: startup.status === "blocked" ? "startup_blocked" : "startup_timeout", startupTimeoutMs, agentContinues: true, output };
+      let rename: ExecResult = { code: 1, stdout: "", stderr: "" };
+      for (let attempt = 1; attempt <= MAX_RENAME_ATTEMPTS; attempt += 1) {
+        rename = await herdr(pi, ["agent", "rename", newPane, agentName]);
+        if (rename.code === 0) break;
+        if (!/agent_name_taken/.test(rename.stderr || rename.stdout) || attempt === MAX_RENAME_ATTEMPTS) break;
+        cancelled();
+        agents = await listAgents(pi);
+        agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId);
+        renameConflictRecovered = true;
+      }
+      if (rename.code !== 0) renameConflictRecovered = false;
+      expectOk(rename, "herdr agent rename");
+    } catch (error) {
+      // The pane was never prompted: close it unless the startup state asks to keep it for inspection.
+      // Pi may already be running in it, so /quit first to avoid orphaning a container process.
+      if (!(error as any)?.retainPane) await discardNeverPromptedPane(pi, newPane);
       throw error;
     }
+    const spawnLog = `crew: spawned ${roleName} in pane ${newPane} (${role.tier ?? role.model ?? "default model"}, workspace: ${workspaceId || "default"}, tab: ${tabId || "default"})`;
+    logLifecycle(pi, onUpdate, "spawn", spawnLog, { launchId, role: roleName, agentName, paneId: newPane, status: "spawned", workspaceId, tabId, model: role.model, tier: role.tier, ephemeral });
+    return newPane;
+  }, signal);
+  const paneId = createdPane;
 
-    let rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
-    if (rename.code !== 0 && /agent_name_taken/.test(rename.stderr || rename.stdout)) {
-      agents = await listAgents(pi);
-      agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId, role.model, role.effort);
-      rename = await herdr(pi, ["agent", "rename", paneId, agentName]);
-      renameConflictRecovered = rename.code === 0;
-    }
-    expectOk(rename, "herdr agent rename");
-
-    const spawnLog = `crew: spawned ${roleName} in pane ${paneId} (${role.tier ?? role.model ?? "default model"}, workspace: ${workspaceId || "default"}, tab: ${tabId || "default"})`;
-    logLifecycle(pi, onUpdate, "spawn", spawnLog, { launchId, role: roleName, agentName, paneId, status: "spawned", workspaceId, tabId, model: role.model, tier: role.tier, ephemeral });
-  }
-
-  const boundAgent = await getOrCorroborateAgent(pi, agentName) ?? agents.find(agent => agent.pane_id === paneId);
-  const childObservation = herdrObservation(boundAgent);
-  const childBinding: ChildSessionBinding = {
+  // Everything between spawn and the prompt can fail or be cancelled; the pane was never prompted, so discard it.
+  let boundAgent: AgentLike | undefined;
+  let childBinding: ChildSessionBinding;
+  let childObservation: Record<string, unknown>;
+  try {
+  cancelled();
+  boundAgent = await getOrCorroborateAgent(pi, agentName) ?? agents.find(agent => agent.pane_id === paneId);
+  createdTerminalId ??= boundAgent?.terminal_id;
+  childObservation = herdrObservation(boundAgent);
+  childBinding = {
     launchId,
     agentName,
     paneId,
@@ -1607,6 +1962,11 @@ export async function executeCrewLaunch(
   if (durable && roleName === "executor") {
     await acquireWriterOwnership(durable.access, taskId, durable.attempt, agentName, paneId);
     await bindTaskChildSession(durable.access, taskId, durable.attempt, childBinding);
+  }
+  cancelled();
+  } catch (error) {
+    await discardNeverPromptedPane(pi, paneId);
+    throw error;
   }
   const promptResult = await herdr(pi, ["agent", "prompt", agentName, prompt], 10_000);
   if (promptResult.code !== 0) {
@@ -1633,6 +1993,7 @@ export async function executeCrewLaunch(
   });
 
   const submittedAt = Date.now();
+  let latestAgent: AgentLike | undefined = boundAgent;
   const pollingResult = await runCrewPollingLoop(
     {
       launchId,
@@ -1640,15 +2001,24 @@ export async function executeCrewLaunch(
       agentName,
       paneId,
       markers,
-      reusedPane: !createdPane,
       submittedAt,
       timeoutMs,
       hardCapMs,
       readLines,
       signal,
+      initialAgent: boundAgent,
     },
     {
-      getAgent: (name) => getOrCorroborateAgent(pi, name),
+      getAgent: async (name) => {
+        const observed = await observeAgent(pi, name);
+        if (observed.state === "unknown") throw new Error(observed.error);
+        if (observed.state === "found") { latestAgent = observed.agent; return observed.agent; }
+        return undefined;
+      },
+      readSessionResult: async () => {
+        const sessionPath = sessionPathFromAgent(latestAgent);
+        return sessionPath ? readSessionCompletion(sessionPath, markers) : undefined;
+      },
       readOutput: (name, pId, lines, curAgent) =>
         curAgent ? readAgent(pi, name, lines) : readPane(pi, pId, lines),
       now: () => Date.now(),
@@ -1670,9 +2040,21 @@ export async function executeCrewLaunch(
     heartbeatCount,
     agentExited,
     lastKnownAgent,
+    sessionFinal,
   } = pollingResult;
 
-  const markerResult = classifyDelegationResult(status, markerOutput.mode);
+  const childSessionPath = sessionPathFromAgent(lastKnownAgent) ?? sessionPathFromAgent(boundAgent) ?? null;
+  const sessionResult = childSessionPath ? readSessionCompletion(childSessionPath, markers) : undefined;
+  const sessionPair = sessionResult?.mode === "marker-pair";
+  // If the session is readable and shows a final reply without a marker pair, a terminal pair is untrusted (echoed prompt).
+  const sessionFinalNoPair = !!sessionResult?.promptSeen && !sessionPair && (sessionFinal || sessionResult.finalSeen);
+  // A readable session that saw the prompt but no final reply vetoes a terminal pair (possibly the echoed prompt), even if the loop exited settled.
+  const sessionUnfinished = !!sessionResult?.promptSeen && !sessionResult.finalSeen && !sessionFinal && !sessionPair;
+  const terminalPair = markerOutput.mode === "marker-pair" && !sessionFinalNoPair && !sessionUnfinished;
+  const effectiveMode = sessionPair || terminalPair ? "marker-pair" : (sessionFinalNoPair || sessionUnfinished) && markerOutput.mode === "marker-pair" ? "missing" : markerOutput.mode;
+  const markerResult = classifyDelegationResult(status, effectiveMode);
+  const extractionSource: "session" | "terminal" | null = sessionPair ? "session" : terminalPair ? "terminal" : null;
+  const extractedText = sessionPair ? sessionResult!.text : markerOutput.text;
   let managedTaskState;
   let managedError: string | undefined;
   if (durable && ["executor", "reviewer"].includes(roleName)) {
@@ -1707,48 +2089,29 @@ export async function executeCrewLaunch(
     }
   }
   const lifecycleManaged = !!durable && ["executor", "reviewer"].includes(roleName);
-  const complete = lifecycleManaged ? !!managedTaskState : markerResult.complete;
-  const settled = lifecycleManaged ? complete : markerResult.settled;
-  const agentContinues = complete ? false : markerResult.agentContinues;
+  const complete = lifecycleManaged ? !!managedTaskState : (markerResult.complete || (agentExited && sessionPair));
+  const settled = lifecycleManaged ? complete : (markerResult.settled || complete);
+  const agentContinues = complete ? false : sessionUnfinished || markerResult.agentContinues;
 
   const compactOutput = complete
     ? lifecycleManaged
       ? JSON.stringify({ status: managedTaskState!.status, taskId, attempt: durable!.attempt, reportArtifactId: managedTaskState!.reportArtifactId, reviewArtifactId: managedTaskState!.reviewArtifactId })
-      : boundedLines(markerOutput.text)
+      : capAnswerText(redactCapabilitySecrets(sessionPair ? extractedText.trim() : boundedLines(extractedText), durable ? [durable.taskToken] : []), childSessionPath)
     : `[CREW STATUS: ${status}; complete: false] ${managedError ? `Managed completion rejected: ${managedError}` : settled ? "The role settled without a confirmed final marker pair; this is incomplete diagnostic output, not a final answer." : "The role did not complete. This is partial diagnostic output, not a final answer."}\n\n${compactRoleOutput(output, prompt, readLines, durable ? [durable.taskToken] : [])}`;
 
-  let tornDown = false;
-  let removalLogged = false;
-  const isWriter = role.authority === "can-edit";
-  const canTeardown = ephemeral && !!createdPane && !isWriter;
-
-  if (canTeardown && complete) {
+  // The pane is closed later, by the extension, only after the brain has received this result (see crewExtension).
+  const tornDown = false;
+  const removalLogged = false;
+  let pendingClose: PendingClose | null = null;
+  const closeObservation = herdrObservation(lastKnownAgent ?? boundAgent);
+  if (ephemeral && complete && !agentExited) {
     const summaryMsg = `crew: ${roleName} completed in pane ${createdPane}. Summary:\n${compactOutput}`;
     logLifecycle(pi, onUpdate, "summary", summaryMsg, { role: roleName, agentName, paneId: createdPane, status: "summary", summary: compactOutput });
-
-    try {
-      try {
-        await delayFn(teardownGraceMs, signal);
-      } catch {
-        // Skip remaining grace wait if cancelled, and still attempt clean teardown
-      }
-      const closeResult = await herdr(pi, ["pane", "close", createdPane]);
-      expectOk(closeResult, "herdr pane close");
-      tornDown = true;
-      const removalMsg = `crew: removed ${roleName} pane ${createdPane} after successful run`;
-      logLifecycle(pi, onUpdate, "remove", removalMsg, { role: roleName, agentName, paneId: createdPane, status: "removed", ephemeral: true });
-      removalLogged = true;
-    } catch (teardownError) {
-      const failMsg = `crew: warning - failed to close pane ${createdPane}: ${teardownError instanceof Error ? teardownError.message : String(teardownError)}`;
-      logLifecycle(pi, onUpdate, "teardown-failed", failMsg, { role: roleName, agentName, paneId: createdPane, error: teardownError instanceof Error ? teardownError.message : String(teardownError) });
-    }
+    pendingClose = { launchId, role: roleName, agentName, paneId: createdPane, terminalId: createdTerminalId ?? (closeObservation.terminalId as string | undefined), sessionValue: (closeObservation.sessionRef as { value?: string } | undefined)?.value, delayMs: teardownGraceMs };
   } else if (ephemeral && !complete) {
     const retentionReason = status !== "done" && status !== "idle" ? status : "incomplete marker output";
     const retentionMsg = `crew: retained ${roleName} pane ${paneId} (${retentionReason}; inspect pane for diagnostics)`;
     logLifecycle(pi, onUpdate, "retain", retentionMsg, { role: roleName, agentName, paneId, status: "retained", retentionReason, ephemeral: true });
-  } else if (ephemeral && isWriter) {
-    const retentionMsg = `crew: retained writer pane ${paneId} (writer panes cannot be torn down ephemerally)`;
-    logLifecycle(pi, onUpdate, "retain", retentionMsg, { role: roleName, agentName, paneId, status: "retained", retentionReason: "writer", reason: "writer", ephemeral: true });
   }
 
   const deliveredContextWarnings = durable ? await deliverManagedContextWarnings(pi, durable.access) : 0;
@@ -1763,8 +2126,10 @@ export async function executeCrewLaunch(
       tabId,
       paneId,
       createdPane,
-      reusedPane: !createdPane,
+      terminalId: createdTerminalId ?? finalObservation.terminalId ?? null,
+      reusedPane: false,
       ephemeral,
+      pendingClose,
       tornDown,
       teardownGraceMs,
       removalLogged,
@@ -1776,7 +2141,7 @@ export async function executeCrewLaunch(
       actualModel: lastKnownAgent?.model ?? lastKnownAgent?.model_id ?? null,
       actualEffort: lastKnownAgent?.thinking_level ?? lastKnownAgent?.reasoning_level ?? null,
       actualModelKnown: !!(lastKnownAgent?.model ?? lastKnownAgent?.model_id),
-      modelWarning: role.model && lastKnownAgent?.model && lastKnownAgent.model !== role.model ? `Running model ${lastKnownAgent.model} differs from requested ${role.model}.` : (!createdPane && role.model ? "Reused pane model was not queried." : null),
+      modelWarning: role.model && lastKnownAgent?.model && lastKnownAgent.model !== role.model ? `Running model ${lastKnownAgent.model} differs from requested ${role.model}.` : null,
       status,
       herdrStatus: finalObservation.status,
       sessionRef: finalObservation.sessionRef ?? null,
@@ -1795,9 +2160,11 @@ export async function executeCrewLaunch(
       configPath: configPath ?? null,
       splitPolicy: splitPolicy ?? null,
       renameConflictRecovered,
-      markerFound: markerOutput.mode !== "missing",
-      extractionMode: markerOutput.mode === "missing" ? "prompt-fallback" : markerOutput.mode,
-      extractionWarning: markerOutput.warning ?? (markerOutput.mode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null),
+      markerFound: markerOutput.mode !== "missing" || (sessionResult?.mode ?? "missing") !== "missing",
+      extractionMode: effectiveMode === "missing" ? "prompt-fallback" : effectiveMode,
+      extractionSource,
+      childSessionPath,
+      extractionWarning: (sessionPair ? null : markerOutput.warning) ?? (effectiveMode !== "marker-pair" || !complete ? "No confirmed final marker pair for a completed delegation." : null),
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       markerCaptureLines: Math.max(readLines, MARKER_READ_LINES),
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
@@ -1920,6 +2287,47 @@ export default function crewExtension(pi: ExtensionAPI) {
     return record;
   };
 
+  let lastCtx: ToolContext | undefined;
+  const pendingCloses = new Map<string, PendingClose>();
+  const closesInFlight = new Set<string>();
+  const closeFallbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** Runs the identity-checked close for one child; never throws. */
+  const closeChild = async (target: { launchId: string; role: string; agentName: string; paneId: string; terminalId?: string; sessionValue?: string }, trigger: string): Promise<void> => {
+    if (closesInFlight.has(target.launchId)) return;
+    closesInFlight.add(target.launchId);
+    try {
+      const outcome = await closeChildPane(pi, target);
+      if (outcome.closed) {
+        const paneClosedAt = new Date().toISOString();
+        logLifecycle(pi, undefined, "remove", `crew: removed ${target.role} pane ${target.paneId} after successful run`, { launchId: target.launchId, role: target.role, agentName: target.agentName, paneId: target.paneId, status: "removed", ephemeral: true, trigger, paneClosedAt });
+        if (childLaunches.has(target.launchId)) trackChild({ launchId: target.launchId, role: target.role, agentName: target.agentName, paneId: target.paneId, paneClosedAt }, lastCtx);
+      } else {
+        if (childLaunches.has(target.launchId) && outcome.skipped) trackChild({ launchId: target.launchId, role: target.role, closeSkippedReason: outcome.skipped }, lastCtx);
+        logLifecycle(pi, undefined, "close-skipped", `crew: kept ${target.role} pane ${target.paneId} (${outcome.skipped})`, { launchId: target.launchId, role: target.role, agentName: target.agentName, paneId: target.paneId, status: "retained", reason: outcome.skipped, trigger });
+      }
+    } catch (error) {
+      try {
+        const message = error instanceof Error ? error.message : String(error);
+        logLifecycle(pi, undefined, "teardown-failed", `crew: warning - failed to close pane ${target.paneId}: ${message}`, { launchId: target.launchId, role: target.role, agentName: target.agentName, paneId: target.paneId, error: message, trigger });
+      } catch { /* logging must never throw into Pi */ }
+    } finally {
+      closesInFlight.delete(target.launchId);
+    }
+  };
+
+  /** Called once the brain has the crew_launch result; schedules the deferred close (deduplicated per toolCallId). */
+  const releasePendingClose = (toolCallId: unknown) => {
+    if (typeof toolCallId !== "string") return;
+    const fallback = closeFallbackTimers.get(toolCallId);
+    if (fallback) { clearTimeout(fallback); closeFallbackTimers.delete(toolCallId); }
+    const pending = pendingCloses.get(toolCallId);
+    if (!pending) return;
+    pendingCloses.delete(toolCallId);
+    const timer = setTimeout(() => { void closeChild(pending, "result-delivered"); }, pending.delayMs);
+    (timer as any).unref?.();
+  };
+
   const childStatusSnapshot = async (query: { launchId?: string; runId?: string; taskId?: string; activeOnly?: boolean; refresh?: boolean }, ctx?: ToolContext) => {
     let records = [...childLaunches.values()].filter(record =>
       (!query.launchId || record.launchId === query.launchId) &&
@@ -1942,7 +2350,9 @@ export default function crewExtension(pi: ExtensionAPI) {
           trackChild({ launchId: record.launchId, role: record.role, lifecycleStatus, complete: record.complete || managedComplete, agentContinues: record.agentContinues, status: record.controllerStatus, herdrStatus: record.herdrStatus }, ctx);
           continue;
         }
-        const agent = await getOrCorroborateAgent(pi, record.agentName);
+        const observed = await observeAgent(pi, record.agentName);
+        if (observed.state === "unknown") continue;
+        const agent = observed.state === "found" ? observed.agent : undefined;
         const observation = agent ? herdrObservation(agent) : { status: "failed", agentExited: true };
         trackChild({ ...observation, launchId: record.launchId, role: record.role, agentName: record.agentName, paneId: agent?.pane_id ?? record.paneId, runId: record.runId, repositoryId: record.repositoryId, taskId: record.taskId, attempt: record.attempt, lifecycleStatus, complete: record.complete || managedComplete, agentContinues: agent ? undefined : false }, ctx);
       }
@@ -1973,8 +2383,8 @@ export default function crewExtension(pi: ExtensionAPI) {
     checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"], description: "Fallback strategy when no completed crew checkpoint is found: recent (default, serialize recent N user turns), explicit (use explicit context), or error." },
     recentTurns: { type: "number", description: "Number of recent user turns to include when falling back to recent turns. Defaults to 6." },
     maxHandoffChars: { type: "number", description: "Maximum character budget for the pushed brain handoff. Defaults to 24000." },
-    ephemeral: { type: "boolean", description: "Whether to tear down the spawned role pane after successful completion. Defaults to false (or lifecycle.ephemeral from config)." },
-    teardownGraceMs: { type: "number", description: "Grace wait in milliseconds before closing an ephemeral pane on success. Defaults to 5000 (or lifecycle.teardownGraceMs from config)." },
+    ephemeral: { type: "boolean", description: "Whether to tear down the spawned role pane after successful completion. Defaults to true (or lifecycle.ephemeral from config); the pane is closed only after the result is delivered to the brain." },
+    teardownGraceMs: { type: "number", description: "Delay in milliseconds AFTER the result is delivered before closing an ephemeral pane. Defaults to 5000 (or lifecycle.teardownGraceMs from config)." },
     recoveryReason: { type: "string", description: "Required audit reason for managed recovery." },
     startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout up to a hard ceiling (default 2x timeoutMs). Defaults to 120000." }, hardCapMs: { type: "number", description: "Hard maximum total runtime ceiling after prompt submission that cannot be refreshed by activity. Defaults to 2x timeoutMs." }, readLines: { type: "number", description: "Line bound for partial/diagnostic output when a role does not complete. The full marked final answer is returned in full on success (capped only by the ~2000-line capture window). Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };
@@ -2020,6 +2430,8 @@ export default function crewExtension(pi: ExtensionAPI) {
       try {
         const result = await executeCrewLaunch(pi, params, signal, trackedUpdate, ctx?.sessionManager?.getSessionId?.());
         trackChild((result as ToolResult).details, ctx);
+        const pending = ((result as ToolResult).details as { pendingClose?: PendingClose | null } | undefined)?.pendingClose;
+        if (pending) pendingCloses.set(toolCallId, pending);
         return result;
       } catch (error) {
         const failure = error && typeof error === "object" && "details" in error && (error as any).details && typeof (error as any).details === "object" ? (error as any).details : {};
@@ -2028,7 +2440,7 @@ export default function crewExtension(pi: ExtensionAPI) {
       }
     });
   };
-  pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible Herdr role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
+  pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible Herdr role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
 
   pi.registerTool({
     name: "crew_status",
@@ -2225,6 +2637,36 @@ export default function crewExtension(pi: ExtensionAPI) {
   });
   pi.on?.("session_shutdown", (_event, ctx) => ctx.ui?.setStatus?.("crew", undefined));
 
+  // Fallback only: if no toolResult message_end (delivery to the brain) arrives soon after tool_execution_end, schedule the close anyway.
+  pi.on?.("tool_execution_end", (event) => {
+    const id = event?.toolCallId;
+    if (typeof id !== "string" || !pendingCloses.has(id) || closeFallbackTimers.has(id)) return;
+    const timer = setTimeout(() => { closeFallbackTimers.delete(id); releasePendingClose(id); }, crewLifecycleTimings.deliveryFallbackMs);
+    (timer as any).unref?.();
+    closeFallbackTimers.set(id, timer);
+  });
+
+  // Best-effort sweep of completed ephemeral children of this brain session whose panes were never closed.
+  pi.on?.("session_start", (_event, ctx) => {
+    lastCtx = ctx;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const pendingLaunches = new Set([...pendingCloses.values()].map(pending => pending.launchId));
+          const retryable = (reason?: string) => !reason || reason === "quit-timeout" || reason === "quit-failed";
+          const recent = (record: ChildLaunchRecord) => Date.now() - Date.parse(record.startedAt) <= 24 * 60 * 60 * 1000;
+          const stale = [...childLaunches.values()].filter(record =>
+            record.complete && record.ephemeral === true && !!record.paneId && !!record.agentName && !record.paneClosedAt && !pendingLaunches.has(record.launchId)
+            && retryable(record.closeSkippedReason) && recent(record));
+          for (const record of stale) {
+            await closeChild({ launchId: record.launchId, role: record.role, agentName: record.agentName!, paneId: record.paneId!, terminalId: record.terminalId, sessionValue: record.sessionRef?.value }, "stale-sweep");
+          }
+        } catch { /* sweep is best-effort */ }
+      })();
+    }, crewLifecycleTimings.sweepDelayMs);
+    (timer as any).unref?.();
+  });
+
   // Safe interactive brain handoff. It is deliberately a user command: tools
   // cannot silently replace the active conversation.
   pi.registerCommand?.("crew-handoff", {
@@ -2255,6 +2697,7 @@ export default function crewExtension(pi: ExtensionAPI) {
     pi.appendEntry?.("crew-context-warning-state", { level: "none", sessionId: ctx.sessionManager?.getSessionId?.(), recordedAt: new Date().toISOString() });
   });
   pi.on?.("message_end", async (event, ctx) => {
+    if (event.message?.role === "toolResult") { releasePendingClose(event.message.toolCallId); return; }
     if (event.message?.role !== "assistant") return;
     const normalized = normalizeUsage(event.message.usage);
     pi.appendEntry?.("crew-usage", { ...normalized, recordedAt: new Date().toISOString(), semantics: "current request, not cumulative session usage" });
@@ -2271,7 +2714,8 @@ export default function crewExtension(pi: ExtensionAPI) {
       const managed = managedCoordinates(ctx.sessionManager?.getBranch?.());
       const runId = managed?.runId ?? "parent-local"; const taskId = managed?.taskId ?? "parent-session";
       const percent = next === "checkpoint" ? 50 : 20;
-      const action = managed ? "Ask the brain to decide yes/no before self_compact; native Pi auto-compaction remains enabled." : isCrewChildSession(ctx.sessionManager?.getBranch?.()) ? "No authenticated brain-decision channel in legacy/proxy mode; voluntary self_compact unavailable, native Pi auto-compaction remains enabled." : "Decide whether to call self_compact at a safe boundary; native Pi auto-compaction remains enabled.";
+      const compactionText = compactionStatusText(readCompactionInfo(ctx.cwd, ctx.model as any, window), window);
+      const action = managed ? `Ask the brain to decide yes/no before self_compact. ${compactionText}` : isCrewChildSession(ctx.sessionManager?.getBranch?.()) ? `No authenticated brain-decision channel in legacy/proxy mode; voluntary self_compact unavailable. ${compactionText}` : `Decide whether to call self_compact at a safe boundary. ${compactionText}`;
       const text = `Crew context ${next}: session=${sessionId} run=${runId} task=${taskId}; ${observed == null ? "estimated" : "observed"} current context=${tokens}/${window} tokens (${percent}% threshold). ${action}`;
       ctx.ui?.notify?.(text, "warning");
       pi.appendEntry?.("crew-context-warning", { level: next, tokens, window, sessionId, runId, taskId, measured: observed != null, text, recordedAt: new Date().toISOString() });
@@ -2306,7 +2750,7 @@ export default function crewExtension(pi: ExtensionAPI) {
       if (params.customInstructions !== undefined && (typeof params.customInstructions !== "string" || params.customInstructions.length > 2000)) throw new Error("customInstructions must be at most 2000 characters");
       const branch = ctx.sessionManager.getBranch?.() ?? [];
       const managed = managedCoordinates(branch);
-      if (isCrewChildSession(branch) && !managed) throw new Error("Legacy/proxy child compaction has no authenticated brain-decision channel; voluntary self_compact is disabled. Pi's native auto-compaction remains enabled");
+      if (isCrewChildSession(branch) && !managed) throw new Error("Legacy/proxy child compaction has no authenticated brain-decision channel; voluntary self_compact is disabled. Native Pi auto-compaction is governed by the compaction settings");
       const sessionId = ctx.sessionManager.getSessionId();
       if (compactionsInFlight.has(sessionId)) throw new Error("Compaction already pending for this session");
       const usage = ctx.getContextUsage?.();
@@ -2338,7 +2782,7 @@ export default function crewExtension(pi: ExtensionAPI) {
         if (!decision) throw new Error("No brain decision for the latest child context warning; continue safely and check the managed inbox");
         const parsed = JSON.parse(decision.content) as { requestId?: string; sessionId?: string; approve?: boolean };
         if (parsed.requestId !== request.artifactId || parsed.sessionId !== sessionId) throw new Error("Brain decision targets a different context request or child session");
-        if (parsed.approve !== true) return { content: [{ type: "text", text: "Brain declined compaction for this warning; continue work. Native Pi auto-compaction is unaffected." }], details: { approved: false, decisionId: decision.artifactId } };
+        if (parsed.approve !== true) return { content: [{ type: "text", text: "Brain declined compaction for this warning; continue work. Native Pi auto-compaction settings are unaffected." }], details: { approved: false, decisionId: decision.artifactId } };
         approvalId = decision.artifactId;
         requestId = request.artifactId;
       }
@@ -2348,12 +2792,15 @@ export default function crewExtension(pi: ExtensionAPI) {
         ctx.compact({ customInstructions: instructions, onComplete: () => {
           compactionsInFlight.delete(sessionId);
           pi.appendEntry?.("crew-self-compact", { sessionId, requestId, decisionId: approvalId, status: "completed", reason: params.reason });
+          // ctx.compact aborts the calling run; resume it explicitly.
+          try { pi.sendMessage?.({ customType: "crew-compaction-resume", content: "Compaction finished; continue the task you were working on from the summary; do not redo completed work.", display: false }, { triggerTurn: true }); } catch { /* best-effort */ }
         }, onError: (error) => {
           compactionsInFlight.delete(sessionId);
           pi.appendEntry?.("crew-self-compact-failed", { sessionId, decisionId: approvalId, error: error.message });
+          try { pi.sendMessage?.({ customType: "crew-compaction-resume", content: `Compaction failed: ${error.message}. Continue the task you were working on; do not redo completed work.`, display: false }, { triggerTurn: true }); } catch { /* best-effort */ }
         } });
       } catch (error) { compactionsInFlight.delete(sessionId); throw error; }
-      return { content: [{ type: "text", text: "Pi self-compaction scheduled for this session. Wait for completion; this is not a success verdict and does not close any Herdr pane." }], details: { scheduled: true, sessionId, decisionId: approvalId } };
+      return { content: [{ type: "text", text: "Pi self-compaction scheduled. The current run will be interrupted for compaction and resumed automatically afterwards; this is not a success verdict and does not close any Herdr pane." }], details: { scheduled: true, sessionId, decisionId: approvalId } };
     },
   });
 

@@ -16,8 +16,8 @@ Use only the project-local crew tools for normal delegation.
 
 - The current Pi session is the **brain** and remains the final decision-maker.
 - Each delegated role runs as a separate agent in its own visible Herdr pane.
-- Keep role panes visible after completion unless the user requests cleanup or explicitly enables safe ephemeral teardown.
-- Reuse an idle same-cwd role pane in the same workspace/tab by default.
+- Every launch gets a fresh pane; panes are never reused. Spawning is serialized per tab.
+- Panes close automatically after the result reaches the brain (all roles, after `teardownGraceMs`, default 5000). Pass `ephemeral: false` (or set `lifecycle.ephemeral=false`) to keep them. Incomplete, working, blocked, failed, and timed-out panes are retained for inspection.
 - Prefer short, focused role tasks over long autonomous chains.
 - Use one mutation-capable role in the active project at a time unless the user explicitly requests isolated worktrees or parallel writers.
 
@@ -246,15 +246,18 @@ Supply:
 
 Preserve detailed reviewer/oracle/scout findings unless the user asks for a summary. Keep numbered findings, caveats, verdicts, sources, and file references. Incomplete diagnostic output is not a final answer.
 
+Completion is read from the child's Pi session JSONL (`agent_session`), with terminal markers as a fallback; `details.extractionSource` is `session` or `terminal` (`null` when no marker pair was confirmed). Answers are capped at 60,000 characters. When truncated, read the full text from `details.childSessionPath`.
+
 ## Checkpoints and handoffs
 
 - Standard implemented phases receive provisional checkpoints.
 - A fresh-session `/crew-handoff` is allowed only after a passed major phase boundary or a passed final review batch.
 - Keep immutable contracts and evidence referenced rather than replaying transcripts.
 - Context warnings use 20% and 50% of the active model's context window (1,000,000 tokens when unavailable), measured from current context rather than cumulative billed tokens. At each warning, decide based on the plan, phase, remaining work, blockers, and evidence whether compaction would save useful context; do not compact reflexively.
-- The brain can call `self_compact` on its own Pi session with a concrete reason and short summary instructions. It schedules Pi's native compaction and does not replace the session or close a pane. Verify completion/failure before proceeding.
+- The brain can call `self_compact` on its own Pi session with a concrete reason and short summary instructions. It interrupts the current run, compacts, then automatically resumes the agent; it does not replace the session or close a pane. Verify completion/failure before proceeding.
+- The notice states whether Pi's native auto-compaction is enabled (`compaction.enabled`). `npm run configure-compaction -- --write` (run on the host from the agent-container repo) enables it with per-model `reserveTokens` at 50% of the context window. Settings apply to newly started or reloaded Pi sessions; recreate running pic containers to pick them up.
 - For a managed child's warning, inspect the delivered notification and the current child identity/status. Use `crew_compact_decide` with run/repository/task/attempt/request ID, explicit `approve: true|false`, and a scope-aware reason. The child checks its inbox and may call `self_compact` only for its latest brain-approved request. A 50% warning permits reconsidering an earlier 20% decline; do not respond to stale or replaced sessions.
-- Legacy and `pic-proxy` children have no authenticated brain-to-child decision channel, so voluntary child self-compaction is disabled there; Pi's native automatic compaction/overflow recovery remains enabled. If needed, use a fresh managed direct-mode launch. Never paste a slash command into a Herdr pane to force compaction.
+- Legacy and `pic-proxy` children have no authenticated brain-to-child decision channel, so voluntary child self-compaction is disabled there; they rely on native auto-compaction only when it is enabled in settings. If needed, use a fresh managed direct-mode launch. Never paste a slash command into a Herdr pane to force compaction.
 - Preview cleanup and delete only owner-scoped obsolete evidence after a replacing approved checkpoint exists.
 - Never delete live blockers, source, Git objects, user panes, or sole report/review evidence.
 

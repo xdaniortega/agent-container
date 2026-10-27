@@ -11,6 +11,8 @@ export type HerdrAgentLike = {
   name?: string;
   agent?: string;
   pane_id?: string;
+  /** Herdr's unique terminal identity; unlike pane ids it is not reused. */
+  terminal_id?: string;
   workspace_id?: string;
   tab_id?: string;
   foreground_cwd?: string;
@@ -44,6 +46,8 @@ export type ChildLaunchRecord = {
   role: string;
   agentName?: string;
   paneId?: string;
+  /** Herdr terminal_id recorded at spawn; required to close a pane whose agent is absent. */
+  terminalId?: string;
   workspaceId?: string;
   tabId?: string;
   runId?: string;
@@ -55,6 +59,12 @@ export type ChildLaunchRecord = {
   taskStatus?: string;
   complete: boolean;
   agentContinues: boolean;
+  /** True when the pane is scheduled for close after completion (set from launch details). */
+  ephemeral?: boolean;
+  /** ISO time the child pane was closed by the lifecycle manager. */
+  paneClosedAt?: string;
+  /** Reason the last close attempt was skipped; the stale sweep does not retry identity-based skips. */
+  closeSkippedReason?: string;
   markerMode?: string;
   sessionRef?: HerdrAgentSessionRef;
   piSessionId?: string;
@@ -122,6 +132,7 @@ export function herdrObservation(agent: HerdrAgentLike | undefined): Record<stri
   return {
     agentName: agent?.name,
     paneId: agent?.pane_id,
+    terminalId: agent?.terminal_id,
     workspaceId: agent?.workspace_id,
     tabId: agent?.tab_id,
     status: normalizedStatus(agent?.agent_status ?? agent?.status),
@@ -162,6 +173,7 @@ export function reconcileChildLaunch(previous: ChildLaunchRecord | undefined, de
     role,
     agentName: typeof details.agentName === "string" ? details.agentName : previous?.agentName,
     paneId: incomingPane ?? previous?.paneId,
+    terminalId: previous?.terminalId ?? (typeof details.terminalId === "string" ? details.terminalId : undefined),
     workspaceId: typeof details.workspaceId === "string" ? details.workspaceId : previous?.workspaceId,
     tabId: typeof details.tabId === "string" ? details.tabId : previous?.tabId,
     runId: typeof details.runId === "string" ? details.runId : previous?.runId,
@@ -173,6 +185,9 @@ export function reconcileChildLaunch(previous: ChildLaunchRecord | undefined, de
     taskStatus: typeof details.lifecycleStatus === "string" ? details.lifecycleStatus : previous?.taskStatus,
     complete,
     agentContinues,
+    ephemeral: typeof details.ephemeral === "boolean" ? details.ephemeral : previous?.ephemeral,
+    paneClosedAt: typeof details.paneClosedAt === "string" ? details.paneClosedAt : previous?.paneClosedAt,
+    closeSkippedReason: typeof details.closeSkippedReason === "string" ? details.closeSkippedReason : previous?.closeSkippedReason,
     markerMode: typeof details.extractionMode === "string" ? details.extractionMode : typeof details.markerMode === "string" ? details.markerMode : previous?.markerMode,
     sessionRef,
     piSessionId: piSessionId(sessionRef, details.piSessionId) ?? previous?.piSessionId,

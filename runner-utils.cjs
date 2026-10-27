@@ -1,4 +1,4 @@
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -77,13 +77,20 @@ async function startProxy({ host, port, proxyUrl = `http://${host}:${port}`, ver
       return { server: null, started: false };
     }
     if (error && error.code === 'EADDRNOTAVAIL') {
-      log(`address ${host} not available, falling back to 0.0.0.0`);
-      const fallbackHost = '0.0.0.0';
-      const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
-      attachRequestFailedLogger(fallbackServer);
-      await fallbackServer.listen();
-      log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
-      return { server: fallbackServer, started: true };
+      if (process.env.PIC_ALLOW_WILDCARD_BIND === '1') {
+        log(`warning: address ${host} not available, falling back to 0.0.0.0 because PIC_ALLOW_WILDCARD_BIND=1`);
+        const fallbackHost = '0.0.0.0';
+        const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
+        attachRequestFailedLogger(fallbackServer);
+        await fallbackServer.listen();
+        log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
+        return { server: fallbackServer, started: true };
+      }
+      const msg = `Address ${host} is not available to bind proxy server on port ${port}. Please set PIC_PROXY_HOST (or CLC_PROXY_HOST) to a reachable IP address on this host, or set PIC_ALLOW_WILDCARD_BIND=1 to allow binding to 0.0.0.0.`;
+      log(`error: ${msg}`);
+      const err = new Error(msg);
+      err.code = 'EADDRNOTAVAIL';
+      throw err;
     }
     throw error;
   }
@@ -138,6 +145,47 @@ function getProjectSessionsNamespace(workdir) {
 // so a concurrent session never rewrites a directory that a running container has
 // bind-mounted at /host-pi (that clobbering emptied model/auth config).
 const STAGED_PI_CONFIG_INSTANCE_RE = /^\d{13,}-\d+-[a-f0-9]{6}$/;
+const SENSITIVE_ENV_NAME_RE = /KEY|TOKEN|SECRET|PASSWORD/i;
+
+function redactSensitiveArgs(args) {
+  if (!Array.isArray(args)) return [];
+  const result = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '-e' || arg === '--env') {
+      result.push(arg);
+      if (i + 1 < args.length) {
+        const nextArg = String(args[i + 1] ?? '');
+        const eqIdx = nextArg.indexOf('=');
+        if (eqIdx !== -1) {
+          const varName = nextArg.slice(0, eqIdx);
+          if (SENSITIVE_ENV_NAME_RE.test(varName)) {
+            result.push(`${varName}=[REDACTED]`);
+            i += 1;
+            continue;
+          }
+        }
+        result.push(nextArg);
+        i += 1;
+      }
+    } else if (typeof arg === 'string' && (arg.startsWith('--env=') || (arg.startsWith('-e') && arg.length > 2))) {
+      const prefix = arg.startsWith('--env=') ? '--env=' : '-e';
+      const rest = arg.slice(prefix.length);
+      const eqIdx = rest.indexOf('=');
+      if (eqIdx !== -1) {
+        const varName = rest.slice(0, eqIdx);
+        if (SENSITIVE_ENV_NAME_RE.test(varName)) {
+          result.push(`${prefix}${varName}=[REDACTED]`);
+          continue;
+        }
+      }
+      result.push(arg);
+    } else {
+      result.push(arg);
+    }
+  }
+  return result;
+}
 
 function isStagedPiConfigInstanceName(name) {
   return STAGED_PI_CONFIG_INSTANCE_RE.test(String(name || ''));
@@ -257,17 +305,254 @@ function buildPicMountArgs({
   return args;
 }
 
+function parseContainerNetworkGateway(jsonText) {
+  if (typeof jsonText !== 'string') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!parsed) return null;
+
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const isDefault = item.id === 'default'
+      || item.configuration?.name === 'default'
+      || item.name === 'default';
+    if (isDefault) {
+      const gateway = item.status?.ipv4Gateway;
+      if (typeof gateway === 'string' && gateway.trim()) {
+        return gateway.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function detectContainerGateway({ spawnSyncImpl = spawnSync } = {}) {
+  try {
+    const res = spawnSyncImpl('container', ['network', 'list', '--format', 'json'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    if (res.status === 0 && res.stdout) {
+      return parseContainerNetworkGateway(res.stdout);
+    }
+  } catch {}
+  return null;
+}
+
+function normalizeDigest(value, { prefixBare = false } = {}) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (prefixBare && !trimmed.startsWith('sha256:')) return `sha256:${trimmed}`;
+  return trimmed;
+}
+
+// Digest of an Apple `container image inspect <ref>` item. Live shape:
+//   [{"configuration":{"descriptor":{"digest":"sha256:ee30..."},"name":"..."},"id":"ee30...","variants":[...]}]
+// Preference: configuration.descriptor.digest, then id (sha256: prefixed when
+// bare), then index.digest.
+function parseImageInspectDigest(jsonText) {
+  if (typeof jsonText !== 'string') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const digest = normalizeDigest(item.configuration?.descriptor?.digest)
+      || normalizeDigest(item.id, { prefixBare: true })
+      || normalizeDigest(item.index?.digest)
+      || normalizeDigest(item.configuration?.index?.digest);
+    if (digest) return digest;
+  }
+  return null;
+}
+
+// Digest of the image a container was created from, taken from one item of
+// `container inspect <id>` output: configuration.image.descriptor.digest
+// (falling back to configuration.image.index.digest). Never uses item.id, which
+// is the container id.
+function parseContainerImageDigest(inspectItem) {
+  const image = inspectItem?.configuration?.image;
+  if (!image || typeof image !== 'object') return null;
+  return normalizeDigest(image.descriptor?.digest) || normalizeDigest(image.index?.digest);
+}
+
+// Shell function shared (verbatim, modulo indentation) with entrypoint.sh.
+// A drift-guard unit test compares the two. All staging (tmp/trash/lock) lives
+// under PIC_STAGING_ROOT (default /root/.pi/.staging), outside the directories
+// Pi scans for extensions/skills, on the same filesystem so mv stays atomic.
+// The function never fails: a lost race, stale lock or failed swap leaves the
+// existing destination intact.
+const INSTALL_PATH_ATOMIC_SH = `# BEGIN install_path_atomic
+install_path_atomic() {
+ia_src="$1"
+ia_dest="$2"
+[ -e "$ia_src" ] || return 0
+if [ -e "$ia_dest" ] && diff -rq "$ia_src" "$ia_dest" >/dev/null 2>&1; then
+return 0
+fi
+ia_root="\${PIC_STAGING_ROOT:-/root/.pi/.staging}"
+mkdir -p "$ia_root" "$(dirname "$ia_dest")" 2>/dev/null || return 0
+ia_key="$(printf '%s' "$ia_dest" | tr '/' '_')"
+ia_lock="$ia_root/$ia_key.lock"
+if [ -d "$ia_lock" ] && [ -n "$(find "$ia_lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+rm -rf "$ia_lock" 2>/dev/null || true
+fi
+if mkdir "$ia_lock" 2>/dev/null; then
+if [ -e "$ia_dest" ] && diff -rq "$ia_src" "$ia_dest" >/dev/null 2>&1; then
+rmdir "$ia_lock" 2>/dev/null || true
+return 0
+fi
+find "$ia_root" -maxdepth 1 \\( -name "$ia_key.tmp.*" -o -name "$ia_key.trash.*" \\) -mmin +10 -exec rm -rf {} + 2>/dev/null || true
+ia_tmp="$ia_root/$ia_key.tmp.$$"
+ia_trash="$ia_root/$ia_key.trash.$$"
+rm -rf "$ia_tmp" "$ia_trash" 2>/dev/null || true
+if cp -aL "$ia_src" "$ia_tmp" 2>/dev/null; then
+ia_moved=0
+if [ -e "$ia_dest" ] && mv "$ia_dest" "$ia_trash" 2>/dev/null; then
+ia_moved=1
+fi
+if mv -T "$ia_tmp" "$ia_dest" 2>/dev/null; then
+rm -rf "$ia_trash" 2>/dev/null || true
+else
+if [ "$ia_moved" = "1" ] && [ ! -e "$ia_dest" ]; then
+mv "$ia_trash" "$ia_dest" 2>/dev/null || true
+fi
+rm -rf "$ia_tmp" 2>/dev/null || true
+if [ -e "$ia_dest" ]; then
+rm -rf "$ia_trash" 2>/dev/null || true
+fi
+fi
+else
+rm -rf "$ia_tmp" 2>/dev/null || true
+fi
+rmdir "$ia_lock" 2>/dev/null || true
+fi
+return 0
+}
+# END install_path_atomic
+`;
+
+// Script run inside a reused container (via `sh -lc`) to refresh one staged
+// extension. A failed or lost refresh is never fatal by itself: the container
+// is only unusable when dest/index.ts is missing afterwards.
+function buildExtensionRefreshScript({ src, dest }) {
+  const q = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  return [
+    INSTALL_PATH_ATOMIC_SH,
+    `mkdir -p "$(dirname ${q(dest)})" 2>/dev/null || true`,
+    `install_path_atomic ${q(src)} ${q(dest)} || true`,
+    `test -f ${q(`${dest}/index.ts`)}`,
+  ].join('\n');
+}
+
+function cleanStaleDirSiblings(resolvedTarget, maxAgeMs = 10 * 60 * 1000, now = Date.now()) {
+  const parentDir = path.dirname(resolvedTarget);
+  const baseName = path.basename(resolvedTarget);
+  const prefix = `${baseName}.`;
+  try {
+    const entries = fs.readdirSync(parentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.name.startsWith(prefix)) continue;
+      const rest = entry.name.slice(prefix.length);
+      if (!rest.startsWith('tmp.') && !rest.startsWith('trash.')) continue;
+      const fullPath = path.join(parentDir, entry.name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+function replaceDirAtomically(targetDir, buildIntoTempDirFn, { maxAgeMs = 10 * 60 * 1000, now = Date.now() } = {}) {
+  const resolvedTarget = path.resolve(targetDir);
+  const parentDir = path.dirname(resolvedTarget);
+  fs.mkdirSync(parentDir, { recursive: true });
+
+  cleanStaleDirSiblings(resolvedTarget, maxAgeMs, now);
+
+  const nonce = `${Date.now()}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const tmpDir = `${resolvedTarget}.tmp.${nonce}`;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  let trashDir = null;
+  try {
+    const result = buildIntoTempDirFn(tmpDir);
+    if (fs.existsSync(resolvedTarget)) {
+      trashDir = `${resolvedTarget}.trash.${nonce}`;
+      try {
+        fs.renameSync(resolvedTarget, trashDir);
+      } catch (renameErr) {
+        if (renameErr && renameErr.code === 'ENOENT') {
+          // Another launcher already moved resolvedTarget aside
+          trashDir = null;
+        } else {
+          throw renameErr;
+        }
+      }
+    }
+    try {
+      fs.renameSync(tmpDir, resolvedTarget);
+    } catch (swapErr) {
+      if (swapErr && (swapErr.code === 'ENOTEMPTY' || swapErr.code === 'EEXIST') && fs.existsSync(resolvedTarget)) {
+        // Another launcher already installed the target directory
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        if (trashDir) {
+          try { fs.rmSync(trashDir, { recursive: true, force: true }); } catch {}
+        }
+        return result;
+      }
+      throw swapErr;
+    }
+    if (trashDir) {
+      try { fs.rmSync(trashDir, { recursive: true, force: true }); } catch {}
+    }
+    return result;
+  } catch (err) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    if (trashDir && fs.existsSync(trashDir) && !fs.existsSync(resolvedTarget)) {
+      try { fs.renameSync(trashDir, resolvedTarget); } catch {}
+    }
+    if (fs.existsSync(resolvedTarget) && (err.code === 'ENOTEMPTY' || err.code === 'EEXIST')) {
+      return undefined;
+    }
+    throw err;
+  }
+}
+
 module.exports = {
   PI_CONFIG_PRUNE_PATHS,
+  INSTALL_PATH_ATOMIC_SH,
+  buildExtensionRefreshScript,
   buildPicMountArgs,
+  cleanStaleDirSiblings,
   createStagedPiConfigInstanceDir,
+  detectContainerGateway,
   getProjectSessionsNamespace,
   isStagedPiConfigInstanceName,
   nodeProxyPreloadImport,
-  pruneStagedPiConfigDirs,
+  parseContainerImageDigest,
+  parseContainerNetworkGateway,
   parseContainerRunnerArgs,
+  parseImageInspectDigest,
+  pruneStagedPiConfigDirs,
   proxyEnvironmentArgs,
   proxyEnvironmentNames,
+  redactSensitiveArgs,
+  replaceDirAtomically,
   runChildProcess,
   shouldPrunePiConfigPath,
   stageHostPiConfig,

@@ -32,6 +32,10 @@ Build the container image:
 container build --dns 1.1.1.1 -t agentic-coding-node:24 .
 ```
 
+Herdr is pinned in the image (`ARG HERDR_VERSION=0.8.2` with `HERDR_SHA256_AARCH64` and
+`HERDR_SHA256_X86_64`). The in-image version must match the host `herdr --version`;
+otherwise Herdr calls fail with `protocol_mismatch`. See [Upgrade](#upgrade) to change it.
+
 If Apple `container build` fails with `Temporary failure resolving 'deb.debian.org'`,
 the long-running `buildkit` helper may be using the wrong resolver. Repair it with:
 ```bash
@@ -43,23 +47,27 @@ If a VPN is connected and the build still cannot resolve Debian hosts, the
 problem may be broader than DNS: Apple `container`/`buildkit` may be unable to
 reach public internet addresses directly. In that case, start a temporary
 host-side HTTP/HTTPS proxy on the Apple container bridge and pass it as build
-args:
+args. First find the bridge gateway address; it is the default network's `ipv4Gateway`
+(currently `192.168.65.1` on recent Apple container releases, `192.168.64.1` on older ones):
 ```bash
+container network list --format json
+GATEWAY=192.168.65.1   # replace with the ipv4Gateway printed above
+
 npm install
 
-node - <<'NODE' &
+GATEWAY=$GATEWAY node - <<'NODE' &
 const ProxyChain = require('proxy-chain');
-const server = new ProxyChain.Server({ host: '192.168.64.1', port: 8891 });
-server.listen().then(() => console.log('proxy listening on 192.168.64.1:8891'));
+const server = new ProxyChain.Server({ host: process.env.GATEWAY, port: 8891 });
+server.listen().then(() => console.log('proxy listening on ' + process.env.GATEWAY + ':8891'));
 process.on('SIGTERM', async () => { await server.close(true); process.exit(0); });
 NODE
 PID=$!
 
-container build --dns 192.168.64.1 \
-  --build-arg HTTP_PROXY=http://192.168.64.1:8891 \
-  --build-arg HTTPS_PROXY=http://192.168.64.1:8891 \
-  --build-arg http_proxy=http://192.168.64.1:8891 \
-  --build-arg https_proxy=http://192.168.64.1:8891 \
+container build --dns $GATEWAY \
+  --build-arg HTTP_PROXY=http://$GATEWAY:8891 \
+  --build-arg HTTPS_PROXY=http://$GATEWAY:8891 \
+  --build-arg http_proxy=http://$GATEWAY:8891 \
+  --build-arg https_proxy=http://$GATEWAY:8891 \
   -t agentic-coding-node:24 .
 
 kill $PID
@@ -83,6 +91,12 @@ linked executable.
 
 `pic` uses direct networking by default. `pic --proxy` enables the host-side
 proxy; the older `pic-proxy` command remains an equivalent compatibility alias.
+
+The proxy and the Herdr bridge bind to the host address of the Apple container
+network, auto-detected from `container network list --format json` (the default
+network's `ipv4Gateway`, currently `192.168.65.1`). Override with `PIC_PROXY_HOST`,
+`PIC_HERDR_BRIDGE_HOST`, or `CLC_PROXY_HOST` (for `clc-proxy`). Neither binds
+`0.0.0.0` unless you set `PIC_ALLOW_WILDCARD_BIND=1`.
 
 Direct mode explicitly clears uppercase and lowercase HTTP, HTTPS, and ALL proxy
 variables, including when it reuses a container originally started in proxy mode.
@@ -137,7 +151,7 @@ Managed direct-mode runs support risk promotion and exact deferred review batche
 ### Choosing / changing models
 
 Crew roles and review agents never hardcode a provider or model. Each names an abstract **model tier** (`frontier` / `medium` / `small`) plus a concrete **reasoning** level (`xhigh` / `medium` / `low`). Everything lives in the single **`model-tiers.json`**:
-- `models.frontier|medium|small` → the provider/model each tier means for us (currently Opus 5.5, Sonnet 5.5, and Gemini 3.8 Flash). **Change which model a crew member uses by editing these three values.**
+- `models.frontier|medium|small` → the provider/model each tier means for us (currently Opus 5.5 for `frontier`, and Sonnet 5.5 for both `medium` and `small`). **Change which model a crew member uses by editing these three values.**
 - `crewRoles.<role>` → the `{ model: <tier>, reasoning: <level>, authority, description }` per crew member (scout, oracle, executor, reviewer).
 - `parallelCodeReview.<agent>` → the model tier + reasoning per review agent.
 
@@ -163,7 +177,29 @@ PIC_HERDR_BRIDGE=0 pic-proxy   # disable Herdr status bridge
 
 Run `herdr integration install pi` on the host once. The entrypoint loads `herdr-agent-state.ts` only when `HERDR_ENV=1`.
 
-Crew context notices occur at 20% and 50% of the active model's context window (1M tokens when the window is unavailable). The brain can call `self_compact` for its own session. For managed direct-mode children, the brain reads the child's context notification and uses `crew_compact_decide` to approve or decline that exact child's request; only an approved child can call `self_compact` in its own Pi session. Legacy/`pic-proxy` children cannot request authenticated approval, so voluntary compaction is disabled for them; Pi's built-in near-limit automatic compaction remains active. Pi compaction is lossy; preserve accepted plan, phase, blockers, and evidence references in summary instructions. Compaction does not close Herdr panes.
+Crew children launched from a `pic` or `pic-proxy` brain inherit its proxy mode (`PIC_PROXY_MODE`). Durable/managed crew mode is still unsupported through `pic`/`pic-proxy`. The in-container Herdr bridge exits when its Pi process exits.
+
+The Herdr version baked into the image must match the host (`herdr --version`). The entrypoint warns on a mismatch, which otherwise surfaces as `protocol_mismatch`. After rebuilding the image, running containers from an older image are no longer reused; the log prints `container stop <id>` to stop them. Reused containers (`container exec`) keep `/root/.pi`: skills and extensions are refreshed atomically and the auth mode is reconciled.
+
+#### Crew pane lifecycle
+
+- Every `crew_launch` creates a fresh Herdr pane; panes are never reused. Spawning is serialized per tab, so parallel launches do not squeeze the brain pane.
+- Completion is read primarily from the child's Pi session JSONL (Herdr reports its path as `agent_session`). Terminal markers are a wrap-tolerant fallback. `details.extractionSource` is `session` or `terminal` (or `null` when no marker pair was confirmed). Answers are capped at 60,000 characters; `details.childSessionPath` points to the full text.
+- Panes of every role, including `executor`, close automatically once the brain has received the result: after the toolResult `message_end` (with `tool_execution_end` as a 30s fallback) plus `teardownGraceMs` (default 5000). `lifecycle.ephemeral` defaults to `true`; pass `ephemeral: false` or set `lifecycle.ephemeral=false` to keep panes.
+- The close is graceful (`/quit`, then `herdr pane close`) and checks pane, name, session, and terminal ID first. Incomplete, working, blocked, failed, and timed-out panes are retained for inspection. A stale-pane sweep runs on session start.
+
+#### Context compaction
+
+Pi's native auto-compaction is the compaction mechanism; it runs between turns without aborting. Crew does not enable it. Configure it with:
+
+```bash
+npm run configure-compaction              # dry run
+npm run configure-compaction -- --write   # apply (run from this repo on the host)
+```
+
+This sets `compaction.enabled=true` and a per-model `reserveTokens` equal to 50% of the context window for the tier models and the default model. Options: `--fraction`, `--model`, `--settings`, `--config-cwd`. A `.bak` backup of the settings file is kept. Settings apply to newly started or reloaded Pi sessions; running pic containers keep their staged copy until recreated.
+
+Crew context notices occur at 20% and 50% of the active model's context window (1M tokens when the window is unavailable) and state the real compaction status read from settings (enabled, or disabled with overflow recovery off). The brain can call `self_compact` for its own session; it interrupts the current run, compacts, then automatically resumes the agent. For managed direct-mode children, the brain reads the child's context notification and uses `crew_compact_decide` to approve or decline that exact child's request; only an approved child can call `self_compact` in its own Pi session. Legacy/`pic-proxy` children cannot request authenticated approval, so voluntary compaction is disabled for them; they rely on native auto-compaction only if it is enabled in settings. Pi compaction is lossy; preserve accepted plan, phase, blockers, and evidence references in summary instructions. Compaction does not close Herdr panes.
 
 Crew launches bind a stable launch ID to the child pane and Herdr `agent_session`. The extension keeps controller state, raw Herdr state, managed task state, and completion evidence separate so an idle child is not mistaken for verified completion. Use the `crew_status` tool from the brain or `/crew-status` interactively to inspect running, blocked, timed-out-but-live, lost, replaced, or settled-incomplete children. A compact `crew:` footer indicator appears when work is active or needs attention.
 
@@ -316,6 +352,7 @@ Claude Code sessions are inspectable through the ignored symlink
 
 The custom `node:24-trixie-slim` image includes:
 - `@earendil-works/pi-coding-agent` (pinned via the `PI_VERSION` build arg)
+- Herdr CLI (pinned and checksum-verified via `HERDR_VERSION` and `HERDR_SHA256_*` build args)
 - the `crew` extension and skill, baked in as an image fallback
 - `pnpm`
 - `fd`
@@ -331,6 +368,17 @@ bump `ARG PI_VERSION` (or override it at build time) and rebuild:
 ```bash
 container build --dns 1.1.1.1 --build-arg PI_VERSION=0.87.1 -t agentic-coding-node:24 .
 ```
+
+Herdr is pinned the same way and must match the host `herdr --version`. Take the
+checksums from https://herdr.dev/latest.json (`releases.<version>.sha256`):
+```bash
+container build --dns 1.1.1.1 \
+  --build-arg HERDR_VERSION=<v> \
+  --build-arg HERDR_SHA256_AARCH64=<sha> \
+  --build-arg HERDR_SHA256_X86_64=<sha> \
+  -t agentic-coding-node:24 .
+```
+After a rebuild, stop containers still running the old image (`container stop <id>`).
 
 To rebuild against the pinned version without cache:
 ```bash

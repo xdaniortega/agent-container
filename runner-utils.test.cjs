@@ -1,3 +1,6 @@
+/**
+ * @notice Verifies pic runner helpers: mounts, config staging, gateway and image-digest parsing, and atomic installs.
+ */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -5,9 +8,17 @@ const path = require('node:path');
 const {
   buildPicMountArgs,
   createStagedPiConfigInstanceDir,
+  detectContainerGateway,
   getProjectSessionsNamespace,
+  INSTALL_PATH_ATOMIC_SH,
+  buildExtensionRefreshScript,
   isStagedPiConfigInstanceName,
+  parseContainerImageDigest,
+  parseContainerNetworkGateway,
+  parseImageInspectDigest,
   pruneStagedPiConfigDirs,
+  redactSensitiveArgs,
+  replaceDirAtomically,
   stageHostPiConfig,
 } = require('./runner-utils.cjs');
 
@@ -261,4 +272,299 @@ test('failed staging preserves the previous staged config', () => {
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
+});
+
+// 9. parseContainerNetworkGateway handles array, object, missing default, and invalid JSON
+test('parseContainerNetworkGateway parses array of networks with default network', () => {
+  const json = JSON.stringify([
+    { id: 'eval-net', status: { ipv4Gateway: '192.168.64.1' } },
+    { id: 'default', configuration: { name: 'default' }, status: { ipv4Gateway: '192.168.65.1' } },
+  ]);
+  assert.equal(parseContainerNetworkGateway(json), '192.168.65.1');
+});
+
+test('parseContainerNetworkGateway parses single object default network', () => {
+  const json = JSON.stringify({
+    id: 'default',
+    configuration: { name: 'default' },
+    status: { ipv4Gateway: '192.168.65.1' },
+  });
+  assert.equal(parseContainerNetworkGateway(json), '192.168.65.1');
+});
+
+test('parseContainerNetworkGateway returns null when default network is missing', () => {
+  const json = JSON.stringify([
+    { id: 'eval-1', configuration: { name: 'eval-1' }, status: { ipv4Gateway: '192.168.66.1' } },
+    { id: 'eval-2', configuration: { name: 'eval-2' }, status: { ipv4Gateway: '192.168.67.1' } },
+  ]);
+  assert.equal(parseContainerNetworkGateway(json), null);
+});
+
+test('parseContainerNetworkGateway returns null for invalid JSON or non-string inputs', () => {
+  assert.equal(parseContainerNetworkGateway('{invalid json'), null);
+  assert.equal(parseContainerNetworkGateway(''), null);
+  assert.equal(parseContainerNetworkGateway(null), null);
+  assert.equal(parseContainerNetworkGateway(undefined), null);
+  assert.equal(parseContainerNetworkGateway(123), null);
+});
+
+// 10. detectContainerGateway invokes container network list and parses gateway
+test('detectContainerGateway delegates to spawnSyncImpl and returns gateway', () => {
+  const mockSpawn = (cmd, args) => {
+    assert.equal(cmd, 'container');
+    assert.deepEqual(args, ['network', 'list', '--format', 'json']);
+    return {
+      status: 0,
+      stdout: JSON.stringify([{ id: 'default', status: { ipv4Gateway: '192.168.65.1' } }]),
+    };
+  };
+  assert.equal(detectContainerGateway({ spawnSyncImpl: mockSpawn }), '192.168.65.1');
+
+  const failSpawn = () => ({ status: 1, stdout: '' });
+  assert.equal(detectContainerGateway({ spawnSyncImpl: failSpawn }), null);
+});
+
+// 11. replaceDirAtomically creates, swaps, and preserves on failure
+test('replaceDirAtomically creates directory and replaces it atomically', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-atomic-'));
+  try {
+    const targetDir = path.join(tmpRoot, 'staged-skills');
+
+    // First creation
+    replaceDirAtomically(targetDir, (temp) => {
+      fs.writeFileSync(path.join(temp, 'file1.txt'), 'version 1');
+    });
+    assert.equal(fs.readFileSync(path.join(targetDir, 'file1.txt'), 'utf8'), 'version 1');
+
+    // Atomic replacement
+    replaceDirAtomically(targetDir, (temp) => {
+      fs.writeFileSync(path.join(temp, 'file1.txt'), 'version 2');
+      fs.writeFileSync(path.join(temp, 'file2.txt'), 'new file');
+    });
+    assert.equal(fs.readFileSync(path.join(targetDir, 'file1.txt'), 'utf8'), 'version 2');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'file2.txt'), 'utf8'), 'new file');
+
+    // Failed replacement: exception thrown during build preserves original directory
+    assert.throws(() => {
+      replaceDirAtomically(targetDir, (temp) => {
+        fs.writeFileSync(path.join(temp, 'file1.txt'), 'broken');
+        throw new Error('disk full or build error');
+      });
+    }, /disk full or build error/);
+
+    assert.equal(fs.readFileSync(path.join(targetDir, 'file1.txt'), 'utf8'), 'version 2');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'file2.txt'), 'utf8'), 'new file');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// 12. replaceDirAtomically lost-race handling and sibling cleanup
+test('replaceDirAtomically handles lost race on target rename (ENOENT) gracefully', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-atomic-enoent-'));
+  try {
+    const targetDir = path.join(tmpRoot, 'target');
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, 'version.txt'), 'old');
+
+    // Simulate sibling moving target aside right as exists check passed
+    const realRenameSync = fs.renameSync;
+    let hooked = false;
+    fs.renameSync = (src, dest) => {
+      if (String(src) === targetDir && String(dest).includes('.trash.') && !hooked) {
+        hooked = true;
+        // In reality, ENOENT happens because the sibling moved targetDir away
+        fs.rmSync(targetDir, { recursive: true, force: true });
+        const err = new Error('ENOENT: no such file or directory');
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return realRenameSync(src, dest);
+    };
+
+    try {
+      replaceDirAtomically(targetDir, (temp) => {
+        fs.writeFileSync(path.join(temp, 'version.txt'), 'new');
+      });
+    } finally {
+      fs.renameSync = realRenameSync;
+    }
+
+    assert.ok(hooked, 'renameSync hook should have executed');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'version.txt'), 'utf8'), 'new');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('replaceDirAtomically handles lost race on swap (ENOTEMPTY/EEXIST) without throwing', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-atomic-enotempty-'));
+  try {
+    const targetDir = path.join(tmpRoot, 'target');
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, 'version.txt'), 'installed-by-sibling');
+
+    const realRenameSync = fs.renameSync;
+    let hooked = false;
+    fs.renameSync = (src, dest) => {
+      if (String(src).includes('.tmp.') && String(dest) === targetDir) {
+        hooked = true;
+        const err = new Error('ENOTEMPTY: directory not empty');
+        err.code = 'ENOTEMPTY';
+        throw err;
+      }
+      return realRenameSync(src, dest);
+    };
+
+    try {
+      // Should not throw, discards own temp, preserves existing target
+      replaceDirAtomically(targetDir, (temp) => {
+        fs.writeFileSync(path.join(temp, 'version.txt'), 'my-temp');
+      });
+    } finally {
+      fs.renameSync = realRenameSync;
+    }
+
+    assert.ok(hooked, 'swap rename hook should have executed');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'version.txt'), 'utf8'), 'installed-by-sibling');
+
+    // Verify temp directory was cleaned up
+    const remaining = fs.readdirSync(tmpRoot);
+    assert.deepEqual(remaining, ['target']);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('replaceDirAtomically cleans up stale sibling tmp and trash dirs older than 10 minutes', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pic-test-atomic-cleanup-'));
+  try {
+    const targetDir = path.join(tmpRoot, 'target');
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, 'version.txt'), 'v1');
+
+    const staleTmp = path.join(tmpRoot, 'target.tmp.12345');
+    const staleTrash = path.join(tmpRoot, 'target.trash.12345');
+    const recentTmp = path.join(tmpRoot, 'target.tmp.99999');
+    fs.mkdirSync(staleTmp, { recursive: true });
+    fs.mkdirSync(staleTrash, { recursive: true });
+    fs.mkdirSync(recentTmp, { recursive: true });
+
+    const now = Date.now();
+    const oldTime = new Date(now - 15 * 60 * 1000); // 15 mins old
+    fs.utimesSync(staleTmp, oldTime, oldTime);
+    fs.utimesSync(staleTrash, oldTime, oldTime);
+
+    replaceDirAtomically(targetDir, (temp) => {
+      fs.writeFileSync(path.join(temp, 'version.txt'), 'v2');
+    }, { now });
+
+    assert.ok(!fs.existsSync(staleTmp), 'stale .tmp sibling should be removed');
+    assert.ok(!fs.existsSync(staleTrash), 'stale .trash sibling should be removed');
+    assert.ok(fs.existsSync(recentTmp), 'recent .tmp sibling should be preserved');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'version.txt'), 'utf8'), 'v2');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// 13. redactSensitiveArgs redacts key/token/secret/password arguments
+test('redactSensitiveArgs redacts sensitive env variables while preserving safe ones', () => {
+  const input = [
+    'exec',
+    '-w', '/workspace/proj',
+    '-e', 'PIC_PROXY_MODE=0',
+    '-e', 'ANTHROPIC_API_KEY=sk-ant-api03-secretkey',
+    '-e', 'ANTHROPIC_AUTH_TOKEN=secret-token',
+    '-e', 'GITHUB_TOKEN=ghp_secret',
+    '-e', 'APP_SECRET=supersecret',
+    '-e', 'DB_PASSWORD=mypassword',
+    '--env=API_KEY=other-secret',
+    '-eSAFE_VAR=visible',
+    '-e', 'GIT_AUTHOR_NAME=Daniel Ortega',
+    'container-123',
+    'entrypoint',
+    'pi',
+  ];
+
+  const redacted = redactSensitiveArgs(input);
+  assert.deepEqual(redacted, [
+    'exec',
+    '-w', '/workspace/proj',
+    '-e', 'PIC_PROXY_MODE=0',
+    '-e', 'ANTHROPIC_API_KEY=[REDACTED]',
+    '-e', 'ANTHROPIC_AUTH_TOKEN=[REDACTED]',
+    '-e', 'GITHUB_TOKEN=[REDACTED]',
+    '-e', 'APP_SECRET=[REDACTED]',
+    '-e', 'DB_PASSWORD=[REDACTED]',
+    '--env=API_KEY=[REDACTED]',
+    '-eSAFE_VAR=visible',
+    '-e', 'GIT_AUTHOR_NAME=Daniel Ortega',
+    'container-123',
+    'entrypoint',
+    'pi',
+  ]);
+});
+
+// --- Fix round 2: image digest parsing ---
+test('parseImageInspectDigest reads configuration.descriptor.digest from live image inspect output', () => {
+  const live = JSON.stringify([{
+    configuration: { descriptor: { digest: 'sha256:ee30aa' }, name: 'agentic-coding-node:24' },
+    id: 'ee30aa',
+    variants: [{ platform: { os: 'linux' } }],
+  }]);
+  assert.equal(parseImageInspectDigest(live), 'sha256:ee30aa');
+});
+
+test('parseImageInspectDigest falls back to id (prefixing sha256:) then index.digest', () => {
+  assert.equal(parseImageInspectDigest(JSON.stringify([{ id: 'abc123' }])), 'sha256:abc123');
+  assert.equal(parseImageInspectDigest(JSON.stringify({ id: 'sha256:abc123' })), 'sha256:abc123');
+  assert.equal(parseImageInspectDigest(JSON.stringify([{ index: { digest: 'sha256:idx' } }])), 'sha256:idx');
+  // descriptor beats id beats index
+  assert.equal(parseImageInspectDigest(JSON.stringify([{ configuration: { descriptor: { digest: 'sha256:d' } }, id: 'x', index: { digest: 'sha256:i' } }])), 'sha256:d');
+  assert.equal(parseImageInspectDigest(JSON.stringify([{ id: 'x', index: { digest: 'sha256:i' } }])), 'sha256:x');
+});
+
+test('parseImageInspectDigest returns null for invalid, empty or digest-less input', () => {
+  assert.equal(parseImageInspectDigest('not json'), null);
+  assert.equal(parseImageInspectDigest(undefined), null);
+  assert.equal(parseImageInspectDigest('[]'), null);
+  assert.equal(parseImageInspectDigest('null'), null);
+  assert.equal(parseImageInspectDigest(JSON.stringify([null, 'x', {}, { id: '  ' }])), null);
+});
+
+test('parseContainerImageDigest reads configuration.image.descriptor.digest and ignores the container id', () => {
+  const item = { id: 'my-container', configuration: { id: 'my-container', image: { reference: 'agentic-coding-node:24', descriptor: { digest: 'sha256:ee30aa' } } } };
+  assert.equal(parseContainerImageDigest(item), 'sha256:ee30aa');
+  assert.equal(parseContainerImageDigest({ configuration: { image: { index: { digest: 'sha256:idx' } } } }), 'sha256:idx');
+  assert.equal(parseContainerImageDigest({ id: 'my-container', configuration: { image: 'agentic-coding-node:24' } }), null);
+  assert.equal(parseContainerImageDigest({ configuration: {} }), null);
+  assert.equal(parseContainerImageDigest(null), null);
+});
+
+// --- Fix round 2: shared atomic-install shell function ---
+test('entrypoint.sh install_path_atomic matches INSTALL_PATH_ATOMIC_SH (drift guard)', () => {
+  const entry = fs.readFileSync(path.join(__dirname, 'entrypoint.sh'), 'utf8');
+  const m = entry.match(/# BEGIN install_path_atomic[\s\S]*?# END install_path_atomic/);
+  assert.ok(m, 'markers present in entrypoint.sh');
+  const norm = (text) => text.split('\n').map(l => l.trim()).filter(Boolean).join('\n');
+  assert.equal(norm(m[0]), norm(INSTALL_PATH_ATOMIC_SH));
+});
+
+test('install_path_atomic stages outside scanned dirs, uses lock with stale handling, and never nests', () => {
+  assert.match(INSTALL_PATH_ATOMIC_SH, /PIC_STAGING_ROOT:-\/root\/\.pi\/\.staging/);
+  assert.match(INSTALL_PATH_ATOMIC_SH, /mkdir "\$ia_lock"/);
+  assert.match(INSTALL_PATH_ATOMIC_SH, /-mmin \+10/);
+  assert.match(INSTALL_PATH_ATOMIC_SH, /mv -T "\$ia_tmp" "\$ia_dest"/);
+  assert.ok(!/mv "\$ia_tmp"/.test(INSTALL_PATH_ATOMIC_SH), 'no non -T fallback that can nest tmp inside dest');
+  assert.ok(!/\$ia_dest\.(tmp|trash|lock)/.test(INSTALL_PATH_ATOMIC_SH), 'no staging siblings next to dest');
+});
+
+test('buildExtensionRefreshScript never exits on a lost race and only checks index.ts at the end', () => {
+  const script = buildExtensionRefreshScript({ src: '/workspace/p/.pi/host-agent-extensions/crew', dest: '/root/.pi/agent/extensions/crew' });
+  assert.ok(!/exit 1/.test(script));
+  assert.ok(!/set -e/.test(script));
+  assert.match(script, /install_path_atomic '\/workspace\/p\/\.pi\/host-agent-extensions\/crew' '\/root\/\.pi\/agent\/extensions\/crew' \|\| true/);
+  const lines = script.trim().split('\n');
+  assert.equal(lines[lines.length - 1], "test -f '/root/.pi/agent/extensions/crew/index.ts'");
 });

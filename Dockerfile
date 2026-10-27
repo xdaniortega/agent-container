@@ -71,8 +71,22 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 
 # Install Herdr CLI so containerized Pi sessions can control the host Herdr
 # session through the socket bridge created by pic/pic-proxy.
-RUN curl -fsSL https://herdr.dev/install.sh | sh \
-    && ln -sf /root/.local/bin/herdr /usr/local/bin/herdr \
+# To bump HERDR_VERSION, also pass HERDR_SHA256_AARCH64 / HERDR_SHA256_X86_64 build
+# args; the checksums are listed at https://herdr.dev/latest.json
+# (releases.<version>.sha256). The defaults below belong to the default version.
+ARG HERDR_VERSION=0.8.2
+ARG HERDR_SHA256_AARCH64=f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d
+ARG HERDR_SHA256_X86_64=976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4
+
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        arm64) herdr_arch="aarch64"; herdr_sha="${HERDR_SHA256_AARCH64}" ;; \
+        amd64) herdr_arch="x86_64"; herdr_sha="${HERDR_SHA256_X86_64}" ;; \
+        *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-${herdr_arch}" -o /usr/local/bin/herdr \
+    && echo "${herdr_sha}  /usr/local/bin/herdr" | sha256sum -c - \
+    && chmod +x /usr/local/bin/herdr \
     && herdr --version
 
 # Bake the crew extension and skill into the image so the crew tool is available

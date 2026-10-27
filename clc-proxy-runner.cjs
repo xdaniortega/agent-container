@@ -5,15 +5,20 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 const {
+  detectContainerGateway,
   parseContainerRunnerArgs,
   proxyEnvironmentArgs,
+  redactSensitiveArgs,
   runChildProcess,
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
 
-const host = process.env.CLC_PROXY_HOST || '192.168.64.1';
+const explicitHost = process.env.CLC_PROXY_HOST;
+let detectedGateway = !explicitHost ? detectContainerGateway() : null;
+let host = explicitHost || detectedGateway || '192.168.64.1';
+let hostDetected = Boolean(!explicitHost && detectedGateway);
 const port = Number(process.env.CLC_PROXY_PORT || 8888);
-const proxyUrl = `http://${host}:${port}`;
+let proxyUrl = `http://${host}:${port}`;
 const verbose = process.env.CLC_PROXY_VERBOSE === '1';
 const workdir = process.env.CLC_WORKDIR || process.cwd();
 const home = process.env.HOME;
@@ -165,6 +170,8 @@ function ensureLocalProjectsLink() {
 async function main() {
   if (!home) throw new Error('HOME is not set');
 
+  log(`proxy host: ${host} (${hostDetected ? 'detected from container network' : (process.env.CLC_PROXY_HOST ? 'from CLC_PROXY_HOST' : 'default fallback')})`);
+
   fs.mkdirSync(claudeConfigHostDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(claudeProjectsHostDir, { recursive: true });
   ensureLocalProjectsLink();
@@ -172,6 +179,16 @@ async function main() {
 
   // Check if a container is already running with our workdir mounted
   const existingContainerId = findContainerWithMount(workdir);
+
+  if (!explicitHost && !hostDetected) {
+    const reDetected = detectContainerGateway();
+    if (reDetected) {
+      host = reDetected;
+      hostDetected = true;
+      proxyUrl = `http://${host}:${port}`;
+      log(`re-detected proxy host after container system startup: ${host}`);
+    }
+  }
 
   if (existingContainerId) {
     log(`reusing container "${existingContainerId}" via exec`);
@@ -218,7 +235,7 @@ async function main() {
       ...claudeArgs,
     ];
 
-    log(`exec: container ${args.slice(1, -claudeArgs.length - 1).join(' ')} ... claude --permission-mode bypassPermissions ...`);
+    log(`exec: container ${redactSensitiveArgs(args.slice(1, -claudeArgs.length - 1)).join(' ')} ... claude --permission-mode bypassPermissions ...`);
     runChildProcess('container', args, { cleanup });
   } else {
     const args = [

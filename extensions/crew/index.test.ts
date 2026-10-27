@@ -1,9 +1,12 @@
+/**
+ * @notice Verifies crew launch, completion capture, pane lifecycle, durable coordination, and context-compaction behavior.
+ */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import crewExtension, {
   buildRolePrompt,
   appendMarkerInstruction,
@@ -14,9 +17,14 @@ import crewExtension, {
   classifyDelegationResult,
   getOrCorroborateAgent,
   PROMPT_START_GRACE_MS,
-  REUSED_IDLE_GRACE_MS,
+  crewLifecycleTimings,
+  readCompactionInfo,
+  compactionStatusText,
+  closeChildPane,
   chooseSplitTarget,
   chooseAgentName,
+  observeAgent,
+  withSpawnLock,
   compactRoleOutput,
   configCandidates,
   modelTiersCandidates,
@@ -37,8 +45,10 @@ import crewExtension, {
   type CheckpointFallback,
   extractMarkerOutput,
   updateMarkerOutput,
-  findReusableRolePane,
-  findReusableRolePaneInList,
+  readSessionCompletion,
+  capAnswerText,
+  SESSION_ERROR_FINAL_GRACE_MS,
+  PROMPT_PICKUP_TIMEOUT_MS,
   parseCrewConfig,
   resolveRole,
   selectLaunchCommand,
@@ -158,9 +168,15 @@ test("selectLaunchCommand uses pi by default", () => {
   assert.equal(selectLaunchCommand({}), "pi");
 });
 
-test("selectLaunchCommand uses pic-proxy for bridge env", () => {
+test("selectLaunchCommand inherits the brain proxy mode", () => {
   assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE: "1" }), "pic-proxy");
   assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE_HOST: "127.0.0.1" }), "pic-proxy");
+  assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE: "1", PIC_PROXY_MODE: "1" }), "pic-proxy");
+  assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE: "1", PIC_PROXY_MODE: "0" }), "pic");
+  assert.equal(selectLaunchCommand({ PIC_HERDR_BRIDGE_HOST: "h", PIC_PROXY_MODE: "0" }), "pic");
+  assert.equal(selectLaunchCommand({ PIC_PROXY_MODE: "0" }), "pi");
+  assert.equal(selectLaunchCommand({ PIC_PROXY_MODE: "1" }), "pi");
+  assert.equal(buildRoleCommand("pic", "provider/model"), "pic --approve --model provider/model");
 });
 
 test("role bootstrap approves the project before selecting the model and enforces read-only tools", () => {
@@ -242,8 +258,10 @@ test("compactRoleOutput keeps output after the last prompt without extra truncat
 
 test("marker helpers extract only the final answer between marker pair", () => {
   const markers = buildCrewMarkers("call:a/b");
-  assert.match(markers.start, /^CREW_RESULT_START_/);
-  assert.match(markers.end, /^CREW_RESULT_END_/);
+  assert.match(markers.start, /^CREW_RESULT_START_[0-9a-f]{12}$/);
+  assert.match(markers.end, /^CREW_RESULT_END_[0-9a-f]{12}$/);
+  assert.deepEqual(buildCrewMarkers("call:a/b"), markers);
+  assert.notDeepEqual(buildCrewMarkers("call:a/c"), markers);
   const prompt = appendMarkerInstruction("You are scout. Task: say hello", markers);
   assert.match(prompt, new RegExp(markers.start));
   assert.match(prompt, new RegExp(markers.end));
@@ -323,49 +341,15 @@ test("config candidates prefer project config before global config", () => {
   assert.deepEqual(configCandidates("/repo", "/home/me"), modelTiersCandidates("/repo", "/home/me"));
 });
 
-test("reuse eligibility requires same role, idle or done, workspace, cwd, and pane", () => {
-  const agent = { name: "reviewer", pane_id: "pane-1", workspace_id: "ws", foreground_cwd: "/repo", agent_status: "idle" };
-  assert.equal(findReusableRolePane(agent, "reviewer", "ws", "/repo"), "pane-1");
-  assert.equal(findReusableRolePane({ ...agent, agent_status: undefined, status: "Idle" }, "reviewer", "ws", "/repo"), "pane-1");
-  assert.equal(findReusableRolePane({ ...agent, agent_status: "working" }, "reviewer", "ws", "/repo"), undefined);
-  assert.equal(findReusableRolePane({ ...agent, workspace_id: "other" }, "reviewer", "ws", "/repo"), undefined);
-  assert.equal(findReusableRolePane({ ...agent, foreground_cwd: "/else" }, "reviewer", "ws", "/repo"), undefined);
-  assert.equal(findReusableRolePane({ ...agent, name: "scout" }, "reviewer", "ws", "/repo"), undefined);
+test("agent naming never reuses a pane: role, then scoped name, then -N suffix", () => {
+  const idle = (name: string) => ({ name, pane_id: `pane-${name}`, workspace_id: "w5", tab_id: "w5:t6", cwd: "/repo", status: "Idle" });
+  assert.equal(chooseAgentName([], "scout", "w5", "/repo", "w5:t6"), "scout");
+  assert.equal(chooseAgentName([idle("scout")], "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6");
+  assert.equal(chooseAgentName([idle("scout"), idle("scout-w5-t6")], "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6-2");
 });
-
-test("reuse lookup finds existing role from agent list", () => {
-  const agents = [
-    { name: "scout", pane_id: "pane-scout", workspace_id: "ws", cwd: "/repo", agent_status: "idle" },
-    { name: "reviewer", pane_id: "pane-reviewer", workspace_id: "ws", cwd: "/repo", agent_status: "idle" },
-  ];
-  assert.equal(findReusableRolePaneInList(agents, "reviewer", "ws", "/repo"), "pane-reviewer");
-});
-
 
 test("agent naming scopes to workspace and tab when base role exists elsewhere", () => {
   const agents = [
-    { name: "scout", pane_id: "pane-scout", workspace_id: "team", tab_id: "team-tab", cwd: "/repo", status: "Idle" },
-  ];
-  assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6");
-});
-
-test("agent naming keeps base role for same tab reuse", () => {
-  const agents = [
-    { name: "scout", pane_id: "pane-scout", workspace_id: "w5", tab_id: "tab-test", cwd: "/repo", status: "Idle" },
-  ];
-  assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "tab-test"), "scout");
-});
-
-test("agent naming does not reuse an occupied name when its requested model is unknown", () => {
-  const agents = [
-    { name: "scout", pane_id: "pane-scout", workspace_id: "w5", tab_id: "tab-test", cwd: "/repo", status: "Idle" },
-  ];
-  assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "tab-test", "provider/model"), "scout-w5-tab-test");
-});
-
-test("agent naming reuses scoped same-tab role", () => {
-  const agents = [
-    { name: "scout-w5-t6", pane_id: "pane-scoped", workspace_id: "w5", tab_id: "w5:t6", cwd: "/repo", status: "Idle" },
     { name: "scout", pane_id: "pane-scout", workspace_id: "team", tab_id: "team-tab", cwd: "/repo", status: "Idle" },
   ];
   assert.equal(chooseAgentName(agents, "scout", "w5", "/repo", "w5:t6"), "scout-w5-t6");
@@ -559,73 +543,6 @@ await regressionTest("polling loop: corroborated real disappearance reports fail
   assert.equal(result.status, "failed");
   const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
   assert.equal(classification.complete, false);
-});
-
-await regressionTest("polling loop: reused idle pane does not complete on stale output at 5s and times out at 15s", async () => {
-  let virtualTime = 1_000_000;
-  const markers = buildCrewMarkers("test-reuse-stale");
-  const result = await runCrewPollingLoop(
-    {
-      roleName: "scout",
-      agentName: "scout-w",
-      paneId: "p1",
-      markers,
-      reusedPane: true,
-      submittedAt: virtualTime,
-      timeoutMs: 60_000,
-      hardCapMs: 120_000,
-      readLines: 200,
-    },
-    {
-      getAgent: async () => ({ agent_status: "idle" }),
-      readOutput: async () => "stale output from previous run without current markers",
-      now: () => virtualTime,
-      delay: async (ms) => { virtualTime += ms; },
-    }
-  );
-
-  assert.equal(result.status, "timed_out");
-  assert.equal(result.observedWorking, false);
-  assert.ok(virtualTime - 1_000_000 >= REUSED_IDLE_GRACE_MS, "must not exit before REUSED_IDLE_GRACE_MS");
-  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
-  assert.equal(classification.complete, false);
-});
-
-await regressionTest("polling loop: reused idle pane completes when current markers appear", async () => {
-  let virtualTime = 1_000_000;
-  const markers = buildCrewMarkers("test-reuse-fresh");
-  let polled = 0;
-  const result = await runCrewPollingLoop(
-    {
-      roleName: "scout",
-      agentName: "scout-w",
-      paneId: "p1",
-      markers,
-      reusedPane: true,
-      submittedAt: virtualTime,
-      timeoutMs: 60_000,
-      hardCapMs: 120_000,
-      readLines: 200,
-    },
-    {
-      getAgent: async () => ({ agent_status: "idle" }),
-      readOutput: async () => {
-        polled += 1;
-        if (polled >= 2) {
-          return `${markers.start}\nfresh answer\n${markers.end}`;
-        }
-        return "warming up";
-      },
-      now: () => virtualTime,
-      delay: async (ms) => { virtualTime += ms; },
-    }
-  );
-
-  assert.equal(result.status, "idle");
-  assert.equal(result.markerOutput.mode, "marker-pair");
-  assert.equal(result.markerOutput.text, "fresh answer");
-  const classification = classifyDelegationResult(result.status, result.markerOutput.mode);
-  assert.equal(classification.complete, true);
 });
 
 await regressionTest("polling loop: heartbeats increment and emit onUpdate notifications", async () => {
@@ -1369,7 +1286,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.deepEqual(permanent.models, {
     frontier: "anthropic/claude-opus-5-5",
     medium: "anthropic/claude-sonnet-5-5",
-    small: "google/gemini-3.8-flash",
+    small: "anthropic/claude-sonnet-5-5",
   });
   assert.deepEqual(
     Object.fromEntries(
@@ -1386,7 +1303,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
     }
   );
 
-  // resolveRole resolves tiers to concrete Opus5.5/Sonnet5.5/Gemini + correct reasoning:
+  // resolveRole resolves tiers to concrete Opus5.5/Sonnet5.5 + correct reasoning:
   const scoutRole = resolveRole("scout", permanent);
   assert.equal(scoutRole.model, "anthropic/claude-sonnet-5-5");
   assert.equal(scoutRole.reasoning, "medium");
@@ -1398,7 +1315,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.equal(oracleRole.reasoning, "xhigh");
 
   const executorRole = resolveRole("executor", permanent);
-  assert.equal(executorRole.model, "google/gemini-3.8-flash");
+  assert.equal(executorRole.model, "anthropic/claude-sonnet-5-5");
   assert.equal(executorRole.reasoning, "medium");
   assert.throws(() => resolveRole("executor-escalation", permanent), /Unknown crew role/);
 
@@ -1414,7 +1331,7 @@ test("model effort, advisory budgets, and normalized current-context warnings ar
   assert.equal(resolvedSynthesis.model, "anthropic/claude-sonnet-5-5");
   assert.equal(resolvedSynthesis.reasoning, "medium");
   const resolvedTestRunner = resolveParallelReviewAgent("testRunner", permanent);
-  assert.equal(resolvedTestRunner.model, "google/gemini-3.8-flash");
+  assert.equal(resolvedTestRunner.model, "anthropic/claude-sonnet-5-5");
   assert.equal(resolvedTestRunner.reasoning, "low");
 
   // Legacy parallelCodeReview inline concrete form:
@@ -1776,11 +1693,16 @@ function createMockHerdr(options: {
   markerOutputText?: string;
   pollStatus?: string;
   closeFails?: boolean;
+  sessionPath?: string;
+  agentReadText?: string;
+  agentExitsAfterPrompt?: boolean;
 }) {
   let createdPaneId: string | undefined;
   let promptCalled = false;
   const closedPanes: string[] = [];
   const agents = [...(options.initialAgents ?? [])];
+  const sessionField = options.sessionPath ? { agent_session: { source: "herdr:pi", agent: "pi", kind: "path", value: options.sessionPath } } : {};
+  const exited = () => !!options.agentExitsAfterPrompt && promptCalled;
 
   const mockPi = {
     registerTool() {},
@@ -1798,24 +1720,28 @@ function createMockHerdr(options: {
         return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: createdPaneId } } }), stderr: "" };
       }
       if (args[0] === "pane" && args[1] === "run") return { code: 0, stdout: "", stderr: "" };
-      if (args[0] === "pane" && args[1] === "read") return { code: 0, stdout: "ready", stderr: "" };
+      if (args[0] === "pane" && args[1] === "read") return exited() ? { code: 1, stdout: "", stderr: "pane_not_found" } : { code: 0, stdout: "ready", stderr: "" };
       if (args[0] === "agent" && args[1] === "list") {
         const curStatus = promptCalled ? (options.pollStatus ?? "idle") : "idle";
-        const list = createdPaneId
-          ? [...agents, { name: "scout", pane_id: createdPaneId, workspace_id: "ws", tab_id: "tab", cwd: options.repo, agent_status: curStatus, status: curStatus }]
+        const list = createdPaneId && !exited()
+          ? [...agents, { name: "scout", pane_id: createdPaneId, workspace_id: "ws", tab_id: "tab", cwd: options.repo, agent_status: curStatus, status: curStatus, ...sessionField }]
           : agents;
         return { code: 0, stdout: JSON.stringify({ result: { agents: list } }), stderr: "" };
       }
       if (args[0] === "agent" && args[1] === "rename") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "agent" && args[1] === "wait") return { code: 1, stdout: "", stderr: "unsupported" };
       if (args[0] === "agent" && args[1] === "get") {
+        if (exited()) return { code: 1, stdout: "", stderr: "agent_not_found" };
         const curStatus = promptCalled ? (options.pollStatus ?? "idle") : "idle";
-        return { code: 0, stdout: JSON.stringify({ result: { agent: { name: args[2], pane_id: createdPaneId ?? agents[0]?.pane_id, agent_status: curStatus, status: curStatus } } }), stderr: "" };
+        return { code: 0, stdout: JSON.stringify({ result: { agent: { name: args[2], pane_id: createdPaneId ?? agents[0]?.pane_id, agent_status: curStatus, status: curStatus, ...sessionField } } }), stderr: "" };
       }
       if (args[0] === "agent" && args[1] === "prompt") {
         promptCalled = true;
         return { code: 0, stdout: "", stderr: "" };
       }
       if (args[0] === "agent" && args[1] === "read") {
+        if (exited()) return { code: 1, stdout: "", stderr: "pane_not_found" };
+        if (options.agentReadText !== undefined) return { code: 0, stdout: options.agentReadText, stderr: "" };
         const text = options.markerOutputText !== undefined
           ? `${options.markers.start}\n${options.markerOutputText}\n${options.markers.end}`
           : "working without markers";
@@ -1832,365 +1758,1048 @@ function createMockHerdr(options: {
   return { mockPi, closedPanes };
 }
 
-test("successful ephemeral run emits spawn log + summary, waits teardownGraceMs, calls pane close exactly once, emits removal log, details.tornDown=true", async () => {
+// ---- Phase C: child pane lifecycle -------------------------------------------------------------
+
+type FakePane = { name: string; status: string; session: string; terminal?: string; workingLeft?: number; gone?: boolean; answer?: string; markers?: { start: string; end: string } };
+
+/** In-memory Herdr fake: panes, renames (with injectable collisions), prompts, /quit, and pane close. */
+function createFakeHerdr(options: { repo: string; panes?: Record<string, Partial<FakePane>>; collideRenames?: number; renameError?: string; startupStatus?: string; noMarkers?: boolean; quitNeverExits?: boolean; sessionDir?: string; workingPolls?: number; onRun?: () => void }) {
+  const panes = new Map<string, FakePane>();
+  for (const [id, pane] of Object.entries(options.panes ?? {})) panes.set(id, { name: id, status: "idle", session: `/sessions/${id}.jsonl`, terminal: `term-${id}`, ...pane });
+  const calls: string[][] = [];
+  const closed: string[] = [];
+  const quits: string[] = [];
+  const prompts: string[] = [];
+  const entries: { type: string; data: any }[] = [];
+  const splits: string[][] = [];
+  const realRepo = realpathSync(options.repo);
+  let counter = 0;
+  let collisions = options.collideRenames ?? 0;
+  const agentList = () => [...panes.entries()].filter(([, pane]) => !pane.gone).map(([id, pane]) => ({
+    name: pane.name, pane_id: id, terminal_id: pane.terminal, workspace_id: "ws", tab_id: "tab", cwd: realRepo, foreground_cwd: realRepo,
+    agent_status: pane.status, status: pane.status, agent_session: { source: "herdr:pi", agent: "pi", kind: "path", value: pane.session },
+  }));
+  const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+  const fail = (stderr: string) => ({ code: 1, stdout: "", stderr });
+  const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+  const pi = {
+    registerTool() {},
+    appendEntry(type: string, data: any) { entries.push({ type, data }); },
+    async exec(command: string, args: string[] = []) {
+      if (command === "pi" && args[0] === "--list-models") return ok("anthropic/claude-sonnet-5-5");
+      assert.equal(command, "herdr");
+      calls.push(args);
+      await tick();
+      const [a, b] = args;
+      if (a === "pane" && b === "current") return ok(JSON.stringify({ result: { pane: { pane_id: "brain", workspace_id: "ws", tab_id: "tab", cwd: options.repo } } }));
+      if (a === "pane" && b === "split") {
+        splits.push(args);
+        counter += 1;
+        const id = `pane-new-${counter}`;
+        panes.set(id, { name: `pi-${counter}`, status: options.startupStatus ?? "idle", session: `${options.sessionDir ?? "/sessions"}/${id}.jsonl`, terminal: `term-${id}`, workingLeft: 0 });
+        return ok(JSON.stringify({ result: { pane: { pane_id: id } } }));
+      }
+      if (a === "pane" && b === "get") {
+        const pane = panes.get(args[2]);
+        return pane ? ok(JSON.stringify({ result: { pane: { pane_id: args[2], terminal_id: pane.terminal } } })) : fail('{"error":{"code":"pane_not_found"}}');
+      }
+      if (a === "pane" && b === "run") { options.onRun?.(); return ok(); }
+      if (a === "pane" && b === "read") return ok("ready");
+      if (a === "pane" && b === "close") {
+        if (!panes.has(args[2])) return fail('{"error":{"code":"pane_not_found"}}');
+        closed.push(args[2]); panes.delete(args[2]); return ok();
+      }
+      if (a === "agent" && b === "list") return ok(JSON.stringify({ result: { agents: agentList() } }));
+      if (a === "agent" && b === "get") {
+        const found = agentList().find(agent => agent.name === args[2]);
+        const holder = panes.get(found?.pane_id ?? "");
+        if (found && holder?.workingLeft) { holder.workingLeft -= 1; found.agent_status = "working"; found.status = "working"; }
+        return found ? ok(JSON.stringify({ result: { agent: found } })) : fail('{"error":{"code":"agent_not_found"}}');
+      }
+      if (a === "agent" && b === "wait") return fail("unsupported");
+      if (a === "agent" && b === "rename") {
+        if (options.renameError) return fail(options.renameError);
+        const [, , paneId, name] = args;
+        if (collisions > 0 || [...panes.values()].some(pane => pane.name === name && !pane.gone)) {
+          if (collisions > 0) { collisions -= 1; panes.set(`foreign-${name}`, { name, status: "idle", session: `/sessions/foreign-${name}.jsonl` }); }
+          return fail('{"error":{"code":"agent_name_taken"}}');
+        }
+        panes.get(paneId)!.name = name;
+        return ok();
+      }
+      if (a === "agent" && b === "prompt") {
+        const entry = [...panes.entries()].find(([, pane]) => pane.name === args[2] && !pane.gone);
+        if (!entry) return fail('{"error":{"code":"agent_not_found"}}');
+        if (args[3] === "/quit") { quits.push(args[2]); if (!options.quitNeverExits) entry[1].gone = true; return ok(); }
+        prompts.push(args[2]);
+        entry[1].workingLeft = options.workingPolls ?? 0;
+        if (options.sessionDir) writeFileSync(entry[1].session, `${JSON.stringify({ type: "message", id: "u", message: { role: "user", content: [{ type: "text", text: args[3] }] } })}\n`);
+        const start = /CREW_RESULT_START_[0-9a-f]+/.exec(args[3])?.[0]; const end = /CREW_RESULT_END_[0-9a-f]+/.exec(args[3])?.[0];
+        entry[1].markers = start && end ? { start, end } : undefined;
+        entry[1].answer = `answer from ${args[2]}`;
+        entry[1].status = options.noMarkers ? "failed" : "idle";
+        return ok();
+      }
+      if (a === "agent" && b === "read") {
+        const pane = [...panes.values()].find(item => item.name === args[2] && !item.gone);
+        if (!pane) return fail("agent_not_found");
+        return ok(pane.markers && !options.noMarkers ? `${pane.markers.start}\n${pane.answer}\n${pane.markers.end}` : "working without markers");
+      }
+      throw new Error(`unexpected herdr call: ${args.join(" ")}`);
+    },
+  };
+  return { pi, panes, calls, closed, quits, prompts, entries, splits };
+}
+
+const waitFor = async (condition: () => boolean, ms = 3000) => {
+  const deadline = Date.now() + ms;
+  while (!condition() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+};
+const settleMs = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function withHerdrRepo<T>(fn: (repo: string) => Promise<T>): Promise<T> {
   const previousHerdr = process.env.HERDR_ENV;
   process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-success-"));
-  try {
-    const markers = buildCrewMarkers("call-eph-success");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All checks passed." });
-    const updates: any[] = [];
-    const delays: number[] = [];
-
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Check research items",
-        ephemeral: true,
-        teardownGraceMs: 5000,
-        toolCallId: "call-eph-success",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      (u) => updates.push(u),
-      undefined,
-      async (ms) => { delays.push(ms); }
-    );
-
-    assert.equal(result.details.complete, true);
-    assert.equal(result.details.ephemeral, true);
-    assert.equal(result.details.tornDown, true);
-    assert.equal(result.details.teardownGraceMs, 5000);
-    assert.equal(result.details.removalLogged, true);
-    assert.deepEqual(closedPanes, ["pane-eph-1"]);
-    assert.ok(delays.includes(5000));
-
-    // Spawn log
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: spawned scout in pane pane-eph-1")));
-    // Summary
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: scout completed in pane pane-eph-1. Summary:\nAll checks passed.")));
-    // Removal log
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: removed scout pane pane-eph-1 after successful run")));
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
+  const repo = mkdtempSync(join(tmpdir(), "crew-lifecycle-"));
+  try { return await fn(repo); }
+  finally {
+    if (previousHerdr === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = previousHerdr;
     rmSync(repo, { recursive: true, force: true });
   }
+}
+
+const launchParams = (repo: string, extra: Record<string, unknown> = {}) => ({
+  role: "scout", task: "Check the research items thoroughly and report the findings", startupTimeoutMs: 1000, startupReadyStableMs: 0, configCwd: repo, ...extra,
 });
 
-test("ephemeral run where pane close fails retains pane, tornDown=false, warns, and result stays successful", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-closefail-"));
-  try {
-    const markers = buildCrewMarkers("call-eph-closefail");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All checks passed.", closeFails: true });
-    const updates: any[] = [];
+/** Boots the extension against a fake Herdr and returns handlers to drive tool calls and events. */
+async function bootExtension(fake: ReturnType<typeof createFakeHerdr>, repo: string, branch: any[] = []) {
+  const tools = new Map<string, any>();
+  const events = new Map<string, any[]>();
+  crewExtension({
+    exec: fake.pi.exec, appendEntry: fake.pi.appendEntry,
+    registerTool(tool: any) { tools.set(tool.name, tool); },
+    on(name: string, handler: any) { events.set(name, [...(events.get(name) ?? []), handler]); },
+  } as any);
+  const ctx = { cwd: repo, sessionManager: { getSessionId: () => "brain-session", getBranch: () => branch }, ui: { setStatus() {} } };
+  for (const handler of events.get("session_start") ?? []) await handler({}, ctx);
+  const emit = async (name: string, event: any) => { for (const handler of events.get(name) ?? []) await handler(event, ctx); };
+  const launch = (toolCallId: string, extra: Record<string, unknown> = {}) => tools.get("crew_launch").execute(toolCallId, launchParams(repo, extra), undefined, undefined, ctx);
+  return { tools, emit, launch, ctx };
+}
 
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Check research items",
-        ephemeral: true,
-        teardownGraceMs: 5000,
-        toolCallId: "call-eph-closefail",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      (u) => updates.push(u),
-      undefined,
-      async () => {}
-    );
-
-    // Teardown failure must not corrupt the successful result
-    assert.equal(result.details.complete, true);
-    assert.ok(result.content?.[0]?.text?.includes("All checks passed."));
-    // Close was attempted but did not succeed
-    assert.deepEqual(closedPanes, ["pane-eph-1"]);
-    assert.equal(result.details.tornDown, false);
-    assert.equal(result.details.removalLogged, false);
-    // A teardown-failure warning was logged
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: warning - failed to close pane pane-eph-1")));
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
-  }
-});
-
-test("failure/timeout ephemeral run does NOT close the pane, details.tornDown=false, retention logged", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-fail-"));
-  try {
-    const markers = buildCrewMarkers("call-eph-fail");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: undefined, pollStatus: "failed" });
-    const updates: any[] = [];
-    const delays: number[] = [];
-
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Check research items",
-        ephemeral: true,
-        timeoutMs: 100,
-        toolCallId: "call-eph-fail",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      (u) => updates.push(u),
-      undefined,
-      async (ms) => { delays.push(ms); }
-    );
-
-    assert.equal(result.details.complete, false);
-    assert.equal(result.details.ephemeral, true);
-    assert.equal(result.details.tornDown, false);
-    assert.equal(result.details.removalLogged, false);
-    assert.deepEqual(closedPanes, []); // Pane close was NEVER called
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: retained scout pane pane-eph-1")));
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
-  }
-});
-
-test("ephemeral mode does not reuse an existing pane", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-noreuse-"));
-  try {
-    const markers = buildCrewMarkers("call-eph-noreuse");
-    const initialAgents = [{
-      name: "scout",
-      pane_id: "pane-existing-scout",
-      workspace_id: "ws",
-      tab_id: "tab",
-      cwd: repo,
-      agent_status: "idle",
-      status: "idle",
-    }];
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, initialAgents, markerOutputText: "OK" });
-
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Run one-off check",
-        ephemeral: true,
-        toolCallId: "call-eph-noreuse",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      undefined,
-      undefined,
-      async () => {}
-    );
-
-    assert.equal(result.details.ephemeral, true);
-    assert.equal(result.details.createdPane, "pane-eph-1");
+await regressionTest("no pane reuse: an idle same-role agent is never reused and names are unique", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo, panes: { "pane-old": { name: "scout", status: "idle" } } });
+    const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "nr-1" } as any);
     assert.equal(result.details.reusedPane, false);
-    assert.deepEqual(closedPanes, ["pane-eph-1"]); // closed the created pane, not existing
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
-  }
+    assert.equal(result.details.createdPane, "pane-new-1");
+    assert.equal(result.details.agentName, "scout-ws-tab");
+    assert.deepEqual(fake.prompts, ["scout-ws-tab"]);
+    assert.equal(fake.panes.get("pane-old")!.name, "scout");
+  });
 });
 
-test("non-ephemeral default is unchanged (no close)", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-noneph-default-"));
-  try {
-    const markers = buildCrewMarkers("call-noneph-default");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "Normal output" });
+await regressionTest("concurrent launches are serialized per tab: second splits below the first's renamed pane with a distinct name", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo });
+    const [first, second] = await Promise.all([
+      executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "cc-1" } as any),
+      executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "cc-2" } as any),
+    ]);
+    assert.notEqual(first.details.agentName, second.details.agentName);
+    assert.equal(fake.splits.length, 2);
+    assert.ok(fake.splits[0].includes("--current"));
+    assert.deepEqual(fake.splits[1].slice(0, 5), ["pane", "split", "pane-new-1", "--direction", "down"]);
+    assert.equal(first.details.complete, true);
+    assert.equal(second.details.complete, true);
+    // Prompting is outside the lock: both prompts happened and neither pane was closed by the tool call.
+    assert.equal(fake.prompts.length, 2);
+    assert.deepEqual(fake.closed, []);
+  });
+});
 
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Normal scout task",
-        toolCallId: "call-noneph-default",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      undefined,
-      undefined,
-      async () => {}
-    );
-
+await regressionTest("rename collisions re-list and re-choose a free name (up to 5 attempts)", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo, collideRenames: 2 });
+    const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "rc-1" } as any);
+    assert.equal(result.details.agentName, "scout-ws-tab-2");
+    assert.equal(result.details.renameConflictRecovered, true);
     assert.equal(result.details.complete, true);
-    assert.equal(result.details.ephemeral, false);
+    assert.deepEqual(fake.closed, []);
+  });
+});
+
+await regressionTest("final rename failure and post-split spawn errors close the never-prompted pane", async () => {
+  await withHerdrRepo(async (repo) => {
+    const exhausted = createFakeHerdr({ repo, collideRenames: 99 });
+    await assert.rejects(() => executeCrewLaunch(exhausted.pi as any, { ...launchParams(repo), toolCallId: "rf-1" } as any), /agent rename failed/);
+    assert.deepEqual(exhausted.closed, ["pane-new-1"]);
+    assert.deepEqual(exhausted.prompts, []);
+    assert.equal(exhausted.calls.filter(c => c[0] === "agent" && c[1] === "rename").length, 5);
+
+    const broken = createFakeHerdr({ repo, renameError: "boom" });
+    await assert.rejects(() => executeCrewLaunch(broken.pi as any, { ...launchParams(repo), toolCallId: "rf-2" } as any), /agent rename failed/);
+    assert.deepEqual(broken.closed, ["pane-new-1"]);
+  });
+});
+
+await regressionTest("startup timeout keeps the pane for inspection", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo, startupStatus: "working" });
+    await assert.rejects(() => executeCrewLaunch(fake.pi as any, { ...launchParams(repo, { startupTimeoutMs: 150 }), toolCallId: "st-1" } as any), /not ready/);
+    assert.deepEqual(fake.closed, []);
+  });
+});
+
+await regressionTest("ephemeral defaults to true; result carries a pending close but the tool call itself never delays or closes", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo });
+    const delays: number[] = [];
+    const updates: any[] = [];
+    const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "pd-1" } as any, undefined, u => updates.push(u), undefined, async (ms) => { delays.push(ms); });
+    assert.equal(result.details.ephemeral, true);
     assert.equal(result.details.tornDown, false);
-    assert.deepEqual(closedPanes, []); // pane close never called
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
+    assert.equal(result.details.teardownGraceMs, 5000);
+    assert.ok(!delays.includes(5000));
+    assert.deepEqual(fake.closed, []);
+    assert.deepEqual(fake.quits, []);
+    assert.equal(result.details.pendingClose.paneId, "pane-new-1");
+    assert.equal(result.details.pendingClose.agentName, "scout");
+    assert.equal(result.details.pendingClose.delayMs, 5000);
+    assert.equal(result.details.pendingClose.sessionValue, "/sessions/pane-new-1.jsonl");
+    const optOut = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo, { ephemeral: false }), toolCallId: "pd-2" } as any);
+    assert.equal(optOut.details.pendingClose, null);
+  });
+});
+
+await regressionTest("deferred close: nothing closes until the toolResult message_end, then /quit precedes pane close; duplicate events are deduplicated", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo });
+    const ext = await bootExtension(fake, repo);
+    const result = await ext.launch("tc-deferred", { teardownGraceMs: 30 });
+    assert.equal(result.details.complete, true);
+    await settleMs(80);
+    assert.deepEqual(fake.closed, []);
+    assert.deepEqual(fake.quits, []);
+    await ext.emit("message_end", { message: { role: "toolResult", toolCallId: "other-call", toolName: "crew_launch" } });
+    await settleMs(60);
+    assert.deepEqual(fake.closed, []);
+    await ext.emit("message_end", { message: { role: "toolResult", toolCallId: "tc-deferred", toolName: "crew_launch" } });
+    await ext.emit("tool_execution_end", { toolCallId: "tc-deferred", toolName: "crew_launch", isError: false });
+    await waitFor(() => fake.closed.length > 0);
+    await settleMs(80);
+    assert.deepEqual(fake.quits, ["scout"]);
+    assert.deepEqual(fake.closed, ["pane-new-1"]);
+    const order = fake.calls.filter(c => (c[0] === "agent" && c[1] === "prompt" && c[3] === "/quit") || (c[0] === "pane" && c[1] === "close")).map(c => c[1]);
+    assert.deepEqual(order, ["prompt", "close"]);
+    const removal = fake.entries.find(e => e.type === "crew-lifecycle" && e.data.action === "remove");
+    assert.ok(removal);
+    const record = [...fake.entries].reverse().find(e => e.type === "crew-child-lifecycle" && e.data.paneClosedAt);
+    assert.ok(record, "child record is updated with paneClosedAt");
+  });
+});
+
+await regressionTest("deferred close: tool_execution_end is only a fallback after the delivery window, and is deduplicated against message_end", async () => {
+  await withHerdrRepo(async (repo) => {
+    const savedFallback = crewLifecycleTimings.deliveryFallbackMs;
+    crewLifecycleTimings.deliveryFallbackMs = 120;
+    try {
+      const fake = createFakeHerdr({ repo });
+      const ext = await bootExtension(fake, repo);
+      await ext.launch("tc-fallback", { teardownGraceMs: 10 });
+      await ext.emit("tool_execution_end", { toolCallId: "tc-fallback", toolName: "crew_launch", isError: false });
+      await settleMs(60);
+      assert.deepEqual(fake.closed, [], "no close before the fallback window elapses");
+      await waitFor(() => fake.closed.length > 0);
+      assert.deepEqual(fake.closed, ["pane-new-1"]);
+
+      // message_end after tool_execution_end preempts the fallback and closes exactly once.
+      const second = createFakeHerdr({ repo });
+      const ext2 = await bootExtension(second, repo);
+      await ext2.launch("tc-fallback-2", { teardownGraceMs: 10 });
+      await ext2.emit("tool_execution_end", { toolCallId: "tc-fallback-2", toolName: "crew_launch", isError: false });
+      await ext2.emit("message_end", { message: { role: "toolResult", toolCallId: "tc-fallback-2" } });
+      await waitFor(() => second.closed.length > 0);
+      await settleMs(200);
+      assert.deepEqual(second.closed, ["pane-new-1"]);
+      assert.deepEqual(second.quits, ["scout"]);
+    } finally { crewLifecycleTimings.deliveryFallbackMs = savedFallback; }
+  });
+});
+
+await regressionTest("deferred close: identity checks skip a replaced session, a working agent, or a different agent", async () => {
+  await withHerdrRepo(async (repo) => {
+    const cases: [string, (fake: ReturnType<typeof createFakeHerdr>) => void, string][] = [
+      ["session", fake => { fake.panes.get("pane-new-1")!.session = "/sessions/other.jsonl"; }, "session-mismatch"],
+      ["working", fake => { fake.panes.get("pane-new-1")!.status = "working"; }, "status-working"],
+      ["agent", fake => { fake.panes.get("pane-new-1")!.name = "someone-else"; }, "different-agent-in-pane"],
+    ];
+    for (const [label, mutate, reason] of cases) {
+      const fake = createFakeHerdr({ repo });
+      const ext = await bootExtension(fake, repo);
+      await ext.launch(`tc-skip-${label}`, { teardownGraceMs: 10 });
+      mutate(fake);
+      await ext.emit("message_end", { message: { role: "toolResult", toolCallId: `tc-skip-${label}` } });
+      await waitFor(() => fake.entries.some(e => e.data?.action === "close-skipped"));
+      assert.deepEqual(fake.closed, [], label);
+      assert.deepEqual(fake.quits, [], label);
+      assert.equal(fake.entries.find(e => e.data?.action === "close-skipped")!.data.reason, reason);
+    }
+  });
+});
+
+await regressionTest("deferred close: a writer (executor) pane is closed too, and an exited-but-present pane tolerates pane_not_found", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo });
+    const ext = await bootExtension(fake, repo);
+    const result = await ext.launch("tc-writer", { role: "executor", teardownGraceMs: 10 });
+    assert.equal(result.details.authority, "can-edit");
+    assert.equal(result.details.complete, true);
+    await ext.emit("message_end", { message: { role: "toolResult", toolCallId: "tc-writer" } });
+    await waitFor(() => fake.closed.length > 0);
+    assert.deepEqual(fake.closed, ["pane-new-1"]);
+
+    // Agent already gone and pane already closed: close tolerates pane_not_found.
+    const gone = createFakeHerdr({ repo, panes: {} });
+    const outcome = await closeChildPane(gone.pi as any, { agentName: "scout", paneId: "pane-missing", terminalId: "term-pane-missing" });
+    assert.deepEqual(outcome, { closed: true });
+    // Without a recorded terminal_id an absent agent can never be proven: never close.
+    assert.deepEqual(await closeChildPane(gone.pi as any, { agentName: "scout", paneId: "pane-missing" }), { closed: false, skipped: "agent-absent-identity-unproven" });
+  });
+});
+
+await regressionTest("deferred close: an incomplete launch is retained and never scheduled", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo, noMarkers: true });
+    const ext = await bootExtension(fake, repo);
+    const result = await ext.launch("tc-incomplete", { teardownGraceMs: 10, timeoutMs: 100 });
+    assert.equal(result.details.complete, false);
+    assert.equal(result.details.pendingClose, null);
+    await ext.emit("message_end", { message: { role: "toolResult", toolCallId: "tc-incomplete" } });
+    await settleMs(80);
+    assert.deepEqual(fake.closed, []);
+    assert.deepEqual(fake.quits, []);
+    assert.ok(fake.entries.some(e => e.data?.action === "retain"));
+  });
+});
+
+await regressionTest("close that cannot quit gracefully keeps the pane and logs", async () => {
+  await withHerdrRepo(async (repo) => {
+    const saved = { ...crewLifecycleTimings };
+    crewLifecycleTimings.quitTimeoutMs = 60; crewLifecycleTimings.quitPollMs = 10;
+    try {
+      const fake = createFakeHerdr({ repo, quitNeverExits: true, panes: { "pane-x": { name: "scout" } } });
+      const outcome = await closeChildPane(fake.pi as any, { agentName: "scout", paneId: "pane-x" });
+      assert.deepEqual(outcome, { closed: false, skipped: "quit-timeout" });
+      assert.deepEqual(fake.closed, []);
+    } finally { Object.assign(crewLifecycleTimings, saved); }
+  });
+});
+
+await regressionTest("stale sweep closes only recorded, completed, ephemeral, unclosed children with matching identity", async () => {
+  await withHerdrRepo(async (repo) => {
+    const saved = { ...crewLifecycleTimings };
+    crewLifecycleTimings.sweepDelayMs = 20;
+    try {
+      const base = { role: "scout", controllerStatus: "settled", herdrStatus: "idle", complete: true, agentContinues: false, ephemeral: true, startedAt: new Date().toISOString(), observedAt: new Date().toISOString(), lastProgressAt: new Date().toISOString(), recoveryHint: "" };
+      const rec = (id: string, extra: Record<string, unknown>) => ({ type: "custom", customType: "crew-child-lifecycle", data: { ...base, launchId: id, agentName: `agent-${id}`, paneId: `pane-${id}`, terminalId: `term-pane-${id}`, sessionRef: { source: "herdr:pi", agent: "pi", kind: "path", value: `/sessions/pane-${id}.jsonl` }, ...extra } });
+      const branch = [
+        rec("stale", {}),
+        rec("closed", { paneClosedAt: "2026-01-01T00:00:02.000Z" }),
+        rec("legacy", { ephemeral: undefined }),
+        rec("incomplete", { complete: false }),
+        rec("nopane", { paneId: undefined }),
+        rec("replaced", { sessionRef: { source: "herdr:pi", agent: "pi", kind: "path", value: "/sessions/older.jsonl" } }),
+      ];
+      const panes: Record<string, Partial<FakePane>> = {};
+      for (const id of ["stale", "closed", "legacy", "incomplete", "replaced"]) panes[`pane-${id}`] = { name: `agent-${id}`, session: `/sessions/pane-${id}.jsonl` };
+      panes["pane-user"] = { name: "user-agent" };
+      const fake = createFakeHerdr({ repo, panes });
+      await bootExtension(fake, repo, branch);
+      await waitFor(() => fake.closed.length > 0);
+      await settleMs(150);
+      assert.deepEqual(fake.closed, ["pane-stale"]);
+      assert.deepEqual(fake.quits, ["agent-stale"]);
+      assert.ok(fake.entries.some(e => e.data?.action === "close-skipped" && e.data.launchId === "replaced"));
+    } finally { Object.assign(crewLifecycleTimings, saved); }
+  });
+});
+
+await regressionTest("sweep with the agent absent: foreign pane under the same pane id is never closed; proven terminal_id is closed without /quit", async () => {
+  await withHerdrRepo(async (repo) => {
+    const saved = { ...crewLifecycleTimings };
+    crewLifecycleTimings.sweepDelayMs = 20;
+    try {
+      const base = { role: "scout", controllerStatus: "settled", herdrStatus: "idle", complete: true, agentContinues: false, ephemeral: true, startedAt: new Date().toISOString(), observedAt: new Date().toISOString(), lastProgressAt: new Date().toISOString(), recoveryHint: "" };
+      const rec = (id: string, extra: Record<string, unknown>) => ({ type: "custom", customType: "crew-child-lifecycle", data: { ...base, launchId: id, agentName: `agent-${id}`, paneId: `pane-${id}`, ...extra } });
+      const branch = [
+        rec("foreign", { terminalId: "term-original" }),
+        rec("proven", { terminalId: "term-pane-proven" }),
+        rec("noterm", {}),
+        rec("old", { terminalId: "term-pane-old", startedAt: new Date(Date.now() - 25 * 3600_000).toISOString() }),
+      ];
+      // Agents are absent: the panes hold no named agent (agent list is empty via gone), only a shell terminal.
+      const fake = createFakeHerdr({ repo, panes: {
+        "pane-foreign": { name: "shell", gone: true, terminal: "term-reused-by-user" },
+        "pane-proven": { name: "shell", gone: true },
+        "pane-noterm": { name: "shell", gone: true },
+        "pane-old": { name: "shell", gone: true },
+      } });
+      await bootExtension(fake, repo, branch);
+      await waitFor(() => fake.closed.length > 0);
+      await settleMs(150);
+      assert.deepEqual(fake.closed, ["pane-proven"]);
+      assert.deepEqual(fake.quits, []);
+      const skips = fake.entries.filter(e => e.data?.action === "close-skipped").map(e => `${e.data.launchId}:${e.data.reason}`).sort();
+      assert.deepEqual(skips, ["foreign:agent-absent-identity-unproven", "noterm:agent-absent-identity-unproven"]);
+      // The skip is recorded so later sweeps do not retry it.
+      assert.ok(fake.entries.some(e => e.type === "crew-child-lifecycle" && e.data.launchId === "foreign" && e.data.closeSkippedReason === "agent-absent-identity-unproven"));
+    } finally { Object.assign(crewLifecycleTimings, saved); }
+  });
+});
+
+await regressionTest("sweep skips records whose last close was skipped for identity reasons", async () => {
+  await withHerdrRepo(async (repo) => {
+    const saved = { ...crewLifecycleTimings };
+    crewLifecycleTimings.sweepDelayMs = 20;
+    try {
+      const now = new Date().toISOString();
+      const data = { launchId: "skipped", role: "scout", agentName: "agent-skipped", paneId: "pane-skipped", terminalId: "term-pane-skipped", closeSkippedReason: "status-working", controllerStatus: "settled", herdrStatus: "idle", complete: true, agentContinues: false, ephemeral: true, startedAt: now, observedAt: now, lastProgressAt: now, recoveryHint: "" };
+      const fake = createFakeHerdr({ repo, panes: { "pane-skipped": { name: "agent-skipped", session: "/sessions/x.jsonl" } } });
+      await bootExtension(fake, repo, [{ type: "custom", customType: "crew-child-lifecycle", data }]);
+      await settleMs(200);
+      assert.deepEqual(fake.closed, []);
+      assert.deepEqual(fake.quits, []);
+    } finally { Object.assign(crewLifecycleTimings, saved); }
+  });
+});
+
+await regressionTest("closeChildPane refuses an agent whose terminal_id differs from the recorded one", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo, panes: { "pane-x": { name: "scout", terminal: "term-other" } } });
+    assert.deepEqual(await closeChildPane(fake.pi as any, { agentName: "scout", paneId: "pane-x", terminalId: "term-mine" }), { closed: false, skipped: "terminal-mismatch" });
+    assert.deepEqual(fake.closed, []);
+  });
+});
+
+await regressionTest("a launch records the spawned pane's terminal_id and it reaches the pending close", async () => {
+  await withHerdrRepo(async (repo) => {
+    const fake = createFakeHerdr({ repo });
+    const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "term-1" } as any);
+    assert.equal(result.details.terminalId, "term-pane-new-1");
+    assert.equal(result.details.pendingClose?.terminalId, "term-pane-new-1");
+  });
+});
+
+await regressionTest("polling 6a: a transient agent lookup error is unknown, not an exit; only not-found means missing", async () => {
+  const m = buildCrewMarkers("poll-6a-get");
+  let t = 1_000_000;
+  let gets = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => { gets += 1; if (gets < 6) throw new Error("bridge hiccup"); return { agent_status: "idle" }; },
+      readOutput: async () => `${m.start}\nok\n${m.end}`,
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.agentExited, false);
+  // observeAgent classification with a fake bridge.
+  const exec = (get: { code: number; stderr: string }, list: { code: number; stderr: string; stdout?: string }) => ({
+    async exec(_c: string, args: string[]) {
+      if (args[1] === "get") return { code: get.code, stdout: "", stderr: get.stderr };
+      return { code: list.code, stdout: list.stdout ?? JSON.stringify({ result: { agents: [] } }), stderr: list.stderr };
+    },
+  });
+  assert.equal((await observeAgent(exec({ code: 1, stderr: "socket timeout" }, { code: 1, stderr: "socket timeout" }) as any, "a")).state, "unknown");
+  assert.equal((await observeAgent(exec({ code: 1, stderr: "socket timeout" }, { code: 0, stderr: "" }) as any, "a")).state, "missing");
+  assert.equal((await observeAgent(exec({ code: 1, stderr: "agent_not_found" }, { code: 1, stderr: "boom" }) as any, "a")).state, "unknown");
+  assert.equal((await observeAgent(exec({ code: 1, stderr: "agent_not_found" }, { code: 0, stderr: "" }) as any, "a")).state, "missing");
+});
+
+await regressionTest("post-loop session veto: settled loop exit with an unfinished session is incomplete and the agent continues", async () => {
+  await withHerdrRepo(async (repo) => {
+    const dir = mkdtempSync(join(tmpdir(), "crew-veto-"));
+    try {
+      const fake = createFakeHerdr({ repo, sessionDir: dir, workingPolls: 1 });
+      const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "veto-1", timeoutMs: 5000 } as any, undefined, undefined, undefined, async () => {});
+      assert.equal(result.details.complete, false);
+      assert.equal(result.details.agentContinues, true);
+      assert.equal(result.details.pendingClose, null);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+await regressionTest("cancellation: a launch waiting for the spawn lock releases it promptly and never prompts or spawns", async () => {
+  const order: string[] = [];
+  let releaseFirst!: () => void;
+  const first = withSpawnLock("k", () => new Promise<void>(resolve => { releaseFirst = resolve; order.push("first"); }));
+  await settleMs(5);
+  const controller = new AbortController();
+  const second = withSpawnLock("k", async () => { order.push("second"); }, controller.signal);
+  const secondResult = second.then(() => "ran", (e: Error) => e.message);
+  const third = withSpawnLock("k", async () => { order.push("third"); });
+  controller.abort();
+  assert.equal(await secondResult, "crew_launch was cancelled");
+  releaseFirst();
+  await first; await third;
+  assert.deepEqual(order, ["first", "third"]);
+});
+
+await regressionTest("cancellation mid-spawn: the created pane is quit and closed and the child is never prompted", async () => {
+  await withHerdrRepo(async (repo) => {
+    const controller = new AbortController();
+    const fake = createFakeHerdr({ repo, onRun: () => controller.abort() });
+    await assert.rejects(() => executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "cancel-1" } as any, controller.signal), /cancelled/);
+    assert.deepEqual(fake.prompts, []);
+    assert.deepEqual(fake.closed, ["pane-new-1"]);
+    assert.deepEqual(fake.quits, ["pi-1"]);
+  });
+});
+
+test("agent naming: numbered candidates truncate the base so the suffix always fits and stays distinct", () => {
+  const long = "a".repeat(32);
+  const agents = [{ name: long, pane_id: "p", workspace_id: "w", cwd: "/r", status: "idle" }, { name: `${"a".repeat(30)}-2`, pane_id: "p2", workspace_id: "w", cwd: "/r", status: "idle" }];
+  const name = chooseAgentName(agents as any, long, "w", "/r", "w:t");
+  assert.ok(name.length <= 32, name);
+  assert.match(name, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.ok(!agents.some(a => a.name === name));
+});
+
+await regressionTest("durable mode is refused for pic and pic-proxy", async () => {
+  for (const baseCommand of ["pic", "pic-proxy"] as const) {
+    await assert.rejects(() => prepareDurableLaunch({ enabled: true, baseCommand, cwd: process.cwd(), role: "executor", taskId: "t", ownerSessionId: "o" }), new RegExp(`not supported through ${baseCommand}.*durable omitted/false`));
   }
 });
 
-test("teardown of a reused/writer pane is refused/never attempted", async () => {
+await regressionTest("polling hardening 6a: non-not-found read errors keep the agent observation", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-transient");
+  let reads = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: reads < 5 ? "working" : "idle" }),
+      readOutput: async () => { reads += 1; if (reads < 5) throw new Error("herdr agent read a failed with code 1: socket timeout"); return `${m.start}\nrecovered\n${m.end}`; },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.agentExited, false);
+  assert.equal(result.markerOutput.text, "recovered");
+  const missing = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "working" }),
+      readOutput: async () => { throw new Error('herdr agent read a failed with code 1: {"error":{"code":"agent_not_found"}}'); },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(missing.agentExited, true);
+});
+
+test("polling hardening 6b: readSessionCompletion does not block on a FIFO", () => {
+  const dir = mkdtempSync(join(tmpdir(), "crew-fifo-"));
+  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+  const fifo = join(dir, "s.jsonl");
+  try { execFileSync("mkfifo", [fifo]); } catch { return; }
+  const r = readSessionCompletion(fifo, buildCrewMarkers("fifo"));
+  assert.equal(r.promptSeen, false);
+});
+
+await regressionTest("polling hardening 6c: an unfinished readable session overrides a terminal marker pair until it agrees", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-6c");
+  let sessionReads = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => `${m.start}\nterminal\n${m.end}`,
+      readSessionResult: async () => {
+        sessionReads += 1;
+        return sessionReads < 4
+          ? { promptSeen: true, finalSeen: false, mode: "missing" as const, text: "", source: "session" as const }
+          : { promptSeen: true, finalSeen: true, mode: "marker-pair" as const, text: "session", source: "session" as const };
+      },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.ok(sessionReads >= 4, `expected to wait for the session, got ${sessionReads} reads`);
+  assert.equal(result.sessionFinal, true);
+  // Session unavailable (never promptSeen): the terminal pair still completes immediately.
+  let reads2 = 0;
+  const unavailable = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => `${m.start}\nterminal\n${m.end}`,
+      readSessionResult: async () => { reads2 += 1; return { promptSeen: false, finalSeen: false, mode: "missing" as const, text: "", source: "session" as const }; },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(reads2, 1);
+  assert.equal(unavailable.markerOutput.mode, "marker-pair");
+});
+
+const sessionFixtureDirs: string[] = [];
+process.on("exit", () => { for (const d of sessionFixtureDirs) rmSync(d, { recursive: true, force: true }); });
+function sessionFixture(lines: unknown[], tail = ""): string {
+  const dir = mkdtempSync(join(tmpdir(), "crew-session-"));
+  sessionFixtureDirs.push(dir);
+  const file = join(dir, "s.jsonl");
+  writeFileSync(file, lines.map(l => typeof l === "string" ? l : JSON.stringify(l)).join("\n") + tail);
+  return file;
+}
+const sMsg = (role: string, content: unknown, stopReason?: string) => ({ type: "message", id: "x", message: { role, content, ...(stopReason ? { stopReason } : {}) } });
+const sText = (text: string) => [{ type: "text", text }];
+
+test("readSessionCompletion extracts the final answer and ignores thinking, toolCall, and other entries", () => {
+  const m = buildCrewMarkers("sess-1");
+  const file = sessionFixture([
+    { type: "session", id: "h" },
+    sMsg("user", sText(appendMarkerInstruction("task", m))),
+    { type: "custom", message: { role: "assistant", content: sText(`${m.start}\nBAD\n${m.end}`) } },
+    sMsg("assistant", [{ type: "thinking", thinking: `${m.start}\nTHINK\n${m.end}` }, { type: "toolCall", name: "x", arguments: { a: `${m.start} ARG ${m.end}` } }], "toolUse"),
+    sMsg("toolResult", sText("tool output")),
+    sMsg("assistant", sText(`working\n${m.start}\nold\n${m.end}`), "toolUse"),
+    sMsg("assistant", sText(`${m.start}\nFinal answer\nline 2\n${m.end}`), "stop"),
+  ]);
+  const r = readSessionCompletion(file, m);
+  assert.deepEqual(r, { promptSeen: true, finalSeen: true, mode: "marker-pair", text: "Final answer\nline 2", source: "session" });
+});
+
+test("readSessionCompletion tolerates wrapped markers, missing END, and unseen prompts", () => {
+  const m = buildCrewMarkers("sess-2");
+  const prompt = sMsg("user", sText(appendMarkerInstruction("task", m)));
+  const half = Math.floor(m.end.length / 2);
+  const wrapped = sessionFixture([prompt, sMsg("assistant", sText(`${m.start}\nAnswer\n${m.end.slice(0, half)}\n${m.end.slice(half)}`), "stop")]);
+  assert.equal(readSessionCompletion(wrapped, m).text, "Answer");
+  assert.equal(readSessionCompletion(wrapped, m).mode, "marker-pair");
+
+  const noEnd = sessionFixture([prompt, sMsg("assistant", sText(`${m.start}\nPartial`))]);
+  assert.deepEqual(readSessionCompletion(noEnd, m), { promptSeen: true, finalSeen: false, mode: "marker-start", text: "Partial", source: "session" });
+
+  const noPrompt = sessionFixture([sMsg("user", sText("other")), sMsg("assistant", sText(`${m.start}\nX\n${m.end}`), "stop")]);
+  assert.equal(readSessionCompletion(noPrompt, m).promptSeen, false);
+  assert.equal(readSessionCompletion(noPrompt, m).mode, "missing");
+
+  const onlyPrompt = sessionFixture([prompt]);
+  assert.deepEqual(readSessionCompletion(onlyPrompt, m), { promptSeen: true, finalSeen: false, mode: "missing", text: "", source: "session" });
+
+  const partial = sessionFixture([prompt, sMsg("assistant", sText(`${m.start}\nA\n${m.end}`), "stop")], '\n{"type":"message","message":{"role":"assis');
+  assert.equal(readSessionCompletion(partial, m).text, "A");
+
+  for (const bad of [undefined, "relative.jsonl", "/nonexistent/x.jsonl", wrapped.replace(/\.jsonl$/, ".txt")]) {
+    assert.equal(readSessionCompletion(bad, m).promptSeen, false);
+  }
+  assert.equal(readSessionCompletion(wrapped, m, { maxBytes: 10 }).promptSeen, false);
+});
+
+test("readSessionCompletion uses the last prompt so an earlier answer is not reused", () => {
+  const m = buildCrewMarkers("sess-3");
+  const file = sessionFixture([
+    sMsg("user", sText(appendMarkerInstruction("first", m))),
+    sMsg("assistant", sText(`${m.start}\nOld\n${m.end}`), "stop"),
+    sMsg("user", sText(appendMarkerInstruction("second", m))),
+  ]);
+  assert.equal(readSessionCompletion(file, m).mode, "missing");
+  assert.equal(readSessionCompletion(file, m).promptSeen, true);
+});
+
+test("terminal extraction tolerates wrapped markers but never matches the echoed prompt", () => {
+  const m = buildCrewMarkers("wrap-1");
+  const cut = 20;
+  const wrapped = `${m.start.slice(0, cut)}\n${m.start.slice(cut)}\nAnswer text\n${m.end.slice(0, cut)}\n${m.end.slice(cut)}`;
+  assert.deepEqual(extractMarkerOutput(wrapped, m), { text: "Answer text", mode: "marker-pair" });
+  assert.equal(extractMarkerOutput(`x\n  ${m.start.slice(0, cut)}\n  ${m.start.slice(cut)}\nAns\n${m.end}`, m).text, "Ans");
+  const echoed = appendMarkerInstruction("Do things", m);
+  assert.equal(extractMarkerOutput(echoed, m).mode, "missing");
+  const narrow = echoed.replace(/(.{24})/g, "$1\n");
+  assert.equal(extractMarkerOutput(narrow, m).mode, "missing");
+  assert.equal(extractMarkerOutput(`${echoed}\nthinking...`, m).mode, "missing");
+});
+
+await regressionTest("polling loop: session marker-pair with settled status completes even when terminal has no markers", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-a");
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 10_000, hardCapMs: 50_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => "garbled",
+      readSessionResult: async () => ({ promptSeen: true, finalSeen: true, mode: "marker-pair", text: "A", source: "session" }),
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.status, "idle");
+  assert.equal(result.sessionCompletion?.text, "A");
+  assert.equal(t, 1_000_000);
+});
+
+await regressionTest("polling loop: settled-without-working keeps waiting while session shows prompt but no final, and during pickup window", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-b");
+  let polls = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => "same",
+      readSessionResult: async () => {
+        polls += 1;
+        const elapsed = t - 1_000_000;
+        if (elapsed < 8_000) return { promptSeen: false, finalSeen: false, mode: "missing", text: "", source: "session" };
+        if (elapsed < 20_000) return { promptSeen: true, finalSeen: false, mode: "missing", text: "", source: "session" };
+        return { promptSeen: true, finalSeen: true, mode: "marker-pair", text: "late", source: "session" };
+      },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.ok(t - 1_000_000 >= 20_000, `waited past grace, got ${t - 1_000_000}`);
+  assert.equal(result.sessionCompletion?.mode, "marker-pair");
+  assert.ok(polls > 5);
+});
+
+await regressionTest("polling loop: unseen prompt gives up after PROMPT_PICKUP_TIMEOUT_MS", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-c");
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "idle" }),
+      readOutput: async () => "same",
+      readSessionResult: async () => ({ promptSeen: false, finalSeen: false, mode: "missing", text: "", source: "session" }),
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.status, "idle");
+  assert.ok(t - 1_000_000 >= PROMPT_PICKUP_TIMEOUT_MS && t - 1_000_000 < PROMPT_PICKUP_TIMEOUT_MS + 5_000);
+});
+
+await regressionTest("polling loop: readOutput errors (pane_not_found) become empty snapshot plus missing agent", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-d");
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "working" }),
+      readOutput: async () => { throw new Error("pane_not_found"); },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.agentExited, true);
+  assert.equal(result.status, "failed");
+  assert.equal(result.output, "");
+});
+
+// ---- Fix round 1 tests ----
+
+/** Simulates a terminal that hard word-wraps text to the given width (breaks long tokens). */
+function wrapToWidth(text: string, width: number): string {
+  const rows: string[] = [];
+  for (const line of text.split("\n")) {
+    let cur = "";
+    for (const word of line.split(" ")) {
+      let w = word;
+      while (w.length > width) {
+        if (cur) { rows.push(cur); cur = ""; }
+        rows.push(w.slice(0, width));
+        w = w.slice(width);
+      }
+      if (!cur) cur = w;
+      else if (cur.length + 1 + w.length <= width) cur += ` ${w}`;
+      else { rows.push(cur); cur = w; }
+    }
+    rows.push(cur);
+  }
+  return rows.join("\n");
+}
+
+test("echoed marker instruction never yields a pair at any wrap width (new and legacy wording)", () => {
+  const m = buildCrewMarkers("wrap-widths");
+  const legacy = `For your final answer, print ${m.start} on its own line, then your answer, then ${m.end} on its own line.`;
+  for (const instruction of [appendMarkerInstruction("Do the thing", m), legacy]) {
+    for (let width = 28; width <= 34; width += 1) {
+      const echo = wrapToWidth(instruction, width);
+      assert.notEqual(extractMarkerOutput(echo, m).mode, "marker-pair", `echo alone, width ${width}`);
+      const withEnd = `${echo}\nthinking...\n${m.end}\n`;
+      assert.notEqual(extractMarkerOutput(withEnd, m).mode, "marker-pair", `echo + real END, width ${width}`);
+      assert.notEqual(updateMarkerOutput({ text: "", mode: "missing" }, withEnd, m).mode, "marker-pair", `updateMarkerOutput, width ${width}`);
+    }
+  }
+});
+
+test("capAnswerText keeps head and tail and points to the session file", () => {
+  assert.equal(capAnswerText("short", "/x.jsonl"), "short");
+  const long = "H".repeat(40_000) + "T".repeat(40_000);
+  const capped = capAnswerText(long, "/tmp/s.jsonl");
+  assert.ok(capped.length < 60_500);
+  assert.ok(capped.startsWith("HHH") && capped.endsWith("TTT"));
+  assert.match(capped, /details\.childSessionPath \(\/tmp\/s\.jsonl\)/);
+});
+
+test("readSessionCompletion reads only the tail of large files and classifies stop reasons", () => {
+  const m = buildCrewMarkers("tail-1");
+  const prompt = sMsg("user", sText(appendMarkerInstruction("task", m)));
+  const big = sessionFixture([prompt, sMsg("assistant", sText("x".repeat(5_000)), "toolUse"), sMsg("assistant", sText(`${m.start}\nA\n${m.end}`), "stop")]);
+  assert.equal(readSessionCompletion(big, m, { maxBytes: 2_000 }).promptSeen, false); // prompt outside tail
+  assert.equal(readSessionCompletion(big, m, { maxBytes: 100_000 }).text, "A");
+  const aborted = sessionFixture([prompt, sMsg("assistant", sText("partial"), "aborted")]);
+  assert.equal(readSessionCompletion(aborted, m).finalSeen, true);
+  const errored = sessionFixture([prompt, sMsg("assistant", sText("oops"), "error")]);
+  const e = readSessionCompletion(errored, m);
+  assert.equal(e.finalSeen, false);
+  assert.equal(e.errorFinal, true);
+});
+
+await regressionTest("polling loop: error stopReason is final only after settled grace", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-err");
+  let statusNow = "working";
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: statusNow }),
+      readOutput: async () => "last good",
+      readSessionResult: async () => ({ promptSeen: true, finalSeen: false, errorFinal: true, mode: "missing", text: "", source: "session" }),
+      now: () => t,
+      delay: async (ms) => { t += ms; if (t - 1_000_000 >= 3_000) statusNow = "idle"; },
+    }
+  );
+  assert.equal(result.status, "idle");
+  assert.equal(result.sessionFinal, true);
+  assert.ok(t - 1_000_000 >= SESSION_ERROR_FINAL_GRACE_MS, `waited grace, got ${t - 1_000_000}`);
+});
+
+await regressionTest("polling loop: does not read the session while the agent is working", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-nowork");
+  let sessionReads = 0;
+  let statusNow = "working";
+  await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: statusNow }),
+      readOutput: async () => "x",
+      readSessionResult: async () => { sessionReads += 1; return { promptSeen: true, finalSeen: true, mode: "marker-pair", text: "A", source: "session" }; },
+      now: () => t,
+      delay: async (ms) => { t += ms; if (t - 1_000_000 >= 60_000) statusNow = "idle"; },
+    }
+  );
+  assert.equal(sessionReads, 1);
+});
+
+async function runSessionLaunch(name: string, setup: (markers: { start: string; end: string }) => { sessionLines: unknown[]; mock: Record<string, unknown>; launch?: Record<string, unknown> }, check: (result: any, ctx: { file: string; updates: any[]; closedPanes: string[] }) => void, withFakeClock = false) {
   const previousHerdr = process.env.HERDR_ENV;
   process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-writer-refused-"));
+  const repo = mkdtempSync(join(tmpdir(), "crew-sess-launch-"));
+  const realNow = Date.now;
+  let offset = 0;
+  const dirs: string[] = [repo];
   try {
-    const markers = buildCrewMarkers("call-writer-refused");
-    let createdPaneId: string | undefined;
-    const closedPanes: string[] = [];
-
-    const mockPi = {
-      registerTool() {},
-      appendEntry() {},
-      async exec(command: string, args: string[] = []) {
-        if (command === "pi" && args[0] === "--list-models") {
-          return { code: 0, stdout: "anthropic/claude-sonnet-5-5\nanthropic/claude-opus-5-5\ngoogle/gemini-3.8-flash", stderr: "" };
-        }
-        assert.equal(command, "herdr");
-        if (args[0] === "pane" && args[1] === "current") {
-          return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "brain", workspace_id: "ws", tab_id: "tab", cwd: repo } } }), stderr: "" };
-        }
-        if (args[0] === "pane" && args[1] === "split") {
-          createdPaneId = "pane-writer-1";
-          return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: createdPaneId } } }), stderr: "" };
-        }
-        if (args[0] === "pane" && args[1] === "run") return { code: 0, stdout: "", stderr: "" };
-        if (args[0] === "pane" && args[1] === "read") return { code: 0, stdout: "ready", stderr: "" };
-        if (args[0] === "agent" && args[1] === "list") {
-          return { code: 0, stdout: JSON.stringify({ result: { agents: [{ name: "executor", pane_id: createdPaneId, workspace_id: "ws", tab_id: "tab", cwd: repo, agent_status: "idle", status: "idle" }] } }), stderr: "" };
-        }
-        if (args[0] === "agent" && args[1] === "rename") return { code: 0, stdout: "", stderr: "" };
-        if (args[0] === "agent" && args[1] === "get") {
-          return { code: 0, stdout: JSON.stringify({ result: { agent: { name: "executor", pane_id: createdPaneId, agent_status: "idle", status: "idle" } } }), stderr: "" };
-        }
-        if (args[0] === "agent" && args[1] === "prompt") return { code: 0, stdout: "", stderr: "" };
-        if (args[0] === "agent" && args[1] === "read") {
-          return { code: 0, stdout: `${markers.start}\nImplemented\n${markers.end}`, stderr: "" };
-        }
-        if (args[0] === "pane" && args[1] === "close") {
-          closedPanes.push(args[2]);
-          return { code: 0, stdout: "", stderr: "" };
-        }
-        throw new Error(`unexpected herdr call: ${args.join(" ")}`);
-      }
-    };
-
+    const markers = buildCrewMarkers(name);
+    const { sessionLines, mock, launch } = setup(markers);
+    const file = sessionFixture(sessionLines);
+    dirs.push(dirname(file));
+    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, sessionPath: file, ...mock } as any);
     const updates: any[] = [];
+    if (withFakeClock) Date.now = () => realNow() + offset;
     const result = await executeCrewLaunch(
       mockPi as any,
-      {
-        role: "executor",
-        task: "Implement phase",
-        ephemeral: true,
-        toolCallId: "call-writer-refused",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
+      { role: "scout", task: "Check research items", startupTimeoutMs: 1000, startupReadyStableMs: 0, toolCallId: name, configCwd: repo, ...launch } as any,
       undefined,
       (u) => updates.push(u),
       undefined,
-      async () => {}
+      async (ms) => { offset += ms; }
     );
+    check(result, { file, updates, closedPanes });
+  } finally {
+    Date.now = realNow;
+    process.env.HERDR_ENV = previousHerdr;
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  }
+}
 
+await regressionTest("executeCrewLaunch prefers the session pair over a terminal pair and reports extraction details", async () => {
+  await runSessionLaunch("sess-prefer", m => ({
+    sessionLines: [sMsg("user", sText(appendMarkerInstruction("task", m))), sMsg("assistant", sText(`${m.start}\nSession answer\ncapabilityToken: abc\n${m.end}`), "stop")],
+    mock: { markerOutputText: "Terminal answer" },
+  }), (result, { file }) => {
     assert.equal(result.details.complete, true);
-    assert.equal(result.details.ephemeral, true);
-    assert.equal(result.details.tornDown, false);
-    assert.deepEqual(closedPanes, []); // close was NEVER called for writer pane
-    assert.ok(updates.some(u => u.content?.[0]?.text?.includes("crew: retained writer pane")));
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
-  }
+    assert.equal(result.details.extractionSource, "session");
+    assert.equal(result.details.childSessionPath, file);
+    assert.match(result.content[0].text, /Session answer/);
+    assert.doesNotMatch(result.content[0].text, /Terminal answer/);
+    assert.doesNotMatch(result.content[0].text, /capabilityToken: abc/);
+    assert.match(result.content[0].text, /\[REDACTED\]/);
+  });
 });
 
-test("ephemeral teardown respects abort signal during grace wait", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-abort-"));
-  try {
-    const markers = buildCrewMarkers("call-eph-abort");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "All done" });
-    const ac = new AbortController();
-
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Check research items",
-        ephemeral: true,
-        teardownGraceMs: 10000,
-        toolCallId: "call-eph-abort",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      ac.signal,
-      undefined,
-      undefined,
-      async (_ms, sig) => {
-        ac.abort();
-        if (sig?.aborted) throw new Error("cancelled");
-      }
-    );
-
-    assert.equal(result.details.tornDown, true);
-    assert.deepEqual(closedPanes, ["pane-eph-1"]); // Teardown still happened cleanly
-  } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
-  }
+await regressionTest("executeCrewLaunch is complete when the agent exited but the session has a marker pair", async () => {
+  await runSessionLaunch("sess-exited", m => ({
+    sessionLines: [sMsg("user", sText(appendMarkerInstruction("task", m))), sMsg("assistant", sText(`${m.start}\nExited answer\n${m.end}`), "stop")],
+    mock: { agentExitsAfterPrompt: true, markerOutputText: "unused" },
+    launch: { ephemeral: true, teardownGraceMs: 10 },
+  }), (result, { updates, closedPanes }) => {
+    assert.equal(result.details.agentExited, true);
+    assert.equal(result.details.complete, true);
+    assert.equal(result.details.extractionSource, "session");
+    assert.match(result.content[0].text, /Exited answer/);
+    assert.deepEqual(closedPanes, []);
+    assert.ok(!updates.some(u => String(u.content?.[0]?.text).includes("failed to close pane")));
+  }, true);
 });
 
-test("ephemeral lifecycle config defaults are respected", async () => {
-  const previousHerdr = process.env.HERDR_ENV;
-  process.env.HERDR_ENV = "1";
-  const repo = mkdtempSync(join(tmpdir(), "crew-eph-config-"));
-  try {
+await regressionTest("executeCrewLaunch rejects a terminal pair when the session shows a final reply without a marker pair", async () => {
+  await runSessionLaunch("sess-nopair", m => ({
+    sessionLines: [sMsg("user", sText(appendMarkerInstruction("task", m))), sMsg("assistant", sText("I finished but forgot the markers."), "stop")],
+    mock: { markerOutputText: "Echoed junk" },
+  }), (result) => {
+    assert.equal(result.details.complete, false);
+    assert.equal(result.details.extractionSource, null);
+    assert.equal(result.details.extractionMode, "prompt-fallback");
+    assert.match(result.content[0].text, /complete: false/);
+  });
+});
+
+await regressionTest("polling loop: a readOutput error keeps the last good snapshot", async () => {
+  let t = 1_000_000;
+  const m = buildCrewMarkers("poll-keep");
+  let reads = 0;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "a", paneId: "p", markers: m, reusedPane: false, submittedAt: t, timeoutMs: 100_000, hardCapMs: 200_000, readLines: 200 },
+    {
+      getAgent: async () => ({ agent_status: "working" }),
+      readOutput: async () => { reads += 1; if (reads > 1) throw new Error("pane_not_found"); return `${m.start}\nlast good`; },
+      now: () => t,
+      delay: async (ms) => { t += ms; },
+    }
+  );
+  assert.equal(result.agentExited, true);
+  assert.equal(result.output, `${m.start}\nlast good`);
+  assert.equal(result.markerOutput.text, "last good");
+});
+
+await regressionTest("withSpawnLock: a cancelled waiter does not delete the lock key while the holder is still running", async () => {
+  const order: string[] = [];
+  let releaseFirst!: () => void;
+  const first = withSpawnLock("k2", () => new Promise<void>(resolve => { releaseFirst = resolve; order.push("first"); }));
+  await settleMs(5);
+  const controller = new AbortController();
+  const cancelled = withSpawnLock("k2", async () => { order.push("cancelled"); }, controller.signal).catch((e: Error) => e.message);
+  controller.abort();
+  assert.equal(await cancelled, "crew_launch was cancelled");
+  await settleMs(5);
+  // The holder is still inside its critical section: a new entrant must still wait.
+  const late = withSpawnLock("k2", async () => { order.push("late"); });
+  await settleMs(20);
+  assert.deepEqual(order, ["first"]);
+  releaseFirst();
+  await first; await late;
+  assert.deepEqual(order, ["first", "late"]);
+});
+
+await regressionTest("polling loop: lastKnownAgent is seeded from the post-spawn agent so transient lookup errors are not a missing agent", async () => {
+  let virtualTime = 1_000_000;
+  const markers = buildCrewMarkers("seed-test");
+  let polled = 0;
+  const seed = { agent_status: "working", name: "scout-w" } as any;
+  const result = await runCrewPollingLoop(
+    { roleName: "scout", agentName: "scout-w", paneId: "p1", markers, submittedAt: virtualTime, timeoutMs: 60_000, hardCapMs: 120_000, readLines: 200, initialAgent: seed },
+    {
+      getAgent: async () => { throw new Error("transient bridge error"); },
+      readOutput: async () => { polled += 1; return polled >= 3 ? `${markers.start}\ndone\n${markers.end}` : "working..."; },
+      now: () => virtualTime,
+      delay: async (ms) => { virtualTime += ms; },
+    }
+  );
+  assert.equal(result.agentExited, false);
+  assert.equal(result.lastKnownAgent, seed);
+});
+
+await regressionTest("config lifecycle.teardownGraceMs reaches pendingClose.delayMs", async () => {
+  await withHerdrRepo(async (repo) => {
     mkdirSync(join(repo, ".pi"), { recursive: true });
-    writeFileSync(
-      join(repo, ".pi", "model-tiers.json"),
-      JSON.stringify({
-        lifecycle: { ephemeral: true, teardownGraceMs: 3500 },
-      })
-    );
-    const markers = buildCrewMarkers("call-eph-config");
-    const { mockPi, closedPanes } = createMockHerdr({ repo, markers, markerOutputText: "Config result" });
-    const delays: number[] = [];
-
-    const result = await executeCrewLaunch(
-      mockPi as any,
-      {
-        role: "scout",
-        task: "Check research",
-        toolCallId: "call-eph-config",
-        startupTimeoutMs: 1000,
-        startupReadyStableMs: 0,
-        configCwd: repo,
-      } as any,
-      undefined,
-      undefined,
-      undefined,
-      async (ms) => { delays.push(ms); }
-    );
-
-    assert.equal(result.details.ephemeral, true);
+    writeFileSync(join(repo, ".pi", "model-tiers.json"), JSON.stringify({ lifecycle: { teardownGraceMs: 3500 } }));
+    const fake = createFakeHerdr({ repo });
+    const result = await executeCrewLaunch(fake.pi as any, { ...launchParams(repo), toolCallId: "cfg-grace" } as any);
     assert.equal(result.details.teardownGraceMs, 3500);
-    assert.equal(result.details.tornDown, true);
-    assert.ok(delays.includes(3500));
-    assert.deepEqual(closedPanes, ["pane-eph-1"]);
+    assert.equal(result.details.pendingClose.delayMs, 3500);
+  });
+});
+
+await regressionTest("compaction info: merges global/project settings, per-model override, and never throws", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crew-compaction-info-"));
+  try {
+    const agentDir = join(dir, "agent"); const project = join(dir, "proj");
+    mkdirSync(agentDir, { recursive: true }); mkdirSync(join(project, ".pi"), { recursive: true });
+    const model = { provider: "anthropic", id: "claude-opus-5-5" };
+    // Missing files: defaults.
+    assert.deepEqual(readCompactionInfo(project, model, 1_000_000, agentDir), { enabled: true, reserveTokens: 16_384, triggerTokens: 983_616 });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1000, modelOverrides: { "anthropic/claude-opus-5-5": { reserveTokens: 500_000 } } } }));
+    assert.deepEqual(readCompactionInfo(project, model, 1_000_000, agentDir), { enabled: true, reserveTokens: 500_000, triggerTokens: 500_000 });
+    assert.equal(readCompactionInfo(project, { provider: "x", id: "y" }, 200_000, agentDir).reserveTokens, 1000);
+    writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({ compaction: { enabled: false } }));
+    const disabled = readCompactionInfo(project, model, 1_000_000, agentDir);
+    assert.equal(disabled.enabled, false);
+    assert.equal(disabled.reserveTokens, 500_000);
+    assert.match(compactionStatusText(disabled, 1_000_000), /DISABLED.*overflow recovery is also off/);
+    assert.equal(compactionStatusText({ enabled: true, reserveTokens: 500_000, triggerTokens: 500_000 }, 1_000_000), "Native Pi auto-compaction is enabled and triggers near 500000 tokens (50%).");
+    writeFileSync(join(agentDir, "settings.json"), "{not json");
+    writeFileSync(join(project, ".pi", "settings.json"), "[]");
+    assert.equal(readCompactionInfo(project, model, 1_000_000, agentDir).reserveTokens, 16_384);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+await regressionTest("message_end context warning reports the real compaction settings", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crew-warning-compaction-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+    mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+    writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), JSON.stringify({ compaction: { enabled: false } }));
+    const events = new Map<string, any[]>(); const messages: any[] = [];
+    crewExtension({ appendEntry() {}, sendMessage: (m: any) => messages.push(m), registerTool() {}, registerCommand() {}, on(n: string, h: any) { events.set(n, [...(events.get(n) ?? []), h]); } } as any);
+    const ctx = { cwd: dir, model: { provider: "anthropic", id: "claude-opus-5-5", contextWindow: 1_000_000 }, getContextUsage: () => ({ tokens: 250_000, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "s", getBranch: () => [] }, ui: { notify() {}, setStatus() {} } };
+    for (const h of events.get("message_end") ?? []) await h({ message: { role: "assistant", usage: { input: 250_000, output: 1 } } }, ctx);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0].content, /DISABLED in settings \(compaction\.enabled=false\)/);
+    assert.doesNotMatch(messages[0].content, /remains enabled/);
   } finally {
-    process.env.HERDR_ENV = previousHerdr;
-    rmSync(repo, { recursive: true, force: true });
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await regressionTest("self_compact resumes the aborted run after compaction completes or fails", async () => {
+  for (const outcome of ["complete", "error"] as const) {
+    const tools = new Map<string, any>(); const sent: any[] = []; const entries: any[] = [];
+    crewExtension({ appendEntry: (t: string, d: any) => entries.push({ t, d }), sendMessage: (m: any, o: any) => sent.push({ m, o }), registerTool: (t: any) => tools.set(t.name, t), registerCommand() {}, on() {} } as any);
+    let handlers: any;
+    const ctx = {
+      cwd: tmpdir(), model: { contextWindow: 200_000 }, getContextUsage: () => ({ tokens: 120_000, contextWindow: 200_000 }),
+      sessionManager: { getSessionId: () => `sc-${outcome}`, getBranch: () => [] },
+      compact: (options: any) => { handlers = options; },
+    };
+    const result = await tools.get("self_compact").execute("c1", { reason: "context is large" }, undefined, undefined, ctx);
+    assert.match(result.content[0].text, /interrupted for compaction and resumed automatically/);
+    assert.deepEqual(sent, [], "no resume before compaction ends");
+    if (outcome === "complete") handlers.onComplete(); else handlers.onError(new Error("boom"));
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].m.customType, "crew-compaction-resume");
+    assert.equal(sent[0].m.display, false);
+    assert.deepEqual(sent[0].o, { triggerTurn: true });
+    if (outcome === "complete") assert.match(sent[0].m.content, /Compaction finished; continue the task you were working on from the summary; do not redo completed work\./);
+    else assert.match(sent[0].m.content, /boom.*[Cc]ontinue/);
   }
 });

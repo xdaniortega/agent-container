@@ -2,7 +2,7 @@
   "models": {
     "frontier": "anthropic/claude-opus-5-5",
     "medium": "anthropic/claude-sonnet-5-5",
-    "small": "google/gemini-3.8-flash"
+    "small": "anthropic/claude-sonnet-5-5"
   },
   "roles": {
     "scout": {
