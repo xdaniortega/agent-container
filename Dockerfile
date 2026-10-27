@@ -5,6 +5,7 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 ARG RGA_VERSION=0.10.10
 ARG TYPST_VERSION=0.15.0
+ARG PI_VERSION=0.87.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -49,8 +50,9 @@ RUN apt-get update \
     && typst --version \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @earendil-works/pi-coding-agent pnpm@11.5.2 \
-    && npm cache clean --force
+RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" pnpm@11.5.2 \
+    && npm cache clean --force \
+    && pi --version
 
 RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh -o /tmp/rtk-install.sh \
     && sh /tmp/rtk-install.sh \
@@ -62,14 +64,22 @@ RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/in
     && cp /root/.pi/agent/extensions/rtk.ts /usr/local/share/pi/extensions/rtk.ts \
     && rm -rf /root/.pi
 
-# Install Claude Code (native binary, lands at ~/.local/bin/claude, already on PATH)
+# Install Claude Code and expose it outside build-time PATH handling.
 RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
     && claude --version
 
 # Install Herdr CLI so containerized Pi sessions can control the host Herdr
 # session through the socket bridge created by pic/pic-proxy.
 RUN curl -fsSL https://herdr.dev/install.sh | sh \
+    && ln -sf /root/.local/bin/herdr /usr/local/bin/herdr \
     && herdr --version
+
+# Bake the crew extension and skill into the image so the crew tool is available
+# in every container even when the host ~/.pi did not stage its own copy. The
+# entrypoint materializes these into ~/.pi/agent at startup as a fallback.
+COPY extensions/crew /usr/local/share/pi/extensions/crew
+COPY skills/crew /usr/local/share/pi/skills/crew
 
 COPY entrypoint.sh /usr/local/bin/entrypoint
 COPY md2pdf /usr/local/bin/md2pdf

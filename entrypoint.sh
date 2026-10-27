@@ -78,6 +78,12 @@ case "${1:-}" in
         cp -aL "$extension" "$target"
       done
     fi
+    # Fall back to the image-baked crew extension when the host did not stage one.
+    # This makes the crew tool available in every container image regardless of
+    # the host ~/.pi contents (mirrors the rtk.ts image fallback below).
+    if [ ! -d /root/.pi/agent/extensions/crew ] && [ -d /usr/local/share/pi/extensions/crew ]; then
+      cp -aL /usr/local/share/pi/extensions/crew /root/.pi/agent/extensions/crew
+    fi
     if [ -d /root/.pi/agent/extensions/crew ] && [ ! -f /root/.pi/agent/extensions/crew/index.ts ]; then
       echo "[pi-container] fatal: crew extension is not a readable regular file" >&2
       exit 1
@@ -147,6 +153,14 @@ case "${1:-}" in
         install_skill "$skill" "$target"
       done
     done
+
+    # Fall back to the image-baked crew skill when none was materialized above.
+    # The crew extension reads model-tiers.json from ~/.pi/agent/skills/crew, so
+    # the skill must exist for the baked-in crew tool to resolve model tiers.
+    if [ ! -e /root/.pi/agent/skills/crew/SKILL.md ] && [ -d /usr/local/share/pi/skills/crew ]; then
+      rm -rf /root/.pi/agent/skills/crew
+      cp -aL /usr/local/share/pi/skills/crew /root/.pi/agent/skills/crew
+    fi
 
     should_pnpm_install=false
     if [ "${PIC_PNPM_INSTALL:-1}" != "0" ] && [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then

@@ -118,13 +118,17 @@ clc-proxy        # Claude Code through the host-side proxy
 
 ### Crew skill
 
-The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets Pi delegate focused work to visible Herdr role panes such as `scout`, `oracle`, `executor`, and `reviewer`. It works with both `pic` and `pic-proxy`; use it when you want parallel research, planning, implementation, or review from the current Pi session. Install the local crew extension with:
+The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets Pi delegate focused work to visible Herdr role panes such as `scout`, `oracle`, `executor`, and `reviewer`. It works with both `pic` and `pic-proxy`; use it when you want parallel research, planning, implementation, or review from the current Pi session.
+
+The crew extension and skill are **baked into the container image**, so the crew tool is available in every container regardless of your host `~/.pi` contents. The entrypoint only falls back to the image-baked copy when the host did not stage its own, so a locally installed crew still takes precedence.
+
+To also use crew in non-containerized host Pi sessions, install the local extension with:
 
 ```bash
 npm run install-crew
 ```
 
-For code work, the brain normalizes either a raw request or an existing user plan into explicit phases. Standard, localized phases are implemented provisionally and reviewed together at the end; major or cross-cutting phases receive an immediate independent reviewer. After feature review, the workflow runs the installed `parallel-code-review` skill over the complete integration diff and resolves compatible Medium-or-higher findings.
+Before implementing any feature or change, the brain uses a Markdown plan named for the change (for example, `feature-to-implement-plan.md`) as the source of truth. It checks a supplied plan against the required template rather than rewriting it. If none is supplied, it drafts one, optionally consulting scout/oracle, and **waits for your explicit confirmation before implementation**. Plans ending in `plan.md` are gitignored. The brain then derives explicit phases from the plan. Standard, localized phases are implemented provisionally and reviewed together at the end; major or cross-cutting phases receive an immediate independent reviewer. After feature review, the workflow runs the installed `parallel-code-review` skill over the complete integration diff and resolves compatible Medium-or-higher findings.
 
 The setup provides one mutation role, `executor`. It does not provide a separate escalation executor; bounded retries reuse the configured executor and unresolved work returns to the user.
 
@@ -133,7 +137,7 @@ Managed direct-mode runs support risk promotion and exact deferred review batche
 ### Choosing / changing models
 
 Crew roles and review agents never hardcode a provider or model. Each names an abstract **model tier** (`frontier` / `medium` / `small`) plus a concrete **reasoning** level (`xhigh` / `medium` / `low`). Everything lives in the single **`model-tiers.json`**:
-- `models.frontier|medium|small` → the provider/model each tier means for us (e.g. `frontier` = Opus 5, `medium` = Opus 4.8, `small` = Gemini 3.8 Flash). **Change which model a crew member uses by editing these three values.**
+- `models.frontier|medium|small` → the provider/model each tier means for us (currently Opus 5.5, Sonnet 5.5, and Gemini 3.8 Flash). **Change which model a crew member uses by editing these three values.**
 - `crewRoles.<role>` → the `{ model: <tier>, reasoning: <level>, authority, description }` per crew member (scout, oracle, executor, reviewer).
 - `parallelCodeReview.<agent>` → the model tier + reasoning per review agent.
 
@@ -158,6 +162,8 @@ PIC_HERDR_BRIDGE=0 pic-proxy   # disable Herdr status bridge
 ```
 
 Run `herdr integration install pi` on the host once. The entrypoint loads `herdr-agent-state.ts` only when `HERDR_ENV=1`.
+
+Crew context notices occur at 20% and 50% of the active model's context window (1M tokens when the window is unavailable). The brain can call `self_compact` for its own session. For managed direct-mode children, the brain reads the child's context notification and uses `crew_compact_decide` to approve or decline that exact child's request; only an approved child can call `self_compact` in its own Pi session. Legacy/`pic-proxy` children cannot request authenticated approval, so voluntary compaction is disabled for them; Pi's built-in near-limit automatic compaction remains active. Pi compaction is lossy; preserve accepted plan, phase, blockers, and evidence references in summary instructions. Compaction does not close Herdr panes.
 
 Crew launches bind a stable launch ID to the child pane and Herdr `agent_session`. The extension keeps controller state, raw Herdr state, managed task state, and completion evidence separate so an idle child is not mistaken for verified completion. Use the `crew_status` tool from the brain or `/crew-status` interactively to inspect running, blocked, timed-out-but-live, lost, replaced, or settled-incomplete children. A compact `crew:` footer indicator appears when work is active or needs attention.
 
@@ -309,7 +315,8 @@ Claude Code sessions are inspectable through the ignored symlink
 ## Image Contents
 
 The custom `node:24-trixie-slim` image includes:
-- `@earendil-works/pi-coding-agent`
+- `@earendil-works/pi-coding-agent` (pinned via the `PI_VERSION` build arg)
+- the `crew` extension and skill, baked in as an image fallback
 - `pnpm`
 - `fd`
 - `ripgrep`
@@ -319,7 +326,13 @@ The custom `node:24-trixie-slim` image includes:
 
 ## Upgrade
 
-To upgrade Pi to the latest published npm version, rebuild without cache:
+Pi is pinned via the `PI_VERSION` build arg in the `Dockerfile`. To upgrade,
+bump `ARG PI_VERSION` (or override it at build time) and rebuild:
+```bash
+container build --dns 1.1.1.1 --build-arg PI_VERSION=0.87.1 -t agentic-coding-node:24 .
+```
+
+To rebuild against the pinned version without cache:
 ```bash
 container build --no-cache --dns 1.1.1.1 -t agentic-coding-node:24 .
 ```
